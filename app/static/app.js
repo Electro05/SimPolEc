@@ -19,6 +19,9 @@ const S = {
     region: null,          // выбранная область (её рынок и население)
     regions: [],
     xGood: 'steel',        // выбранный товар на бирже
+    buildSector: 'all',    // фильтр отраслей в строительстве
+    sectors: [],
+    chainRules: null,
     exchange: null,
     diplo: null,
     page: 'market',
@@ -151,7 +154,12 @@ async function refresh(full) {
         S.region = market.region_id;          // сервер мог поправить выбор
         S.regionName = market.region_name;
         S.regions = market.regions || [];
-        S.tradeCap = market.trade_capacity;
+        S.access = {
+            access: market.access, chambers: market.chambers,
+            chamber_max: market.chamber_max,
+            access_per_level: market.access_per_level,
+            tariff: market.tariff, import_tariff: market.import_tariff,
+        };
         S.secondsLeft = world.seconds_left;
 
         const newTick = world.tick !== S.lastTick;
@@ -169,6 +177,7 @@ async function refresh(full) {
             ]);
             S.series = series.series; S.macro = macro.rows;
             S.cities = regions.regions; S.industries = industries.industries;
+            S.sectors = industries.sectors || []; S.chainRules = industries.chain;
             S.people = people; S.govBuildings = govBuildings.buildings;
             S.canManageState = govBuildings.can_manage;
             S.map = mapData.nodes; S.elections = el;
@@ -253,8 +262,36 @@ const CAT = {
     luxury: 'роскошь',
 };
 
+/** Доступность рынка области: одно число на оба конца торговли.
+ *  Внутри страны — как быстро область сравнивается ценами с соседями,
+ *  снаружи — какой объём проходит через границу. Растёт от «Торговых палат». */
+function renderAccess() {
+    const a = S.access || {};
+    const v = a.access || 0;
+    const lv = a.chambers || 0, max = a.chamber_max || 9;
+    $('mAccess').textContent = pct(v);
+    $('mAccess').className = 'v num ' + (v < .3 ? 'bad' : v < .6 ? 'warn'
+        : v < .999 ? 'good' : 'gold');
+    $('mChambers').textContent = lv + ' / ' + max;
+    $('mChambers').className = 'v num ' + (lv >= max ? 'gold' : lv ? 'good' : 'dim');
+    $('mTariff').textContent = pct(a.tariff || 0);
+    $('mImport').textContent = pct(a.import_tariff || 0);
+    const left = Math.max(0, max - lv);
+    $('accessNote').innerHTML =
+        'Доступность — насколько прилавок этой области включён в общую экономику. '
+        + '<b>Внутри страны</b> это скорость выравнивания: за пейдей область '
+        + 'закрывает <b>' + pct(v) + '</b> разрыва между своим складом и '
+        + 'общестрановой нормой, поэтому на сотне рынки областей практически '
+        + 'сливаются в один. <b>С заграницей</b> — просто объём: столько товара '
+        + 'область пропустит через границу. Поднимает её только «Торговая палата» — '
+        + 'по ' + pct(a.access_per_level || .1) + ' за уровень поверх базовых 10%'
+        + (left ? ', осталось <b>' + left + '</b> ур. до полного единого рынка.'
+                : '. Область включена в общий рынок полностью.');
+}
+
 function renderMarket() {
     $('marketRegion').textContent = S.regionName || '—';
+    renderAccess();
     regionPicker('marketRegions', S.regions, S.region);
     $('marketRows').innerHTML = S.market.map(g => {
         const pos = Math.max(0, Math.min(1, g.position)) * 100;
@@ -361,6 +398,7 @@ function renderExchange() {
     $('xCap').textContent = pct(x.my_capacity);
     $('xCap').className = 'v num ' + (x.my_capacity > 0 ? 'good' : 'bad');
     $('xTariff').textContent = pct(x.tariff);
+    $('xImport').textContent = pct(x.import_tariff || 0);
     // знаменатель — государства, а не узлы карты: узел карты это область
     const states = new Set((S.map || []).map(n => n.country_id));
     $('xTraders').textContent = (x.traders || []).length + ' / ' + states.size;
@@ -406,30 +444,59 @@ function renderExchange() {
             q.capacity > 0 ? pct(q.capacity) : 'закрыта'}</td>
     </tr>`).join('');
 
+    drawWorldChart();
+
+    const side = (title, list, unit, key) => `<div class="card" style="margin:0">
+        <h2>${title}</h2>
+        ${list.length ? `<div class="tw"><table><tbody>${list.map(r => `<tr>
+            <td>${esc(r.name)}</td>
+            <td class="right">${qty(r.qty)}</td>
+            <td class="right dim">по ${r.local_price.toFixed(2)} ₡ дома</td>
+            <td class="right ${key === 'duty' ? 'good' : 'dim'}">${money(r[key])} ₡ ${unit}</td>
+        </tr>`).join('')}</tbody></table></div>`
+        : '<div class="empty">Сделок не было</div>'}</div>`;
+    $('xTrades').innerHTML = side('Вывезли', g.exports || [], 'пошлины', 'duty')
+        + side('Ввезли', g.imports || [], 'заплачено', 'paid');
+}
+
+/** Мировая цена против домашней. Вынесено из renderExchange: график живёт
+ *  в сворачиваемой карточке и должен уметь перерисоваться сам, когда её
+ *  раскроют, — иначе ширину он снимет с нулевой (свёрнутой) рамки. */
+function drawWorldChart() {
+    const x = S.exchange;
+    if (!x) return;
+    const g = (x.goods || []).find(r => r.key === S.xGood) || (x.goods || [])[0];
+    if (!g) return;
     const world = (x.history || {})[g.key] || [];
     const local = (S.series || {})[g.key] || [];
     lineChart('worldChart', [
         { data: local.map(r => ({ x: r.tick, y: r.price })), color: '#4c9aff' },
         { data: world.map(r => ({ x: r.tick, y: r.price })), color: '#e3b341' },
     ], { fmt: v => v.toFixed(v < 10 ? 2 : 0) });
-
-    const side = (title, list, unit, key) => `<div class="card" style="margin:0">
-        <h2>${title}</h2>
-        ${list.length ? `<table><tbody>${list.map(r => `<tr>
-            <td>${esc(r.name)}</td>
-            <td class="right">${qty(r.qty)}</td>
-            <td class="right dim">по ${r.local_price.toFixed(2)} ₡ дома</td>
-            <td class="right ${key === 'duty' ? 'good' : 'dim'}">${money(r[key])} ₡ ${unit}</td>
-        </tr>`).join('')}</tbody></table>`
-        : '<div class="empty">Сделок не было</div>'}</div>`;
-    $('xTrades').innerHTML = side('Вывезли', g.exports || [], 'пошлины', 'duty')
-        + side('Ввезли', g.imports || [], 'заплачено', 'paid');
 }
 
 function pickXGood(key) { S.xGood = key; renderExchange(); }
 
 /* ------------------------------ население ------------------------------ */
 const CLASS_COLOR = { 'низший': '#8b97a8', 'средний': '#4c9aff', 'высший': '#e3b341' };
+
+/** Что и сколько сословие потребляет: «Еда 0.78 / 0.91» с долей покрытия.
+ *  Число слева — взято на человека за пейдей, справа — положено по корзине. */
+function consumptionCells(rows) {
+    if (!rows || !rows.length) return '<span class="dim">ничего не покупают</span>';
+    const num = v => v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(2) : v.toFixed(3);
+    return rows.map(r => {
+        const col = r.share === null ? 'dim'
+            : r.share < .5 ? 'bad' : r.share < .9 ? 'warn' : 'good';
+        const of = r.norm > 0 ? ` / ${num(r.norm)}` : '';
+        const tail = r.share === null ? '' : ` <span class="dim">${pct(r.share)}</span>`;
+        return `<span class="tag eat${r.luxury ? ' luxury' : ''}"`
+            + ` title="${esc(r.name)}: взято ${num(r.per_capita)}`
+            + `${r.norm > 0 ? `, положено ${num(r.norm)}` : ''} на человека за пейдей">`
+            + `${esc(r.name)} <b class="${col}">${num(r.per_capita)}</b>`
+            + `<span class="dim">${of}</span>${tail}</span>`;
+    }).join(' ');
+}
 
 function renderPeople() {
     const p = S.people;
@@ -475,6 +542,7 @@ function renderPeople() {
         <td><div class="bar" style="margin:0" title="1.0 — обычная корзина">
             <i style="width:${Math.min(100, s.living_standard / 2 * 100).toFixed(0)}%;
                background:${s.living_standard < 1 ? 'var(--warn)' : 'var(--gold)'}"></i></div></td>
+        <td style="font-size:12px">${consumptionCells(s.consumption)}</td>
         <td class="dim" style="font-size:13px">${s.luxuries && s.luxuries.length
             ? s.luxuries.map(l => `${esc(l.name)} <span class="dim">${pct(l.share)}</span>`).join(', ')
             : '<span class="dim">только необходимое</span>'}</td>
@@ -506,6 +574,30 @@ function renderPeople() {
 }
 
 /* ------------------------ мои предприятия ------------------------ */
+/** Разброс зарплат по списку предприятий + заполнение поля «зп всем».
+ *  Поле подставляется только когда игрок в нём не набирает: иначе число
+ *  переписывалось бы прямо под курсором. */
+function wageSpread(list, inputId) {
+    if (!list.length) return '';
+    const wages = list.map(b => b.wage);
+    const lo = Math.min(...wages), hi = Math.max(...wages);
+    const el = $(inputId);
+    if (el && document.activeElement !== el) el.value = Math.round(hi);
+    return lo === hi ? `Сейчас у всех ${lo.toFixed(2)} ₡`
+        : `Сейчас от ${lo.toFixed(2)} до ${hi.toFixed(2)} ₡`;
+}
+
+/** Из чего сложилась прибавка за цепочку — подсказка на цифре бонуса. */
+function chainTitle(chain) {
+    if (!chain) return '';
+    const parts = [];
+    if (chain.links && chain.links.length)
+        parts.push('звенья цепочки: ' + chain.links.join(', '));
+    if (chain.mates && chain.mates.length)
+        parts.push('соседи по отрасли: ' + chain.mates.join(', '));
+    return parts.join('; ') || 'связанных предприятий рядом нет';
+}
+
 function renderBiz() {
     // Не перерисовываем список, пока игрок набирает зарплату в одном из полей:
     // иначе поле пересоздастся под курсором и ввод оборвётся на полуслове.
@@ -520,14 +612,37 @@ function renderBiz() {
     $('sProfit').textContent = (profit >= 0 ? '+' : '') + money(profit) + ' ₡';
     $('sProfit').className = 'v num ' + (profit >= 0 ? 'good' : 'bad');
     $('sEmp').textContent = qty(sum('employed'));
+    // Сбыт: доля выпуска, которую вообще удалось продать. Именно она объясняет
+    // разрыв между «завод работает» и «денег нет».
+    const made = sum('last_output'), soldQ = sum('last_sold');
+    $('sSell').textContent = made > 0 ? pct(Math.min(1, soldQ / made)) : '—';
+    $('sSell').className = 'v num ' + (made <= 0 ? 'dim'
+        : soldQ / made < .6 ? 'bad' : soldQ / made < .9 ? 'warn' : 'good');
+    $('sSell').title = made > 0
+        ? `Продано ${qty(soldQ)} из ${qty(made)} выпущенных` : '';
+    const unsold = sum('last_unsold');
+    $('sUnsold').textContent = qty(unsold);
+    $('sUnsold').className = 'v num ' + (unsold > 1 ? 'warn' : 'dim');
+    $('sUnsold').title = 'Непроданный выпуск за прошлый пейдей. Он лежит на рынке '
+        + 'и денег пока не принёс';
+    $('bizWageCard').style.display = bs.length ? '' : 'none';
+    $('bizWageHint').textContent = wageSpread(bs, 'bizWageAll');
 
     const hint = S.people ? S.people.reference_wage : 0;
     const ruined = S.me.bankrupt ? `<div class="card bad" style="margin-bottom:14px">
         <b>Вы банкрот.</b> Касса ${money(S.me.cash)} ₡ упёрлась в порог
-        ${money(S.me.bankruptcy_limit)} ₡, установленный государством, и все ваши
-        предприятия остановлены. Продайте товар со складов, снесите убыточное —
-        или просите субсидию у лидера государства: он видит вас в списке
-        промышленников.</div>` : '';
+        ${money(S.me.bankruptcy_limit)} ₡, установленный государством: все ваши
+        предприятия остановлены и сами уже не запустятся. Строить и расширяться
+        тоже нельзя. Дело о банкротстве закрывает <b>только государство</b> — и оно
+        же решает, открыть всё хозяйство или одни прибыльные цеха.
+        ${S.me.rescue_cost > 0 ? `Чтобы это стало возможно, кассе не хватает
+            <b>${money(S.me.rescue_cost)} ₡</b> — просите субсидию у лидера или
+            распродайте склад и снесите убыточное.`
+            : 'Касса уже выше порога выхода — дело за решением лидера.'}
+        </div>` : (S.me.halted ? `<div class="card warn" style="margin-bottom:14px">
+        Под замком осталось предприятий: <b>${S.me.halted}</b>. Государство закрыло
+        ваше банкротство, но эти цеха признало убыточными и не открыло. Запустить их
+        может только лидер — либо снесите их сами.</div>` : '');
     $('bizList').innerHTML = ruined + (bs.length ? bs.map(b => {
         const ins = b.inputs.length
             ? b.inputs.map(i => `${esc(i.name)} ×${i.qty}`).join(', ') : 'ничего';
@@ -537,7 +652,9 @@ function renderBiz() {
         const noBuyer = !admin && out && out.demand < 1 && b.last_output > 0;
         // цех укомплектован людьми, но ничего не выпускает — значит нет сырья
         const starved = !admin && b.employed > 1 && b.last_output < 1 && b.active;
-        return `<div class="biz${b.damage ? ' hurt' : ''}">
+        // выпустил, но не продал: рынок затоварен, деньги не пришли
+        const glut = !admin && b.sell_through != null && b.sell_through < .9;
+        return `<div class="biz${b.damage ? ' hurt' : ''}${b.halted ? ' sealed' : ''}">
             <h3>${esc(b.industry)}
                 <span class="lvl">${b.state ? '<span class="tag">казна</span> ' : ''}${
                     b.foreign ? '<span class="tag">за границей</span> ' : ''}ур. ${b.level}${
@@ -549,18 +666,32 @@ function renderBiz() {
             <dl>
                 <dt>Рабочие</dt><dd>${qty(b.employed)} / ${qty(b.jobs)} (${pct(b.fill)})</dd>
                 <dt>Зарплата</dt><dd class="${lowWage ? 'warn' : ''}">${b.wage.toFixed(2)} ₡</dd>
+                ${b.chain_bonus > 0 ? `<dt>Цепочка</dt>
+                <dd class="chain" title="${chainTitle(b.chain)}">+${pct(b.chain_bonus)} к выпуску</dd>` : ''}
                 ${admin ? '' : `<dt>Выпуск</dt><dd>${qty(b.last_output)}</dd>
+                <dt>Продано</dt><dd class="${b.sell_through == null ? ''
+                    : b.sell_through < .6 ? 'bad' : b.sell_through < .9 ? 'warn' : 'good'}"
+                    title="Деньги приходят в момент продажи, а не выпуска">${qty(b.last_sold)}${
+                    b.sell_through != null ? ` (${pct(b.sell_through)})` : ''}</dd>
+                <dt>На рынке лежит</dt><dd class="dim">${qty(b.last_stock)}</dd>
                 <dt>Выручка</dt><dd>${money(b.last_revenue)} ₡</dd>`}
                 <dt>Расходы</dt><dd>${money(b.last_costs)} ₡</dd>
                 <dt>${admin ? 'Содержание' : 'Прибыль'}</dt>
                 <dd class="${b.last_profit >= 0 ? 'good' : 'bad'}">${
                     (b.last_profit >= 0 ? '+' : '') + money(b.last_profit)} ₡</dd>
             </dl>
+            ${b.halted ? `<div class="warn" style="font-size:12px;margin-bottom:8px">
+                Цех остановлен банкротством и запечатан. Запустить его может только
+                государство, закрыв дело о банкротстве.</div>` : ''}
             ${lowWage ? `<div class="warn" style="font-size:12px;margin-bottom:8px">
                 Мало платите — люди не идут. В деревне зарабатывают ${hint.toFixed(2)} ₡.</div>` : ''}
             ${noBuyer ? `<div class="bad" style="font-size:12px;margin-bottom:8px">
                 ${esc(b.output_good_name)} никто не покупает — товар копится на складе,
-                а цена падает. Нужен тот, кто пустит его в дело.</div>` : ''}
+                а цена падает. Нужен тот, кто пустит его в дело.</div>`
+            : glut ? `<div class="warn" style="font-size:12px;margin-bottom:8px">
+                Продано лишь ${pct(b.sell_through)} выпуска — остальное легло на склад
+                и денег не принесло, хотя зарплаты и налоги уплачены. Сбавьте выпуск,
+                снизьте цену спросом или ищите рынок в соседней области.</div>` : ''}
             ${starved ? `<div class="bad" style="font-size:12px;margin-bottom:8px">
                 Не хватает сырья — цех простаивает. Постройте поставщика
                 или переждите.</div>` : ''}
@@ -573,11 +704,13 @@ function renderBiz() {
                     <input type="number" id="w${b.id}" value="${b.wage.toFixed(0)}" min="0"
                            onchange="setWage(${b.id})">
                 </label>
-                <button class="sm" onclick="upgrade(${b.id})"
+                <button class="sm" onclick="upgrade(${b.id})" ${S.me.bankrupt ? 'disabled' : ''}
                     title="Следующий уровень">Ур. ${b.level + 1} — ${money(b.upgrade_cost)} ₡</button>
                 ${b.damage ? `<button class="sm primary" onclick="repairBiz(${b.id})"
                     title="Восстановить разрушенные уровни">Починить — ${money(b.repair_cost)} ₡</button>` : ''}
-                <button class="sm" onclick="toggleBiz(${b.id})">${b.active ? 'Стоп' : 'Пуск'}</button>
+                <button class="sm" onclick="toggleBiz(${b.id})" ${b.halted ? 'disabled' : ''}
+                    title="${b.halted ? 'Запечатано банкротством' : ''}">${
+                    b.active ? 'Стоп' : 'Пуск'}</button>
                 <button class="sm danger" onclick="demolish(${b.id})">Снести</button>
             </div>
         </div>`;
@@ -606,6 +739,21 @@ const setWage = id => {
         .then(r => { toast('Зарплата: ' + r.building.wage.toFixed(2) + ' ₡'); })
         .catch(e => toast(e.message, true));
 };
+/** Одна ставка на все предприятия разом — своя или казённая. */
+const setWageAll = scope => act(async () => {
+    const el = $(scope === 'state' ? 'govWageAll' : 'bizWageAll');
+    const wage = Number(el.value);
+    // Пустое поле — это не «поставить всем ноль»: одним промахом мимо кнопки
+    // так можно обнулить зарплату на всех заводах разом.
+    if (!el.value.trim() || !isFinite(wage) || wage < 0) {
+        toast('Введите зарплату', true);
+        return;
+    }
+    const r = await api('/api/buildings/wage_all', { wage, scope });
+    toast(`Зарплата ${wage.toFixed(2)} ₡ — на ${r.changed} из ${r.total} предприятий`
+        + (r.raised_to_min_wage
+            ? `; ${r.raised_to_min_wage} подняты до местного МРОТ` : ''));
+});
 const upgrade = id => act(async () => {
     const r = await api('/api/buildings/upgrade', { id });
     toast('Уровень ' + r.building.level);
@@ -622,6 +770,14 @@ const demolish = id => act(async () => {
 });
 
 /* ------------------------------ стройка ------------------------------ */
+/** Подходит ли отрасль под строку поиска: имя, товар, сырьё или отрасль. */
+function matchesQuery(i, q) {
+    if (!q) return true;
+    const hay = [i.name, i.output_good_name, i.sector_name, i.description || '']
+        .concat((i.inputs || []).map(x => x.name)).join(' ').toLowerCase();
+    return hay.includes(q);
+}
+
 function renderBuild() {
     // Строим в области: у каждой свой рынок сырья и своя рабочая сила.
     regionPicker('buildRegions', S.regions, S.region);
@@ -634,47 +790,106 @@ function renderBuild() {
         Новому предприятию зарплата ставится с запасом автоматически. Если в стране есть
         свободные рабочие, они нанимаются и при меньшей ставке.`;
 
-    const prod = S.industries.filter(i => i.kind !== 'admin');
-    $('buildRows').innerHTML = prod.map(i => {
+    const ch = S.chainRules || {};
+    $('chainNote').innerHTML = `Разрозненные заводы работают хуже связанных.
+        Каждое <b>звено цепочки</b> во дворе — сосед, который делает для вас сырьё
+        или пускает ваш выпуск в дело, — прибавляет
+        <b class="good">+${pct(ch.link_bonus || 0)}</b> к выпуску, каждый <b>сосед по
+        отрасли</b> — ещё <b class="good">+${pct(ch.sector_bonus || 0)}</b>, до
+        <b>+${pct(ch.cap || 0)}</b> в сумме. Считается по вашим предприятиям в одной
+        области, поэтому выгоднее поднимать цепочку целиком и в одной отрасли,
+        чем хватать всё подряд. Второго такого же завода в одной области не строят —
+        только новый уровень.`;
+
+    // Фильтры: отрасль и поиск. Отраслей уже два десятка, и без них таблица
+    // превращается в простыню.
+    const sectors = S.sectors || [];
+    const cur = S.buildSector || 'all';
+    $('buildSectors').innerHTML = [{ key: 'all', name: 'Все отрасли' }]
+        .concat(sectors).map(s =>
+            `<button class="rg${s.key === cur ? ' on' : ''}"
+                onclick="pickSector('${s.key}')">${esc(s.name)}</button>`).join('');
+
+    const q = ($('buildSearch').value || '').trim().toLowerCase();
+    const prod = S.industries.filter(i => i.kind !== 'admin'
+        && (cur === 'all' || i.sector === cur) && matchesQuery(i, q));
+
+    $('buildRows').innerHTML = prod.length ? prod.map(i => {
         const ins = i.inputs.length
             ? i.inputs.map(x => `<span class="${x.available ? '' : 'bad'}">${esc(x.name)} ×${x.qty}</span>`).join(', ')
             : '<span class="dim">ничего</span>';
         const short = i.shortage > .3 ? 'bad' : i.shortage > .05 ? 'warn' : 'dim';
+        const sell = i.sell_through;
+        const chain = i.chain || {};
+        // Такой же завод здесь уже стоит — значит только уровень
+        const mine = i.mine, stateHere = i.state_here;
         return `<tr>
-            <td>${esc(i.name)}</td>
+            <td>${esc(i.name)}<br><span class="tag">${esc(i.sector_name)}</span></td>
             <td>${esc(i.output_good_name)} <span class="dim">${i.output_per_worker}/раб.</span></td>
             <td class="dim" style="font-size:13px">${ins}</td>
-            <td class="right ${i.value_per_worker > 0 ? 'good' : 'bad'}">${i.value_per_worker.toFixed(1)} ₡</td>
+            <td class="right ${i.value_per_worker > 0 ? 'good' : 'bad'}">${i.value_per_worker.toFixed(1)} ₡
+                ${sell != null && sell < .995 ? `<br><span class="dim" style="font-size:12px"
+                    title="С поправкой на сбыт: непроданное денег не приносит">${
+                    i.value_per_worker_net.toFixed(1)} ₡ по факту</span>` : ''}</td>
+            <td class="right ${sell == null ? 'dim' : sell < .6 ? 'bad'
+                : sell < .9 ? 'warn' : 'good'}">${sell == null ? '—' : pct(sell)}</td>
+            <td class="right ${chain.bonus > 0 ? 'chain' : 'dim'}"
+                title="${chainTitle(chain)}">${chain.bonus > 0 ? '+' + pct(chain.bonus) : '—'}</td>
             <td class="right">${i.inputs_ready
                 ? '<span class="good">есть</span>' : '<span class="bad">нет в стране</span>'}</td>
             <td class="right ${i.has_buyer ? 'dim' : 'bad'}">${i.has_buyer
                 ? qty(i.output_demand) : 'покупателя нет'}</td>
             <td class="right ${short}">${i.shortage > .005 ? pct(i.shortage) : '—'}</td>
             <td class="right dim">${i.state_levels} / ${i.private_levels}</td>
-            <td class="right">${money(i.build_cost)} ₡</td>
+            <td class="right">${mine ? money(mine.upgrade_cost) : money(i.build_cost)} ₡</td>
             <td class="right" style="white-space:nowrap">
-                <button class="sm primary" onclick="buildBiz('${i.key}')">Построить</button>
-                ${S.me.is_governor ? `<button class="sm"
-                    onclick="buildBiz('${i.key}', true)" title="За счёт казны">казной</button>` : ''}
+                ${mine
+                    ? `<button class="sm primary" onclick="upgrade(${mine.id})"
+                        title="Такое предприятие здесь у вас уже есть — второе не строят">
+                        Ур. ${mine.level} → ${mine.level + 1}</button>`
+                    : `<button class="sm primary" onclick="buildBiz('${i.key}')">Построить</button>`}
+                ${S.me.is_governor ? (stateHere
+                    ? `<button class="sm" onclick="upgrade(${stateHere.id})"
+                        title="Казённое предприятие этой отрасли здесь уже есть">
+                        казной ур. ${stateHere.level + 1}</button>`
+                    : `<button class="sm" onclick="buildBiz('${i.key}', true)"
+                        title="За счёт казны. Цепочка казны здесь: ${
+                            (i.state_chain || {}).bonus
+                                ? '+' + pct(i.state_chain.bonus) + ' — ' + chainTitle(i.state_chain)
+                                : 'связанных казённых предприятий рядом нет'}">казной</button>`) : ''}
             </td>
         </tr>`;
-    }).join('');
+    }).join('') : '<tr><td colspan="12" class="empty">Ничего не нашлось — '
+        + 'смените отрасль или запрос</td></tr>';
 
     const admins = S.industries.filter(i => i.kind === 'admin');
     $('adminCard').style.display = admins.length ? '' : 'none';
-    $('adminRows').innerHTML = admins.map(i => `<tr>
-        <td>${esc(i.name)}</td>
+    $('adminRows').innerHTML = admins.map(i => {
+        // Здание с пределом развития: показываем, сколько уровней уже занято в
+        // этой области и во что обойдётся следующий — у палаты он кусается.
+        const here = i.state_here || i.mine;
+        const capped = i.max_level && i.levels_here >= i.max_level;
+        const next = here ? here.upgrade_cost : i.build_cost;
+        return `<tr>
+        <td>${esc(i.name)}${i.max_level
+            ? ` <span class="tag ${capped ? 'luxury' : ''}">${i.levels_here} / ${i.max_level} ур.</span>` : ''}</td>
         <td class="dim" style="font-size:13px;max-width:320px">${esc(i.description)}</td>
         <td class="dim" style="font-size:13px">${i.upkeep_goods.map(x =>
             `${esc(x.name)} ×${x.qty}`).join(', ') || '—'}</td>
         <td class="right">${qty(i.jobs_per_level)}</td>
         <td class="right dim">${money(i.cost_per_level)} ₡</td>
-        <td class="right">${money(i.build_cost)} ₡</td>
-        <td class="right"><button class="sm ${S.me.is_governor ? 'primary' : ''}"
+        <td class="right ${next > 1e7 ? 'warn' : ''}">${money(next)} ₡</td>
+        <td class="right">${capped
+            ? '<span class="dim">развита до предела</span>'
+            : `<button class="sm ${S.me.is_governor ? 'primary' : ''}"
             ${S.me.is_governor ? '' : 'disabled title="Нужны полномочия гос.деятеля"'}
-            onclick="buildBiz('${i.key}', true)">Построить казной</button></td>
-    </tr>`).join('');
+            onclick="${here ? `upgrade(${here.id})` : `buildBiz('${i.key}', true)`}">${
+                here ? 'Поднять уровень' : 'Построить казной'}</button>`}</td>
+    </tr>`;
+    }).join('');
 }
+
+function pickSector(key) { S.buildSector = key; renderBuild(); }
 
 const buildBiz = (key, state) => act(async () => {
     const r = await api('/api/buildings/build',
@@ -701,6 +916,10 @@ function renderCountry() {
             <td class="right ${c.satisfaction < .4 ? 'bad' : c.satisfaction < .55 ? 'warn' : 'good'}">${pct(c.satisfaction)}</td>
             <td class="right ${c.living_standard < .3 ? 'bad' : c.living_standard < .55 ? 'warn' : 'good'}">${c.living_standard.toFixed(2)}</td>
             <td class="right">${c.avg_wage.toFixed(2)} ₡</td>
+            <td class="right ${(c.access || 0) < .3 ? 'bad' : (c.access || 0) < .6 ? 'warn'
+                : (c.access || 0) < .999 ? 'good' : 'gold'}"
+                title="Торговых палат: ${c.chambers || 0} ур. Доступность решает, насколько быстро цены здесь сравниваются с остальной страной и какой объём область пропускает через границу">${
+                pct(c.access || 0)}</td>
             <td><div class="bar" style="margin:0" title="Озлобление ${pct(unrest)}">
                 <i style="width:${Math.min(100, unrest * 100).toFixed(0)}%;
                    background:${unrest > .7 ? 'var(--bad)' : 'var(--warn)'}"></i></div></td>
@@ -708,16 +927,33 @@ function renderCountry() {
         </tr>`;
     }).join('');
 
-    lineChart('gdpChart', [
-        { data: S.macro.map(r => ({ x: r.tick, y: r.gdp })), color: '#4c9aff' },
-        { data: S.macro.map(r => ({ x: r.tick, y: r.treasury })), color: '#e3b341' },
-    ], { fmt: money, zero: true });
+    drawGdpChart();
 
     api('/api/events?limit=20').then(r => {
         $('eventRows').innerHTML = r.events.length
             ? r.events.map(e => `<li><b>#${e.tick}</b>${esc(e.message)}</li>`).join('')
             : '<li class="dim">Пока ничего не произошло</li>';
     }).catch(() => {});
+}
+
+function drawGdpChart() {
+    if (!S.macro) return;
+    lineChart('gdpChart', [
+        { data: S.macro.map(r => ({ x: r.tick, y: r.gdp })), color: '#4c9aff' },
+        { data: S.macro.map(r => ({ x: r.tick, y: r.treasury })), color: '#e3b341' },
+    ], { fmt: money, zero: true });
+}
+
+/** Перерисовать все графики разом. Нужен там, где ширина рамки только что
+ *  изменилась: раскрыли свёрнутую карточку, повернули телефон, потянули окно.
+ *  lineChart снимает ширину с живого DOM (svg.clientWidth), поэтому без этого
+ *  график, нарисованный в свёрнутом виде, остаётся растянутым по запасным
+ *  600 пикселям. */
+function redrawCharts() {
+    if (!S.world) return;
+    if (S.market && S.market.length) drawPriceChart();
+    if (S.macro) { drawMacroChart(); drawGdpChart(); }
+    if (S.exchange) drawWorldChart();
 }
 
 /* ------------------------------ государство ------------------------------ */
@@ -729,6 +965,7 @@ function renderGov() {
     $('gGdp').textContent = money(c.gdp) + ' ₡';
     $('gWage').textContent = (wld.avg_wage || 0).toFixed(2) + ' ₡';
     $('gInd').textContent = pct(c.industrialisation);
+    renderBudget(c.budget);
     renderGovBuildings();
     renderElections();
     renderConfidence();
@@ -737,24 +974,70 @@ function renderGov() {
     $('gCorp').value = Math.round(c.corporate_tax * 100);
     $('gSales').value = Math.round(c.sales_tax * 100);
     $('gInc').value = Math.round(c.income_tax * 100);
+    // Подушная подать — не доля, а твёрдая сумма с души, поэтому без ×100.
+    $('gPoll').value = (c.poll_tax || 0).toFixed(2);
+    $('gTithe').value = Math.round((c.tithe || 0) * 100);
+    $('gWealth').value = ((c.wealth_tax || 0) * 100).toFixed(1);
+    $('gExcise').value = Math.round((c.excise_tax || 0) * 100);
     $('gSpend').value = Math.round(c.public_spending_rate * 100);
     $('gRent').value = Math.round(c.land_rent * 100);
+    $('gTariff').value = Math.round((c.tariff || 0) * 100);
+    $('gImport').value = Math.round((c.import_tariff || 0) * 100);
     $('gMin').value = Math.round(c.min_wage);
     $('gBank').value = Math.round(c.bankruptcy_limit);
     const cb = $('gForeign');
     if (cb) cb.checked = !!c.foreign_investment_open;
     const can = S.me.is_governor && c.leader_is_ai === false && c.id === S.me.country_id;
     $('govSave').disabled = !can;
-    $('govNote').textContent = can
+    $('govNote').innerHTML = can
         ? 'Вы лидер государства «' + c.name + '». Налоги наполняют казну, госрасходы '
         + 'возвращают деньги людям. Земельная рента забирает часть выручки деревни в '
-        + 'пользу высшего класса. Откройте страну для иностранных инвестиций, чтобы '
-        + 'чужие промышленники могли строить у вас.'
+        + 'пользу высшего класса. Помните, что <b>подоходный налог</b> удерживается '
+        + 'только с заводских зарплат, а их получают одни рабочие: деревня и горожане '
+        + 'проходят мимо него целиком. Взять с них можно <b>подушной податью</b> (с души, '
+        + 'ложится на всех поровну и потому больнее всего — на бедных), <b>оброком</b> '
+        + '(доля рыночной выручки крестьян и кустарей), <b>налогом на сбережения</b> '
+        + '(с накопленного, тяжелее всего для высшего класса) и <b>акцизом на роскошь</b> '
+        + '(его платит только тот, кто уже живёт лучше обычного). '
+        + '<b>Вывозная пошлина</b> берётся с каждой сделки на '
+        + 'бирже и оседает в казне, но чем она выше, тем меньше своим смысла вывозить. '
+        + '<b>Ввозная</b> защищает своих: чужой товар обходится в мировую цену плюс '
+        + 'пошлину, и пока дома дешевле — импорт до прилавка не дойдёт. Откройте страну '
+        + 'для иностранных инвестиций, чтобы чужие промышленники могли строить у вас.'
         : (c.leader_is_ai
             ? 'Государством управляет AI. Зарегистрируйтесь здесь и победите на выборах, '
               + 'чтобы стать лидером.'
             : 'Лидер государства — «' + (c.leader || 'другой игрок') + '». Здесь видно, '
               + 'по каким правилам живёт страна.');
+}
+
+/** Роспись казны: каждая статья — своя строка, доли считаются от итога.
+ *
+ *  Статьи с нулём не прячем намеренно: пустая строка «Подушная подать» — это
+ *  подсказка, что рычаг есть и он не задействован. Пустой остаётся только та
+ *  сторона отчёта, где вообще ничего не было.
+ */
+function renderBudget(b) {
+    if (!b) return;
+    const sign = v => (v > 0 ? 'good' : v < 0 ? 'bad' : 'dim');
+    $('bOpen').textContent = money(b.opening) + ' ₡';
+    $('bIn').textContent = '+' + money(b.total_income) + ' ₡';
+    $('bOut').textContent = '−' + money(b.total_expense) + ' ₡';
+    const net = $('bNet');
+    net.textContent = (b.net >= 0 ? '+' : '−') + money(Math.abs(b.net)) + ' ₡';
+    net.className = 'v num ' + sign(b.net);
+    $('bClose').textContent = money(b.closing) + ' ₡';
+
+    const rows = (list, total) => list.length
+        ? list.map(r => `<tr title="${esc(r.note)}">
+            <td>${esc(r.name)}</td>
+            <td class="right ${r.amount ? '' : 'dim'}">${money(r.amount)}</td>
+            <td class="right dim">${r.per_capita.toFixed(2)}</td>
+            <td class="right dim">${total > 0 ? pct(r.amount / total) : '—'}</td>
+          </tr>`).join('')
+        : '<tr><td colspan="4" class="dim">Ничего не было</td></tr>';
+    $('budgetIn').innerHTML = rows(b.income, b.total_income);
+    $('budgetOut').innerHTML = rows(b.expense, b.total_expense);
 }
 
 function renderElections() {
@@ -775,12 +1058,12 @@ function renderElections() {
     html += '</div>';
     const cands = el.candidates || [];
     if (cands.length) {
-        html += '<table style="font-size:13px"><tbody>' + cands.map(cd =>
+        html += '<div class="tw"><table style="font-size:13px"><tbody>' + cands.map(cd =>
             `<tr><td>${esc(cd.username)}${cd.is_me ? ' (вы)' : ''}</td>
              <td class="right dim">${cd.votes} гол.</td>
              <td class="right">${phase === 'voting' && !cd.is_me
                 ? `<button class="sm" onclick="voteFor(${cd.id})">Голосовать</button>` : ''}</td></tr>`
-        ).join('') + '</tbody></table>';
+        ).join('') + '</tbody></table></div>';
     } else {
         html += '<div class="dim" style="font-size:13px">Кандидатов (игроков-граждан) пока нет.</div>';
     }
@@ -833,11 +1116,13 @@ const voteConfidence = verdict => act(async () => {
 function renderCitizens() {
     const d = S.citizens;
     if (!d || !$('citizenRows')) return;
-    const lead = S.me.is_governor && S.world.country
-        && S.world.country.id === S.me.country_id;
+    const lead = !!d.is_leader;
     $('cBankrupt').textContent = d.bankrupt;
     $('cBankrupt').className = 'v num ' + (d.bankrupt ? 'bad' : 'good');
     $('cLimit').textContent = money(d.bankruptcy_limit) + ' ₡';
+    $('cExit').textContent = money(d.exit_level) + ' ₡';
+    $('cExit').title = 'Пока касса ниже этого числа, снимать банкротство '
+        + 'бессмысленно — дело провалится тем же пейдеем';
     $('cSubs').textContent = money(d.last_subsidies) + ' ₡';
     $('cTreasury').textContent = money(d.treasury) + ' ₡';
 
@@ -847,21 +1132,40 @@ function renderCitizens() {
         <td class="right ${p.cash < 0 ? 'bad' : ''}">${money(p.cash)} ₡</td>
         <td class="right dim">${money(p.net_worth)} ₡</td>
         <td class="right">${p.buildings}${p.damaged
-            ? ` <span class="bad" title="разрушено уровней">(−${p.damaged})</span>` : ''}</td>
+            ? ` <span class="bad" title="разрушено уровней">(−${p.damaged})</span>` : ''}${
+            p.halted ? ` <span class="warn" title="запечатано банкротством">(⏸${p.halted})</span>` : ''}</td>
         <td class="right dim">${qty(p.employees)}</td>
         <td class="right ${p.profit >= 0 ? 'good' : 'bad'}">${
             (p.profit >= 0 ? '+' : '') + money(p.profit)} ₡</td>
         <td>${p.bankrupt
             ? `<span class="bad">банкрот с #${p.bankrupt_since}</span>`
-            : '<span class="dim">в деле</span>'}</td>
+            : p.halted ? '<span class="warn">часть цехов под замком</span>'
+                : '<span class="dim">в деле</span>'}</td>
         <td class="right" style="white-space:nowrap">${lead ? `
             <input type="number" id="sub${p.id}" style="width:110px" step="100000"
                    value="${Math.max(0, Math.round(p.rescue_cost)) || ''}"
                    placeholder="сумма">
             <button class="sm ${p.bankrupt ? 'primary' : ''}"
                 onclick="giveSubsidy(${p.id})">Выдать</button>` : ''}</td>
-    </tr>`).join('') : '<tr><td colspan="8" class="empty">Промышленников пока нет</td></tr>';
+        <td class="right" style="white-space:nowrap">${
+            !lead || (!p.bankrupt && !p.halted) ? '<span class="dim">—</span>'
+            : !p.can_release && p.bankrupt
+                ? `<span class="dim" title="Сначала субсидия">не хватает ${
+                    money(p.rescue_cost)} ₡</span>`
+            : `<button class="sm primary" onclick="endBankruptcy(${p.id},'all')"
+                   title="Открыть всё хозяйство">Открыть всё (${p.halted})</button>
+               <button class="sm" onclick="endBankruptcy(${p.id},'profitable')"
+                   title="Открыть только те цеха, что работали в плюс; убыточные останутся под замком">
+                   Только прибыльные (${p.halted_profitable})</button>`}</td>
+    </tr>`).join('') : '<tr><td colspan="9" class="empty">Промышленников пока нет</td></tr>';
 }
+
+/** Государство закрывает дело о банкротстве и решает, что запускать обратно. */
+const endBankruptcy = (id, mode) => act(async () => {
+    const r = await api('/api/gov/bankruptcy', { player_id: id, mode });
+    toast(`Банкротство закрыто: запущено ${r.opened} предприятий`
+        + (r.sealed ? `, ${r.sealed} убыточных остались под замком` : ''));
+});
 
 const giveSubsidy = id => act(async () => {
     const amount = Number($('sub' + id).value);
@@ -879,6 +1183,13 @@ function renderGovBuildings() {
     const act = document.activeElement;
     if (act && act.tagName === 'INPUT' && box.contains(act)) return;
     const can = !!S.canManageState;
+    // «Установить зп всем» — только лидеру и только если есть чему её ставить
+    const wageBox = $('govWageBox');
+    if (wageBox) {
+        wageBox.style.display = can && bs.length ? '' : 'none';
+        if ($('govWageBtn')) $('govWageBtn').disabled = !can;
+        wageSpread(bs, 'govWageAll');
+    }
     box.innerHTML = bs.length ? bs.map(b => {
         const admin = b.kind === 'admin';
         const ins = b.inputs.length
@@ -896,7 +1207,13 @@ function renderGovBuildings() {
             <dl>
                 <dt>Рабочие</dt><dd>${qty(b.employed)} / ${qty(b.jobs)} (${pct(b.fill)})</dd>
                 <dt>Зарплата</dt><dd>${b.wage.toFixed(2)} ₡</dd>
+                ${b.chain_bonus > 0 ? `<dt>Цепочка</dt>
+                <dd class="chain" title="${chainTitle(b.chain)}">+${pct(b.chain_bonus)} к выпуску</dd>` : ''}
                 ${b.output_good ? `<dt>Выпуск</dt><dd>${qty(b.last_output)}</dd>
+                <dt>Продано</dt><dd class="${b.sell_through == null ? ''
+                    : b.sell_through < .6 ? 'bad' : b.sell_through < .9 ? 'warn' : 'good'}">${
+                    qty(b.last_sold)}${b.sell_through != null
+                        ? ` (${pct(b.sell_through)})` : ''}</dd>
                 <dt>Выручка</dt><dd>${money(b.last_revenue)} ₡</dd>` : ''}
                 <dt>${admin && !b.output_good ? 'Содержание' : 'Прибыль'}</dt>
                 <dd class="${profit >= 0 ? 'good' : 'bad'}">${
@@ -926,8 +1243,15 @@ const savePolicy = () => act(async () => {
         corporate_tax: Number($('gCorp').value) / 100,
         sales_tax: Number($('gSales').value) / 100,
         income_tax: Number($('gInc').value) / 100,
+        // подушная подать задаётся в червонцах с души, а не в процентах
+        poll_tax: Number($('gPoll').value),
+        tithe: Number($('gTithe').value) / 100,
+        wealth_tax: Number($('gWealth').value) / 100,
+        excise_tax: Number($('gExcise').value) / 100,
         public_spending_rate: Number($('gSpend').value) / 100,
         land_rent: Number($('gRent').value) / 100,
+        tariff: Number($('gTariff').value) / 100,
+        import_tariff: Number($('gImport').value) / 100,
         min_wage: Number($('gMin').value),
         bankruptcy_limit: Math.min(0, Number($('gBank').value)),
     };
@@ -967,10 +1291,10 @@ function renderAnnexations() {
         return `<div class="biz${a.resolved ? '' : ' hurt'}">
             <h3>${esc(a.city)} <span class="lvl">отнята у ${esc(a.former)}${
                 a.resolved ? '' : ` · решить за ${Math.max(0, left)} пейдей(-ев)`}</span></h3>
-            ${a.pending.length ? `<table style="font-size:13px"><tbody>${
-                rows(a.pending, false)}</tbody></table>` : ''}
-            ${a.decided.length ? `<table style="font-size:12px;margin-top:8px"><tbody>${
-                rows(a.decided, true)}</tbody></table>` : ''}
+            ${a.pending.length ? `<div class="tw"><table style="font-size:13px"><tbody>${
+                rows(a.pending, false)}</tbody></table></div>` : ''}
+            ${a.decided.length ? `<div class="tw"><table style="font-size:12px;margin-top:8px"><tbody>${
+                rows(a.decided, true)}</tbody></table></div>` : ''}
             ${a.resolved ? '<div class="muted" style="font-size:12px;margin-top:8px">Решено.</div>'
             : lead && a.pending.length ? `<div class="acts" style="margin-top:10px">
                 <button class="sm primary" onclick="decideAnnex(${a.id},'keep')">Оставить всех</button>
@@ -1074,21 +1398,44 @@ function renderWar() {
         </tr>`).join('');
         const peace = (w.separate_peace || []).map(p =>
             `${esc(p.a)} — ${esc(p.b)}`).join('; ');
+        // Восстание — не война государств: договариваться с мятежниками не с
+        // кем, поэтому вместо кнопок мира здесь стоит предупреждение.
+        const revolt = w.revolt ? `<div class="bad" style="font-size:13px;margin-bottom:8px">
+            <b>Восстание.</b> ${esc(sides(w.defenders))} откололась и требует
+            независимости. Мира в такой войне не бывает: область можно только
+            вернуть силой — или потерять насовсем.</div>` : '';
         return `<div class="biz${mine ? ' hurt' : ''}">
-            <h3>Война #${w.id} ${mine ? '<span class="tag">вы участвуете</span>' : ''}
+            <h3>${w.revolt ? 'Восстание' : 'Война'} #${w.id}
+                ${mine ? '<span class="tag">вы участвуете</span>' : ''}
+                ${w.revolt ? '<span class="tag military">мира не будет</span>' : ''}
                 <span class="lvl">с пейдея #${w.started_tick}</span></h3>
             <div class="where">${sides(w.attackers)} <b>против</b> ${sides(w.defenders)}</div>
+            ${revolt}
             ${peace ? `<div class="muted" style="font-size:12px;margin-bottom:8px">
                 Сепаратный мир: ${peace}</div>` : ''}
-            ${occ ? `<table style="font-size:13px"><tbody>${occ}</tbody></table>` : ''}
-            ${rep ? `<table style="font-size:12px;margin-top:8px"><tbody>${rep}</tbody></table>`
+            ${occ ? `<div class="tw"><table style="font-size:13px"><tbody>${occ}</tbody></table></div>` : ''}
+            ${rep ? `<div class="tw"><table style="font-size:12px;margin-top:8px"><tbody>${rep}</tbody></table></div>`
                 : '<div class="muted" style="font-size:12px">Боёв не было: у сторон нет общей границы.</div>'}
-            ${mine && lead ? `<div class="acts" style="margin-top:10px">${
+            ${mine && lead && w.can_peace ? `<div class="acts" style="margin-top:10px">${
                 (w.my_enemies || []).map(e =>
                     `<button class="sm" onclick="offerPeace(${w.id},${e.id})">Мир с ${esc(e.name)}</button>`
                 ).join('')}</div>` : ''}
         </div>`;
     }).join('') : '<div class="empty">В мире тихо — ни одной войны.</div>';
+
+    // Своё восстание — событие, которое нельзя не заметить: выносим отдельным
+    // предупреждением над списком войн.
+    const myRevolts = (d.my_wars || []).filter(w => w.revolt);
+    if (myRevolts.length) {
+        $('warList').insertAdjacentHTML('afterbegin',
+            `<div class="card bad" style="margin-bottom:14px">
+                <b>В стране восстание!</b> ${myRevolts.map(w =>
+                    esc(w.defenders.map(x => x.name).join(', '))).join('; ')} —
+                отколовшиеся области с пейдея #${myRevolts[0].started_tick}.
+                Мир с мятежниками невозможен: пока восстание не подавлено,
+                области считаются потерянными, а часть армии ушла к ним.
+            </div>`);
+    }
 
     // ---- предложения ----
     const inc = (d.incoming || []).map(o => `<tr>
@@ -1105,7 +1452,7 @@ function renderWar() {
         <td class="dim">пейдей #${o.created_tick}</td>
         <td class="right dim">ждём ответа</td></tr>`).join('');
     $('offerList').innerHTML = (inc || out)
-        ? `<table style="font-size:13px"><tbody>${inc}${out}</tbody></table>`
+        ? `<div class="tw"><table style="font-size:13px"><tbody>${inc}${out}</tbody></table></div>`
         : '<div class="empty">Предложений нет.</div>';
 
     // ---- соседи ----
@@ -1279,37 +1626,124 @@ function renderTop() {
 const forceTick = () => act(async () => { await api('/api/tick', {}); });
 
 /* ------------------------------ навигация ------------------------------ */
-document.querySelectorAll('nav button').forEach(btn => {
-    btn.onclick = () => {
-        document.querySelectorAll('nav button').forEach(b => b.classList.remove('on'));
-        document.querySelectorAll('.page').forEach(p => p.classList.remove('on'));
-        btn.classList.add('on');
-        S.page = btn.dataset.page;
-        $('page-' + S.page).classList.add('on');
-        if (S.page === 'market') renderMarket();
-        if (S.page === 'country') renderCountry();
-        if (S.page === 'people') renderPeople();
-        if (S.page === 'top') renderTop();
-        if (S.page === 'map') renderMap();
-        if (S.page === 'gov') renderGov();
-        if (S.page === 'exchange') renderExchange();
-        if (S.page === 'war') { renderWar(); renderAnnexations(); }
-    };
+/** Узкий экран. Один порог на весь клиент — тот же, что в style.css. */
+const narrow = () => window.matchMedia('(max-width: 720px)').matches;
+const NAV_MQ = window.matchMedia('(max-width: 720px)');
+
+/** Переключение раздела. Вынесено из обработчика: на телефоне те же разделы
+ *  открываются ещё и из листа «Ещё», а дублировать логику ради этого незачем. */
+function goPage(page) {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('on'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('on'));
+    const btn = document.querySelector(`nav button[data-page="${page}"]`);
+    if (!btn) return;
+    btn.classList.add('on');
+    S.page = page;
+    $('page-' + page).classList.add('on');
+    // Раздел из-под «Ещё» подсвечивает саму кнопку «Ещё»: иначе на телефоне
+    // не видно, где ты находишься.
+    $('navMore').classList.toggle('on', !btn.dataset.pin);
+    closeNavSheet();
+
+    if (page === 'market') renderMarket();
+    if (page === 'country') renderCountry();
+    if (page === 'people') renderPeople();
+    if (page === 'top') renderTop();
+    if (page === 'map') renderMap();
+    if (page === 'gov') renderGov();
+    if (page === 'exchange') renderExchange();
+    if (page === 'war') { renderWar(); renderAnnexations(); }
+    // Страница только что показалась — до этого её svg были нулевой ширины.
+    redrawCharts();
+}
+
+document.querySelectorAll('nav button[data-page]').forEach(btn => {
+    btn.onclick = () => goPage(btn.dataset.page);
+});
+
+/* ------------------------- лист «Ещё» (телефон) ------------------------- */
+function toggleNavSheet() {
+    const sheet = $('navSheet');
+    if (sheet.classList.contains('open')) return closeNavSheet();
+    // Лист собираем из самого меню, чтобы список разделов жил в одном месте.
+    $('navSheetBody').innerHTML = [...document.querySelectorAll('nav button[data-page]')]
+        .filter(b => !b.dataset.pin)
+        .map(b => `<button class="${b.dataset.page === S.page ? 'on' : ''}"
+            onclick="goPage('${b.dataset.page}')">${esc(b.textContent.trim())}</button>`)
+        .join('');
+    sheet.classList.add('open');
+}
+
+/** Закрыть лист. Клик по подложке закрывает, клик по кнопке внутри — нет. */
+function closeNavSheet(e) {
+    if (e && e.target !== $('navSheet')) return;
+    $('navSheet').classList.remove('open');
+}
+
+/* ---------------------- сворачиваемые подразделы ---------------------- */
+/* На телефоне раздел открывается со свёрнутыми карточками, кроме помеченной
+   data-main, — иначе до нужной таблицы приходится мотать пол-экрана. На ПК
+   всё развёрнуто. Что игрок открыл или закрыл руками, помним и уважаем. */
+const UI_KEY = 'simpolec.sections';
+
+function loadSections() {
+    try { return JSON.parse(localStorage.getItem(UI_KEY)) || {}; }
+    catch (e) { return {}; }
+}
+
+function applySections() {
+    const saved = loadSections();
+    const phone = narrow();
+    document.querySelectorAll('details.card[data-sec]').forEach(d => {
+        const key = d.dataset.sec;
+        d.open = key in saved ? saved[key]
+            : (!phone || d.hasAttribute('data-main'));
+    });
+}
+
+// Событие toggle не всплывает — слушаем на фазе перехвата.
+document.addEventListener('toggle', e => {
+    const d = e.target;
+    if (!(d instanceof HTMLDetailsElement)) return;
+    if (d.classList.contains('card') && d.dataset.sec) {
+        const saved = loadSections();
+        saved[d.dataset.sec] = d.open;
+        try { localStorage.setItem(UI_KEY, JSON.stringify(saved)); } catch (err) {}
+    }
+    // Карточку раскрыли — только теперь у её svg появилась настоящая ширина.
+    if (d.open && d.querySelector('.chart')) redrawCharts();
+}, true);
+
+// Смена ширины экрана меняет умолчания, но не затирает выбор игрока.
+NAV_MQ.addEventListener('change', () => {
+    closeNavSheet();
+    applySections();
+    redrawCharts();
 });
 
 ['u', 'p'].forEach(id => $(id).addEventListener('keydown', e => {
     if (e.key === 'Enter') doAuth('login');
 }));
-window.addEventListener('resize', () => { if (S.world) renderMarket(); });
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+    if (!S.world) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(redrawCharts, 150);
+});
 
 // Обработчики висят в разметке на onclick, поэтому кладём их в window явно.
 Object.assign(window, {
     doAuth, logout, showAuth, pickGood, forceTick, savePolicy, pickMapNode, pickRegion,
-    voteFor, setWage, upgrade, toggleBiz, demolish, buildBiz, repairBiz,
+    voteFor, setWage, setWageAll, upgrade, toggleBiz, demolish, buildBiz, repairBiz,
     pickXGood, saveArmy, mobilize, demobilize, declareWar, offerPeace,
     offerAlliance, acceptOffer, declineOffer, breakAlliance,
-    voteConfidence, giveSubsidy, decideAnnex,
+    voteConfidence, giveSubsidy, decideAnnex, endBankruptcy,
+    pickSector, renderBuild,
+    goPage, toggleNavSheet, closeNavSheet,
 });
+
+applySections();
 
 setInterval(tickClock, 1000);
 setInterval(() => { if (S.token) refresh(false); }, 5000);

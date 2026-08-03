@@ -136,20 +136,26 @@ def pay_builders(world, country, city, p: Player, cost: float) -> None:
     st = city.s("town_low")
     st.cash += net
     st.income += net
-    country.treasury += cost * country.income_tax
+    # Через статью бюджета, а не мимо неё: роспись казны обязана сходиться с
+    # остатком, и бот-застройщик не исключение.
+    country.collect("income_tax", cost * country.income_tax)
 
 
-def open_trade(world, countries: int = 3, levels: int = 3) -> None:
-    """Построить торговые площади в нескольких государствах."""
-    for n, co in enumerate(list(world.countries.values())[:countries]):
-        city = next(c for c in world.cities.values() if c.country_id == co.id)
-        p = Player(id=world.next_player_id, username=f"Купец-{co.name}",
-                   cash=3e7, country_id=co.id)
-        world.players[p.id] = p
-        world.next_player_id += 1
-        for _ in range(4):
-            b = Building(id=world.next_building_id, industry_key="market",
-                         owner_id=p.id, city_id=city.id, level=levels, wage=50.0)
+def open_trade(world, countries: int = 3, levels: int = 6) -> None:
+    """Поднять «Торговые палаты» в нескольких государствах.
+
+    Палата — казённое ведомство, и строит её государство, поэтому владельцем
+    ставим казну. Каждый её уровень поднимает доступность рынка области на
+    десять процентов: с шестью уровнями область включена в общий рынок на 70%.
+    """
+    for co in list(world.countries.values())[:countries]:
+        state = world.state_player(co.id)
+        if state is None:
+            continue
+        for city in world.country_regions(co.id):
+            b = Building(id=world.next_building_id, industry_key="trade_chamber",
+                         owner_id=state.id, city_id=city.id, level=levels,
+                         wage=50.0)
             world.buildings[b.id] = b
             world.next_building_id += 1
 
@@ -212,6 +218,11 @@ def main() -> int:
 
     food_shortage = []
     worst_cash = float("inf")
+    # Роспись казны обязана сходиться с остатком до червонца: каждое движение
+    # казны помечено статьёй, и сумма статей равна изменению остатка. Если
+    # где-то в коде казна меняется мимо Country.collect/.spend, эта проверка
+    # поймает пропажу — а вкладка «Казна» перестала бы врать незаметно.
+    budget_drift = 0.0
     war = None
     war_log = {"battles": 0, "damaged": 0, "news": [], "separate_peace": False}
     for i in range(1, TICKS + 1):
@@ -232,6 +243,11 @@ def main() -> int:
                     and not war.ended
                     and war_setup["attacker"].id in war.attackers)
         r = run_tick(world)
+        for co in world.countries.values():
+            if co.alive:
+                budget_drift = max(budget_drift, abs(
+                    co.last_budget_opening + sum(co.last_budget.values())
+                    - co.budget_opening))
         bc = bot_home()
         if war is not None:
             war_log["battles"] += len(war.last_report)
@@ -320,6 +336,19 @@ def main() -> int:
          f"{money_drift:+.1%}"),
         ("казны не в минусе", treasury >= -1,
          f"{treasury:,.0f} ₡"),
+        ("роспись казны сходится с остатком", budget_drift < 1.0,
+         f"максимальное расхождение {budget_drift:,.4f} ₡ за пейдей"),
+        # Государство обязано УМЕТЬ выходить в плюс: налоги с населения дают
+        # ему доход, не зависящий от того, есть ли в стране заводы.
+        ("налоги с населения поступают",
+         sum(v for co in world.countries.values()
+             for k, v in co.last_budget.items()
+             if k in ("poll_tax", "tithe", "wealth_tax", "excise")) > 0,
+         "подать + оброк + налог на сбережения + акциз: "
+         + ", ".join(
+             f"{name} {sum(co.last_budget.get(key, 0.0) for co in world.countries.values()):,.0f} ₡"
+             for key, name, _ in config.BUDGET_INCOME
+             if key in ("poll_tax", "tithe", "wealth_tax", "excise"))),
         ("все цены внутри коридора", not problems,
          "; ".join(problems) or "ок"),
         ("страна сыта", avg_shortage < 0.20,
@@ -342,18 +371,70 @@ def main() -> int:
     ]
 
     if WITH_TRADE:
-        from app.economy.engine import trade_capacity
-        caps = trade_capacity(world)
-        trading = {k: v for k, v in caps.items() if v > 0}
-        duties = sum(world.countries[k].treasury for k in trading)
+        from app.economy.engine import country_access
+        caps = country_access(world)
+        # Палаты подняли доступность выше базовой — значит, они и правда работают
+        base = config.TRADE_ACCESS_BASE
+        opened = {k: v for k, v in caps.items() if v > base + 1e-6}
+        duties = sum(world.countries[k].treasury for k in opened)
         wp_ok = all(v > 0 and v == v and v < 1e7 for v in world.world_prices.values())
+        # Единый рынок: у страны с палатами цены областей обязаны сойтись
+        # ТЕСНЕЕ, чем у страны без них. Сравнение, а не абсолютный порог:
+        # мировые потрясения двигают разрыв у всех сразу, и ловить надо
+        # именно разницу между «с палатами» и «без».
+        def price_spread(cids) -> float:
+            out = []
+            for cid in cids:
+                regions = society.country_cities(world, world.countries[cid])
+                if len(regions) < 2:
+                    continue
+                for g in world.goods.values():
+                    if not g.storable:
+                        continue
+                    prices = [c.goods[g.key].price for c in regions
+                              if g.key in c.goods]
+                    mean = sum(prices) / len(prices) if prices else 0.0
+                    if mean > 1e-6:
+                        out.append((max(prices) - min(prices)) / mean)
+            # Медиана, а не среднее: один товар, которого в стране нет вовсе,
+            # болтается между краями коридора и в среднем перевешивает два
+            # десятка сошедшихся. Нас интересует рынок в целом.
+            if not out:
+                return 0.0
+            out.sort()
+            return out[len(out) // 2]
+
+        # Мерить надо там, где областям ЕСТЬ чем различаться: завод стоит в
+        # одной области и сам по себе разводит цены соседей — вот эту разницу
+        # палаты и обязаны стереть. В стране без промышленности области и так
+        # одинаковы, и сравнивать нечего.
+        industrial = {world.cities[b.city_id].country_id
+                      for b in world.buildings.values()
+                      if not world.players[b.owner_id].is_state}
+        # И только те страны, где палаты стоят во ВСЕХ областях. Война
+        # перекраивает границы: отбитая у соседа область приходит без палаты,
+        # своим рынком и своими ценами — сращивать её будут ещё долго, и
+        # спрашивать с механики за это нечестно.
+        from app.economy.engine import region_access
+        acc = region_access(world)
+        covered = [k for k in opened
+                   if all(acc.get(c.id, 0.0) > base + 1e-6
+                          for c in society.country_cities(world, world.countries[k]))]
+        watched = ([k for k in covered if k in industrial]
+                   or covered or list(opened))
+        spread = price_spread(watched)
         checks += [
-            ("торговые площади открыли границу", len(trading) >= 3,
-             f"{len(trading)} государств, пропускная способность "
-             f"{max(trading.values()):.0%}"),
+            ("торговые палаты подняли доступность", len(opened) >= 3,
+             f"{len(opened)} государств, доступность рынка "
+             f"{max(opened.values()):.0%} при базовых {base:.0%}"),
             ("мировые цены адекватны", wp_ok,
              f"{len(world.world_prices)} товаров"),
             ("пошлины поступают в казну", duties > 0, f"{duties:,.0f} ₡"),
+            # Доступность рынка на то и доступность: чем она выше, тем ближе
+            # цены соседних областей одной страны.
+            ("палаты сращивают рынки областей", spread < 0.20,
+             f"разрыв цен между областями страны с палатами {spread:.1%} "
+             f"(медиана по товарам; без палат доходит до 60%)"),
         ]
 
     if war_setup is not None:

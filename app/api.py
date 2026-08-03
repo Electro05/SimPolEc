@@ -16,14 +16,18 @@ from . import config, db
 from .auth import hash_password, new_token, verify_password
 from .economy.engine import (
     _add_alliance,
+    bankruptcy_exit_level,
+    chain_bonus_for,
     citizen_players as engine_citizens,
     confidence_tally as engine_confidence,
     declare_war as engine_declare_war,
     level_cost, make_peace,
+    chamber_levels as engine_chamber_levels,
+    country_access, region_access,
     region_cpi as engine_region_cpi,
-    region_trade_capacity as engine_region_caps,
+    release_bankrupt as engine_release_bankrupt,
     resolve_annexation as engine_resolve_annexation,
-    run_tick, trade_capacity,
+    run_tick,
 )
 from .economy.pricing import price_bounds
 from .economy import society
@@ -163,6 +167,10 @@ def me(ctx: Ctx) -> dict:
         "country_name": c.name if c else "—",
         "bankrupt": p.bankrupt,
         "bankruptcy_limit": c.bankruptcy_limit if c else 0.0,
+        # Сколько не хватает, чтобы государство вообще могло закрыть дело
+        "rescue_cost": round(max(0.0, bankruptcy_exit_level(c) - p.cash), 2)
+                       if c else 0.0,
+        "halted": sum(1 for b in w.player_buildings(p.id) if b.halted),
         "warehouse": warehouse,
     }
 
@@ -300,11 +308,22 @@ def _country_brief(w: World, c) -> dict:
         "corporate_tax": c.corporate_tax,
         "sales_tax": c.sales_tax,
         "income_tax": c.income_tax,
+        # Налоги, ложащиеся на население: подоходный берётся только с
+        # заводских зарплат, а их получают одни рабочие.
+        "poll_tax": c.poll_tax,
+        "tithe": c.tithe,
+        "wealth_tax": c.wealth_tax,
+        "excise_tax": c.excise_tax,
         "public_spending_rate": c.public_spending_rate,
         "min_wage": c.min_wage,
         "land_rent": c.land_rent,
+        "tariff": c.tariff,
+        "import_tariff": c.import_tariff,
         "bankruptcy_limit": c.bankruptcy_limit,
         "foreign_investment_open": c.foreign_investment_open,
+        # Средняя доступность рынка страны: насколько её области срослись в
+        # один рынок. Растёт только от «Торговых палат».
+        "access": round(country_access(w).get(c.id, 0.0), 4),
         "living_standard": round(society.country_living_standard(w, c), 3),
         "industrialisation": round(workers / sum(ct.population for ct in w.cities.values()
                                                  if ct.country_id == c.id), 4)
@@ -317,6 +336,48 @@ def _country_brief(w: World, c) -> dict:
         "reference_wage": round(society.reference_wage(w, c), 2),
         "alive": c.alive,
         "army": _army_brief(w, c),
+        "budget": _budget_brief(w, c),
+    }
+
+
+def _budget_brief(w: World, c) -> dict:
+    """Роспись казны за прошлый пейдей: откуда пришло и куда ушло.
+
+    Не оценка задним числом, а бухгалтерия: каждое движение казны в движке
+    помечено статьёй (Country.collect / .spend), поэтому сумма доходов минус
+    сумма расходов в точности равна изменению остатка. Витрине остаётся
+    разложить это по подписям и объяснить, на кого какая статья ложится.
+
+    Статьи с нулём тоже идут в ответ: лидеру важно видеть, что рычаг есть, но
+    не приносит ничего, — это и есть повод им воспользоваться.
+    """
+    ledger = c.last_budget or {}
+    pop = sum(city.population for city in w.country_regions(c.id)) or 1.0
+
+    def rows(spec, sign):
+        out = []
+        for key, name, note in spec:
+            # `or 0.0` убирает минус-ноль: расходная статья без движения должна
+            # читаться как «0», а не как «−0».
+            value = (ledger.get(key, 0.0) or 0.0) * sign or 0.0
+            out.append({"key": key, "name": name, "note": note,
+                        "amount": round(value, 2),
+                        "per_capita": round(value / pop, 4)})
+        return out
+
+    income = rows(config.BUDGET_INCOME, 1.0)
+    expense = rows(config.BUDGET_EXPENSE, -1.0)
+    total_in = sum(r["amount"] for r in income)
+    total_out = sum(r["amount"] for r in expense)
+    opening = c.last_budget_opening
+    return {
+        "income": income, "expense": expense,
+        "total_income": round(total_in, 2),
+        "total_expense": round(total_out, 2),
+        "net": round(total_in - total_out, 2),
+        "opening": round(opening, 2),
+        "closing": round(opening + total_in - total_out, 2),
+        "population": round(pop),
     }
 
 
@@ -392,7 +453,15 @@ def market(ctx: Ctx) -> dict:
     return {"goods": rows, "country_id": c.id, "country_name": c.name,
             "region_id": city.id, "region_name": city.name,
             "regions": _region_list(w, c),
-            "trade_capacity": round(engine_region_caps(w).get(city.id, 0.0), 4)}
+            # Доступность рынка области: насколько её прилавок включён в общий.
+            # Внутри страны это скорость выравнивания цен с соседями, снаружи —
+            # объём вывоза и ввоза.
+            "access": round(region_access(w).get(city.id, 0.0), 4),
+            "chambers": engine_chamber_levels(w, city.id),
+            "chamber_max": config.TRADE_CHAMBER_MAX_LEVEL,
+            "access_per_level": config.TRADE_ACCESS_PER_LEVEL,
+            "tariff": round(c.tariff, 4),
+            "import_tariff": round(c.import_tariff, 4)}
 
 
 def _chosen_country(ctx: Ctx):
@@ -433,10 +502,12 @@ def _chosen_region(ctx: Ctx):
 
 def _region_list(w: World, country) -> list[dict]:
     """Список областей страны — для переключателя во всех витринах."""
+    access = region_access(w)
     return [{"id": c.id, "name": c.name,
              "population": round(c.population),
              "capital": c.id == country.capital_city_id,
              "unrest": round(c.unrest, 3),
+             "access": round(access.get(c.id, 0.0), 4),
              "revolt": c.revolt_ticks > 0}
             for c in sorted(w.country_regions(country.id),
                             key=lambda x: (x.id != country.capital_city_id, x.name))]
@@ -446,6 +517,7 @@ def regions(ctx: Ctx) -> dict:
     """Области выбранной страны и общая сводка по каждой."""
     w = ctx.world
     c = _chosen_country(ctx)
+    access = region_access(w)
     rows = []
     for city in w.country_regions(c.id):
         workers = city.s("workers").people
@@ -453,6 +525,9 @@ def regions(ctx: Ctx) -> dict:
         rows.append({
             "id": city.id, "name": city.name,
             "capital": city.id == c.capital_city_id,
+            # Доступность рынка и палаты, которые её дают
+            "access": round(access.get(city.id, 0.0), 4),
+            "chambers": engine_chamber_levels(w, city.id),
             "population": round(city.population),
             "workers": round(workers), "employed": round(employed),
             "unemployment": round(city.unemployment, 4),
@@ -470,7 +545,10 @@ def regions(ctx: Ctx) -> dict:
                           for n in w.region_neighbors(city.id) if n in w.cities],
         })
     rows.sort(key=lambda r: (not r["capital"], r["name"]))
-    return {"regions": rows, "country_id": c.id, "country_name": c.name}
+    return {"regions": rows, "country_id": c.id, "country_name": c.name,
+            "access": round(country_access(w).get(c.id, 0.0), 4),
+            "chamber_max": config.TRADE_CHAMBER_MAX_LEVEL,
+            "access_per_level": config.TRADE_ACCESS_PER_LEVEL}
 
 
 def exchange(ctx: Ctx) -> dict:
@@ -481,7 +559,7 @@ def exchange(ctx: Ctx) -> dict:
     сколько досталось казне пошлиной.
     """
     w = ctx.world
-    caps = trade_capacity(w)
+    caps = country_access(w)
     home = ctx.player_country()
     order = {"raw": 0, "intermediate": 1, "consumer": 2, "military": 3,
              "luxury": 4, "services": 5}
@@ -558,6 +636,8 @@ def exchange(ctx: Ctx) -> dict:
 
     traders = [{"country_id": cid, "name": w.countries[cid].name,
                 "capacity": round(cap, 4),
+                "tariff": round(w.countries[cid].tariff, 4),
+                "import_tariff": round(w.countries[cid].import_tariff, 4),
                 "is_mine": home is not None and cid == home.id}
                for cid, cap in sorted(caps.items(), key=lambda kv: -kv[1])
                if cap > 0 and w.countries[cid].alive]
@@ -565,8 +645,11 @@ def exchange(ctx: Ctx) -> dict:
     return {
         "goods": rows,
         "traders": traders,
-        "tariff": config.WORLD_TRADE_TARIFF,
-        "share_per_level": config.WORLD_MARKET_SHARE_PER_LEVEL,
+        "tariff": round(home.tariff, 4) if home else config.WORLD_TRADE_TARIFF,
+        "import_tariff": (round(home.import_tariff, 4) if home
+                          else config.IMPORT_TARIFF_DEFAULT),
+        "access_per_level": config.TRADE_ACCESS_PER_LEVEL,
+        "chamber_max": config.TRADE_CHAMBER_MAX_LEVEL,
         "my_capacity": round(caps.get(home.id, 0.0), 4) if home else 0.0,
         "history": db.world_price_series(int(ctx.query.get("limit", "120"))),
     }
@@ -614,6 +697,53 @@ def cities(ctx: Ctx) -> dict:
     return {"cities": rows}
 
 
+def _consumption_rows(w: World, key: str, agg: dict) -> list[dict]:
+    """Что и сколько сословие потребляет прямо сейчас — на одного человека.
+
+    Уровень жизни — одно число, и по нему не понять, чего людям не хватает:
+    хлеба, одежды или оперы. Здесь та же величина разложена по товарам: сколько
+    чего взяли за пейдей и какую долю положенного это покрывает.
+
+    «Положено» — обычная корзина сословия с поправкой на его уровень
+    потребления; для роскоши — та её часть, которую сословие уже считает для
+    себя нормой (society.luxury_share от ожиданий). Роскошь, до которой оно ещё
+    не доросло, в список не попадает: её никто и не ждал.
+    """
+    people = agg["people"]
+    if people <= 1.0:
+        return []
+    level = config.STRATA[key]["level"]
+    expect = agg["expect"] / people
+    eaten = agg["eaten"]
+
+    norms: dict[str, float] = {
+        g: spec["qty"] * level for g, spec in config.CONSUMPTION_BASKET.items()
+    }
+    for g, spec in config.LUXURY_BASKET.items():
+        share = society.luxury_share(expect, spec["unlock"])
+        if share > 0.001:
+            norms[g] = spec["qty"] * level * share
+
+    rows = []
+    for g in set(norms) | set(eaten):
+        good = w.goods.get(g)
+        if good is None:
+            continue
+        per_head = eaten.get(g, 0.0) / people
+        norm = norms.get(g, 0.0)
+        rows.append({
+            "good": g, "name": good.name,
+            "per_capita": round(per_head, 4),
+            "norm": round(norm, 4),
+            "share": round(per_head / norm, 3) if norm > 1e-9 else None,
+            "luxury": g in config.LUXURY_BASKET,
+            "tier": config.CONSUMPTION_BASKET.get(g, {}).get("tier", 4),
+        })
+    # Сперва необходимое, потом роскошь; внутри — по ступеням потребности.
+    rows.sort(key=lambda r: (r["luxury"], r["tier"], r["good"]))
+    return rows
+
+
 def population(ctx: Ctx) -> dict:
     """Население ОБЛАСТИ (?region_id=), либо всей страны при ?scope=country.
 
@@ -628,7 +758,7 @@ def population(ctx: Ctx) -> dict:
     scope_cities = w.country_regions(c.id) if whole else [region]
 
     agg = {k: {"people": 0.0, "cash": 0.0, "income": 0.0, "satisfaction": 0.0,
-               "sol": 0.0, "expect": 0.0}
+               "sol": 0.0, "expect": 0.0, "eaten": {}}
            for k in config.STRATA_ORDER}
     for city in scope_cities:
         for key in config.STRATA_ORDER:
@@ -640,6 +770,8 @@ def population(ctx: Ctx) -> dict:
             a["satisfaction"] += st.satisfaction * st.people
             a["sol"] += st.living_standard * st.people
             a["expect"] += st.expectation * st.people
+            for g, qty in (st.consumed or {}).items():
+                a["eaten"][g] = a["eaten"].get(g, 0.0) + qty
     total_pop = sum(a["people"] for a in agg.values()) or 1.0
     strata = []
     for key in config.STRATA_ORDER:
@@ -647,6 +779,7 @@ def population(ctx: Ctx) -> dict:
         spec = config.STRATA[key]
         sat = a["satisfaction"] / a["people"] if a["people"] > 1.0 else 0.0
         strata.append({
+            "consumption": _consumption_rows(w, key, a),
             "key": key, "name": spec["name"], "class": spec["class"],
             "level": spec["level"],
             "people": round(a["people"]),
@@ -732,6 +865,8 @@ def industries(ctx: Ctx) -> dict:
     region = _chosen_region(ctx)
     wage = society.reference_wage(w, c)
     upkeep_per_worker = config.UPKEEP_PER_LEVEL / config.JOBS_PER_LEVEL
+    me = ctx.player
+    state = w.state_player(c.id)
 
     rows = []
     for i in w.industries.values():
@@ -753,13 +888,41 @@ def industries(ctx: Ctx) -> dict:
             else:
                 private_lv += b.level
 
+        # Что уже стоит в ЭТОЙ области: второй такой же завод не построить,
+        # можно только поднять уровень. Отдельно своё и отдельно казённое —
+        # это разные хозяева.
+        def owned(owner) -> dict | None:
+            if owner is None:
+                return None
+            b = _existing_building(w, owner.id, region.id, i.key)
+            if b is None:
+                return None
+            return {"id": b.id, "level": b.level, "damage": b.damage,
+                    "upgrade_cost": round(
+                        level_cost(i.build_cost_mult, b.level + 1), 2)}
+
         row = {
             "key": i.key, "name": i.name, "kind": i.kind,
+            "sector": i.sector,
+            "sector_name": config.SECTORS.get(i.sector, i.sector),
             "jobs_per_level": i.jobs_per_level,
             "inputs": inputs,
             "inputs_ready": all(x["available"] for x in inputs),
             "build_cost": round(level_cost(i.build_cost_mult, 1), 2),
             "state_levels": state_lv, "private_levels": private_lv,
+            # Предел развития и сколько уже занято В ЭТОЙ ОБЛАСТИ: у «Торговой
+            # палаты» девять уровней на область, и считаются они по всем хозяевам.
+            "max_level": i.max_level,
+            "levels_here": _levels_in_city(w, region.id, i.key),
+            "mine": owned(me),
+            "state_here": owned(state),
+            # Что даст цепочка, если поставить этот цех здесь и сейчас
+            "chain": (chain_bonus_for(w, me.id, region.id, i.key)
+                      if me is not None else {"bonus": 0.0, "links": [],
+                                              "mates": []}),
+            "state_chain": (chain_bonus_for(w, state.id, region.id, i.key)
+                            if state is not None else {"bonus": 0.0, "links": [],
+                                                       "mates": []}),
             "description": i.description,
             # Содержание штата есть и у производящих административных зданий
             # (оперный театр), поэтому считаем его всегда, а не в одной ветке.
@@ -775,12 +938,23 @@ def industries(ctx: Ctx) -> dict:
             row.update({
                 "output_good": None, "output_good_name": "—",
                 "shortage": 0.0, "output_demand": 0.0, "has_buyer": True,
-                "value_per_worker": 0.0,
+                "value_per_worker": 0.0, "sell_through": None,
+                "value_per_worker_net": 0.0,
             })
         else:
             good = w.goods[i.output_good]
             local = society.lg(region, i.output_good)
             input_cost = sum(q * society.lg(region, k).price for k, q in i.inputs.items())
+            # Сбыт: какая доля выставленного на прилавок вообще нашла
+            # покупателя в прошлый пейдей. Затоваренный рынок виден отсюда
+            # заранее — и «прибыль на работника» на нём не настоящая.
+            sell_through = (min(1.0, local.last_sold / local.last_supply)
+                            if local.last_supply > 1.0 else None)
+            gross = ((local.price - input_cost) * i.output_per_worker
+                     - wage - upkeep_per_worker) if i.output_per_worker > 0 else 0.0
+            net = ((local.price * (sell_through if sell_through is not None else 1.0)
+                    - input_cost) * i.output_per_worker
+                   - wage - upkeep_per_worker) if i.output_per_worker > 0 else 0.0
             row.update({
                 "output_good": i.output_good,
                 "output_good_name": good.name,
@@ -790,9 +964,12 @@ def industries(ctx: Ctx) -> dict:
                 "shortage": round(local.last_shortage, 4),
                 "output_demand": round(local.last_demand, 1),
                 "has_buyer": local.last_demand > 1.0,
-                "value_per_worker": round(
-                    (local.price - input_cost) * i.output_per_worker
-                    - wage - upkeep_per_worker, 2) if i.output_per_worker > 0 else 0.0,
+                "sell_through": round(sell_through, 4)
+                                if sell_through is not None else None,
+                "value_per_worker": round(gross, 2),
+                # То же, но с поправкой на сбыт: столько останется, если
+                # непроданное так и пролежит на складе.
+                "value_per_worker_net": round(net, 2),
                 "notional_cost": round(
                     society.notional_unit_cost(w, region, i.output_good, wage) or 0, 2),
             })
@@ -802,7 +979,11 @@ def industries(ctx: Ctx) -> dict:
     return {"industries": rows, "reference_wage": round(wage, 2),
             "country_id": c.id, "country_name": c.name,
             "region_id": region.id, "region_name": region.name,
-            "regions": _region_list(w, c)}
+            "regions": _region_list(w, c),
+            "sectors": [{"key": k, "name": v} for k, v in config.SECTORS.items()],
+            "chain": {"link_bonus": config.CHAIN_LINK_BONUS,
+                      "sector_bonus": config.CHAIN_SECTOR_BONUS,
+                      "cap": config.CHAIN_BONUS_CAP}}
 
 
 def leaderboard(ctx: Ctx) -> dict:
@@ -853,6 +1034,8 @@ def _building_dto(w: World, b: Building) -> dict:
         "industry_key": b.industry_key,
         "industry": ind.name,
         "kind": ind.kind,
+        "sector": ind.sector,
+        "sector_name": config.SECTORS.get(ind.sector, ind.sector),
         "state": bool(owner and owner.is_state),
         "city": city.name,
         "city_id": b.city_id,
@@ -869,7 +1052,14 @@ def _building_dto(w: World, b: Building) -> dict:
         "employed": round(b.employed),
         "fill": round(b.employed / cap, 4) if cap else 0.0,
         "active": b.active,
+        # Запечатано банкротством: сам хозяин такой цех не запустит, решение
+        # за государством.
+        "halted": b.halted,
         "throttle": b.throttle,
+        # Бонус за производственную цепочку и отраслевой кластер
+        "chain_bonus": round(b.chain_bonus, 4),
+        "chain": chain_bonus_for(w, b.owner_id, b.city_id, b.industry_key,
+                                 skip_id=b.id),
         "output_good": ind.output_good,
         "output_good_name": w.goods[ind.output_good].name if ind.output_good else "—",
         "output_price": round(local.price, 2) if local else 0.0,
@@ -878,11 +1068,19 @@ def _building_dto(w: World, b: Building) -> dict:
         "upkeep_goods": [{"good": k, "name": w.goods[k].name, "qty": q * b.level}
                          for k, q in ind.upkeep_goods.items()],
         "last_output": round(b.last_output, 1),
+        # Выпустить не значит продать: выручка — это то, за что реально
+        # заплатили, а непроданное осело на складе и денег не принесло.
+        "last_sold": round(b.last_sold, 1),
+        "last_unsold": round(b.last_unsold, 1),
+        "last_stock": round(b.last_stock, 1),
+        "sell_through": round(b.last_sold / b.last_output, 4)
+                        if b.last_output > 1e-9 else None,
         "last_revenue": round(b.last_revenue, 2),
         "last_inputs": round(b.last_inputs, 2),
         "last_wages": round(b.last_wages, 2),
         "last_costs": round(b.last_costs, 2),
         "last_profit": round(b.last_profit, 2),
+        "last_active_profit": round(b.last_active_profit, 2),
         "upkeep": round(b.effective_level * config.UPKEEP_PER_LEVEL, 2),
         "upgrade_cost": round(level_cost(ind.build_cost_mult, b.level + 1), 2),
     }
@@ -945,14 +1143,31 @@ def _charge(ctx: Ctx, owner: Player, cost: float, country, city) -> None:
         raise ApiError(400, f"Не хватает средств: нужно {cost:,.0f} ₡, {who} "
                             f"{purse:,.0f} ₡")
     if state_owned:
-        country.treasury -= cost
+        country.spend("construction", cost)
     else:
         owner.cash -= cost
     net = cost * (1.0 - country.income_tax)
     st = city.s("town_low")
     st.cash += net
     st.income += net
-    country.treasury += cost * country.income_tax
+    country.collect("income_tax", cost * country.income_tax)
+
+
+def _existing_building(w: World, owner_id: int, city_id: int, key: str):
+    """Уже построенное предприятие этой отрасли у этого хозяина в этой области."""
+    return next((b for b in w.buildings.values()
+                 if b.owner_id == owner_id and b.city_id == city_id
+                 and b.industry_key == key), None)
+
+
+def _levels_in_city(w: World, city_id: int, key: str) -> int:
+    """Сколько уровней этой отрасли стоит в области — у всех хозяев сразу.
+
+    Предел развития («Торговая палата» — девять уровней) считается по области
+    целиком, иначе его обошли бы, поставив вторую палату от другого лица.
+    """
+    return sum(b.level for b in w.buildings.values()
+               if b.city_id == city_id and b.industry_key == key)
 
 
 def build(ctx: Ctx) -> dict:
@@ -973,6 +1188,9 @@ def build(ctx: Ctx) -> dict:
         raise ApiError(404, "Город не принадлежит государству")
     if ind.kind == "admin" and not state_owned:
         raise ApiError(403, "Административные здания строит только государство")
+    if not state_owned and p.bankrupt:
+        raise ApiError(403, "Вы признаны банкротом: строить нельзя, пока "
+                            "государство не закроет дело о банкротстве")
 
     # Иностранные стройки: вне своего гражданства — только если государство
     # открыло режим иностранных инвестиций и вы с ним не воюете. Выпуск такого
@@ -986,6 +1204,25 @@ def build(ctx: Ctx) -> dict:
                                 f"вкладываться во врага нельзя")
 
     owner = _owner_for(ctx, state_owned, country)
+
+    # Второго такого же завода во дворе не ставят: вместо десятка одинаковых
+    # лесопилок поднимается одна, но уровнями. В соседней области — пожалуйста,
+    # там свой рынок и своя рабочая сила.
+    if ind.max_level and _levels_in_city(w, city_id, key) >= ind.max_level:
+        raise ApiError(400, f"«{ind.name}» в области {city.name} уже развита до "
+                            f"предела ({ind.max_level} ур.)")
+
+    if config.ONE_BUILDING_PER_INDUSTRY:
+        twin = _existing_building(w, owner.id, city_id, key)
+        if twin is not None:
+            who = "У государства" if state_owned else "У вас"
+            cost = level_cost(ind.build_cost_mult, twin.level + 1)
+            raise ApiError(400,
+                           f"{who} в области {city.name} уже есть «{ind.name}» "
+                           f"(ур. {twin.level}). Второе такое же не строят — "
+                           f"поднимите уровень за {cost:,.0f} ₡ или стройте "
+                           f"в другой области.")
+
     _charge(ctx, owner, level_cost(ind.build_cost_mult, 1), country, city)
 
     b = Building(id=w.next_building_id, industry_key=key, owner_id=owner.id,
@@ -1025,6 +1262,12 @@ def upgrade(ctx: Ctx) -> dict:
     owner = w.players[b.owner_id]
     city = w.cities[b.city_id]
     country = w.countries[city.country_id]
+    if owner.bankrupt:
+        raise ApiError(403, "Дело признано банкротом: расширяться нельзя, пока "
+                            "государство не закроет банкротство")
+    if ind.max_level and _levels_in_city(w, b.city_id, b.industry_key) >= ind.max_level:
+        raise ApiError(400, f"«{ind.name}» развита до предела: "
+                            f"{ind.max_level} ур. — выше не поднять")
     _charge(ctx, owner, level_cost(ind.build_cost_mult, b.level + 1), country, city)
     b.level += 1
     return {"ok": True, "building": _building_dto(w, b),
@@ -1042,6 +1285,44 @@ def set_wage(ctx: Ctx) -> dict:
     return {"ok": True, "building": _building_dto(w, b)}
 
 
+def set_wage_all(ctx: Ctx) -> dict:
+    """Одна ставка на все предприятия разом — свои или казённые.
+
+    Ставить зарплату каждому цеху поодиночке невыносимо, когда их полтора
+    десятка: рабочие уходят туда, где платят больше, и держать разнобой почти
+    никогда не нужно. МРОТ у каждой страны свой, поэтому для заграничных цехов
+    ставка не отвергается, а поднимается до тамошнего минимума.
+    """
+    w = ctx.world
+    p = ctx.require_player()
+    wage = float(ctx.need("wage"))
+    if wage < 0 or wage != wage:
+        raise ApiError(400, "Зарплата должна быть неотрицательным числом")
+    state_scope = str(ctx.body.get("scope") or "mine") == "state"
+
+    if state_scope:
+        _, country = ctx.require_leader()
+        owner = w.state_player(country.id)
+        if owner is None:
+            raise ApiError(500, "В государстве нет казны")
+        targets = w.player_buildings(owner.id)
+    else:
+        targets = w.player_buildings(p.id)
+
+    changed = raised = 0
+    for b in targets:
+        country = w.countries[w.cities[b.city_id].country_id]
+        value = max(wage, country.min_wage)
+        if value > wage + 1e-9:
+            raised += 1
+        if abs(b.wage - value) > 1e-9:
+            b.wage = value
+            changed += 1
+    return {"ok": True, "changed": changed, "total": len(targets),
+            "raised_to_min_wage": raised, "wage": round(wage, 2),
+            "buildings": [_building_dto(w, b) for b in targets]}
+
+
 def set_throttle(ctx: Ctx) -> dict:
     b = _own(ctx)
     b.throttle = max(0.0, min(1.0, float(ctx.need("throttle"))))
@@ -1049,9 +1330,14 @@ def set_throttle(ctx: Ctx) -> dict:
 
 
 def toggle(ctx: Ctx) -> dict:
+    w = ctx.world
     b = _own(ctx)
+    if b.halted and not b.active:
+        raise ApiError(403, "Предприятие остановлено банкротством. Запустить "
+                            "его может только государство, закрыв дело "
+                            "о банкротстве.")
     b.active = not b.active
-    return {"ok": True, "building": _building_dto(ctx.world, b)}
+    return {"ok": True, "building": _building_dto(w, b)}
 
 
 def repair(ctx: Ctx) -> dict:
@@ -1066,6 +1352,11 @@ def repair(ctx: Ctx) -> dict:
     if b.damage <= 0:
         raise ApiError(400, "Предприятие цело — чинить нечего")
     owner = w.players[b.owner_id]
+    if owner.bankrupt:
+        # Чинить остановленный цех бессмысленно: он всё равно не работает, а
+        # деньги нужны, чтобы поднять кассу до порога выхода.
+        raise ApiError(403, "Дело признано банкротом: ремонт возможен после того, "
+                            "как государство закроет банкротство")
     city = w.cities[b.city_id]
     country = w.countries[city.country_id]
 
@@ -1094,7 +1385,7 @@ def demolish(ctx: Ctx) -> dict:
     refund = sum(level_cost(ind.build_cost_mult, lv)
                  for lv in range(1, b.level + 1)) * config.DEMOLISH_REFUND
     if owner.is_state:
-        country.treasury += refund
+        country.collect("construction", refund)
     else:
         owner.cash += refund
     del w.buildings[b.id]
@@ -1109,9 +1400,19 @@ POLICY_LIMITS = {
     "corporate_tax": (0.0, 0.75),
     "sales_tax": (0.0, 0.50),
     "income_tax": (0.0, 0.60),
+    # Налоги с населения. Подушная подать задаётся не долей, а твёрдой суммой
+    # с души — в этом её суть, и потому у неё свой предел, в червонцах.
+    "poll_tax": (0.0, 500.0),
+    "tithe": (0.0, 0.50),
+    "wealth_tax": (0.0, 0.20),
+    "excise_tax": (0.0, 0.80),
     "public_spending_rate": (0.0, 1.0),
     "land_rent": (0.0, 0.50),
     "min_wage": (0.0, 10_000.0),
+    # Пошлины. Вывозная кормит казну с каждой сделки, но отбивает у своих охоту
+    # вывозить; ввозная защищает своего производителя от дешёвого чужого товара.
+    "tariff": (0.0, config.TARIFF_MAX),
+    "import_tariff": (0.0, config.TARIFF_MAX),
     # Порог банкротства — величина отрицательная: до какого минуса государство
     # позволяет предприятиям работать в долг.
     "bankruptcy_limit": (config.BANKRUPTCY_LIMIT_MIN, 0.0),
@@ -1201,6 +1502,8 @@ def cast_vote(ctx: Ctx) -> dict:
 # ---------------------------------------------------------------------------
 def _citizen_dto(w: World, p: Player, country) -> dict:
     blds = w.player_buildings(p.id)
+    halted = [b for b in blds if b.halted]
+    exit_at = bankruptcy_exit_level(country)
     return {
         "id": p.id, "username": p.username,
         "cash": round(p.cash, 2),
@@ -1213,10 +1516,12 @@ def _citizen_dto(w: World, p: Player, country) -> dict:
         "damaged": sum(b.damage for b in blds),
         "employees": round(sum(b.employed for b in blds)),
         "profit": round(sum(b.last_profit for b in blds), 2),
-        # сколько не хватает, чтобы выйти из банкротства
-        "rescue_cost": round(max(0.0, country.bankruptcy_limit
-                                 * (1.0 - config.BANKRUPTCY_EXIT_MARGIN)
-                                 - p.cash), 2),
+        # Запечатанные банкротством цеха: их открывает только государство.
+        "halted": len(halted),
+        "halted_profitable": sum(1 for b in halted if b.last_active_profit >= 0),
+        # сколько не хватает, чтобы государство могло снять банкротство
+        "rescue_cost": round(max(0.0, exit_at - p.cash), 2),
+        "can_release": p.cash > exit_at,
     }
 
 
@@ -1231,8 +1536,10 @@ def citizens(ctx: Ctx) -> dict:
         "country_id": c.id, "country_name": c.name,
         "treasury": round(c.treasury, 2),
         "bankruptcy_limit": c.bankruptcy_limit,
+        "exit_level": round(bankruptcy_exit_level(c), 2),
         "last_subsidies": round(c.last_subsidies, 2),
         "bankrupt": sum(1 for r in rows if r["bankrupt"]),
+        "is_leader": bool(ctx.player and c.leader_id == ctx.player.id),
     }
 
 
@@ -1253,18 +1560,54 @@ def gov_subsidy(ctx: Ctx) -> dict:
     if c.treasury < amount:
         raise ApiError(400, f"В казне только {c.treasury:,.0f} ₡")
 
-    c.treasury -= amount
+    c.spend("player_subsidy", amount)
     target.cash += amount
     c.last_subsidies += amount
-    # субсидия может сразу вывести дело из банкротства
-    exit_at = c.bankruptcy_limit * (1.0 - config.BANKRUPTCY_EXIT_MARGIN)
-    if target.bankrupt and target.cash > exit_at:
-        target.bankrupt = False
+    # Само по себе банкротство субсидия НЕ снимает: деньги и решение — разные
+    # вещи. Наполнив кассу, лидер отдельной кнопкой решает, открывать ли дело
+    # целиком или только его прибыльную часть (см. gov_bankruptcy).
     db.add_event(w.tick, leader.id, "subsidy",
                  f"{c.name} выделяет {amount:,.0f} ₡ промышленнику "
                  f"{target.username}")
     return {"ok": True, "citizen": _citizen_dto(w, target, c),
             "treasury": round(c.treasury, 2)}
+
+
+def gov_bankruptcy(ctx: Ctx) -> dict:
+    """Государство закрывает дело о банкротстве и решает, что запускать.
+
+    Сам промышленник из банкротства не выходит: иначе получался круг, из
+    которого экономика не выбиралась — распродал склад, всплыл, снова
+    завалил рынок, снова разорился. Поэтому решение здесь, и у него два
+    варианта: поднять всё хозяйство разом или открыть только те цеха, что в
+    последний рабочий пейдей давали прибыль. Остальные остаются под замком —
+    их можно открыть позже или снести.
+    """
+    w = ctx.world
+    leader, c = ctx.require_leader()
+    target = w.players.get(int(ctx.need("player_id")))
+    if target is None or target.is_state or target.country_id != c.id:
+        raise ApiError(404, "Такого гражданина нет в вашем государстве")
+    mode = str(ctx.body.get("mode") or "all")
+    if mode not in ("all", "profitable"):
+        raise ApiError(400, "Режим — либо «all», либо «profitable»")
+    if not target.bankrupt and not any(b.halted for b in w.player_buildings(target.id)):
+        raise ApiError(400, f"{target.username} не банкрот — открывать нечего")
+
+    exit_at = bankruptcy_exit_level(c)
+    if target.bankrupt and target.cash <= exit_at:
+        raise ApiError(400,
+                       f"С кассой {target.cash:,.0f} ₡ дело провалится тем же "
+                       f"пейдеем. Сначала субсидия: не хватает "
+                       f"{exit_at - target.cash:,.0f} ₡ до {exit_at:,.0f} ₡")
+
+    res = engine_release_bankrupt(w, target, mode)
+    db.add_event(w.tick, leader.id, "bankruptcy",
+                 f"{c.name} закрывает банкротство {target.username}: "
+                 f"запущено {res['opened']} предприятий"
+                 + (f", {res['sealed']} убыточных оставлены под замком"
+                    if res["sealed"] else ""))
+    return {"ok": True, "citizen": _citizen_dto(w, target, c), **res}
 
 
 # ---------------------------------------------------------------------------
@@ -1432,8 +1775,14 @@ def _war_dto(w: World, war, viewer_id: int | None) -> dict:
         return [{"id": i, "name": w.countries[i].name} for i in ids
                 if i in w.countries]
     side = war.side_of(viewer_id) if viewer_id else None
+    revolt = war.kind == "revolt"
     return {
         "id": war.id,
+        "kind": war.kind,
+        "revolt": revolt,
+        # Мятежникам мира не предлагают — фронт об этом должен знать, чтобы не
+        # рисовать кнопку, которая всё равно вернёт отказ.
+        "can_peace": not revolt,
         "attackers": names(war.attackers),
         "defenders": names(war.defenders),
         "started_tick": war.started_tick,
@@ -1569,6 +1918,9 @@ def peace_offer(ctx: Ctx) -> dict:
         raise ApiError(404, "Такой войны нет")
     if war.side_of(c.id) is None:
         raise ApiError(403, "Вы не участвуете в этой войне")
+    if war.kind == "revolt":
+        raise ApiError(400, "С мятежниками не договариваются: восстание можно "
+                            "только подавить или проиграть")
     target_id = int(ctx.need("country_id"))
     if target_id not in war.enemies_of(c.id):
         raise ApiError(400, "Это государство вам не противник в этой войне")
@@ -1721,6 +2073,7 @@ ROUTES: dict[tuple[str, str], Route] = {
     ("POST", "/api/buildings/build"): (build, True),
     ("POST", "/api/buildings/upgrade"): (upgrade, True),
     ("POST", "/api/buildings/wage"): (set_wage, True),
+    ("POST", "/api/buildings/wage_all"): (set_wage_all, True),
     ("POST", "/api/buildings/throttle"): (set_throttle, True),
     ("POST", "/api/buildings/toggle"): (toggle, True),
     ("POST", "/api/buildings/demolish"): (demolish, True),
@@ -1729,6 +2082,7 @@ ROUTES: dict[tuple[str, str], Route] = {
     ("GET", "/api/gov/buildings"): (state_buildings, False),
     ("GET", "/api/gov/citizens"): (citizens, False),
     ("POST", "/api/gov/subsidy"): (gov_subsidy, True),
+    ("POST", "/api/gov/bankruptcy"): (gov_bankruptcy, True),
     ("POST", "/api/gov/policy"): (gov_policy, True),
     ("POST", "/api/gov/confidence"): (confidence_vote, True),
     ("GET", "/api/annexations"): (annexations, False),

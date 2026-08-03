@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SimPolEc — симулятор экономики</title>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -28,21 +28,29 @@
 
 <!-- ------------------------------ игра ------------------------------ -->
 <div id="game" style="display:none">
+
+<!-- Шапка и меню едут вместе: так высота шапки перестаёт быть магическим
+     числом в `top` у меню и вёрстка переживает любое сжатие. -->
+<div class="topbar">
 <header>
     <div class="brand">Sim<span>Pol</span>Ec</div>
-    <div class="stat"><span class="k">Государство</span><span class="v" id="hCountry">—</span></div>
-    <div class="stat"><span class="k">Касса</span><span class="v num" id="hCash">—</span></div>
-    <div class="stat"><span class="k">Капитал</span><span class="v num" id="hWorth">—</span></div>
-    <div class="stat"><span class="k">Пейдей</span><span class="v num" id="hTick">—</span></div>
-    <div class="stat"><span class="k">Население страны</span><span class="v num" id="hPop">—</span></div>
-    <div class="stat"><span class="k">Областей</span><span class="v num" id="hRegions">—</span></div>
-    <div class="stat"><span class="k">Индустриализация</span><span class="v num" id="hInd">—</span></div>
-    <div class="stat"><span class="k">Безработица</span><span class="v num" id="hUnemp">—</span></div>
-    <div class="stat"><span class="k">Довольство</span><span class="v num" id="hSat">—</span></div>
-    <div class="stat"><span class="k">Уровень жизни</span><span class="v num" id="hSol">—</span></div>
+    <!-- На узком экране это одна прокручиваемая строка вместо пяти строк
+         переноса: ни одна цифра не теряется, а шапка остаётся низкой. -->
+    <div class="hstats">
+        <div class="stat"><span class="k">Государство</span><span class="v" id="hCountry">—</span></div>
+        <div class="stat"><span class="k">Касса</span><span class="v num" id="hCash">—</span></div>
+        <div class="stat"><span class="k">Капитал</span><span class="v num" id="hWorth">—</span></div>
+        <div class="stat"><span class="k">Пейдей</span><span class="v num" id="hTick">—</span></div>
+        <div class="stat"><span class="k">Население страны</span><span class="v num" id="hPop">—</span></div>
+        <div class="stat"><span class="k">Областей</span><span class="v num" id="hRegions">—</span></div>
+        <div class="stat"><span class="k">Индустриализация</span><span class="v num" id="hInd">—</span></div>
+        <div class="stat"><span class="k">Безработица</span><span class="v num" id="hUnemp">—</span></div>
+        <div class="stat"><span class="k">Довольство</span><span class="v num" id="hSat">—</span></div>
+        <div class="stat"><span class="k">Уровень жизни</span><span class="v num" id="hSol">—</span></div>
+    </div>
     <div class="timer">
         <div class="ring">
-            <svg width="46" height="46">
+            <svg viewBox="0 0 46 46">
                 <circle cx="23" cy="23" r="19" fill="none" stroke="#262e3a" stroke-width="4"/>
                 <circle id="ringArc" cx="23" cy="23" r="19" fill="none" stroke="#4c9aff"
                         stroke-width="4" stroke-linecap="round" stroke-dasharray="119.4" stroke-dashoffset="0"/>
@@ -54,64 +62,53 @@
     </div>
 </header>
 
+<!-- data-pin — разделы, которые остаются на нижней панели телефона.
+     Остальные уезжают под кнопку «Ещё», её собирает app.js. -->
 <nav>
-    <button class="on" data-page="market">Рынок</button>
+    <button class="on" data-page="market" data-pin="1">Рынок</button>
     <button data-page="exchange">Биржа</button>
     <button data-page="people">Население</button>
-    <button data-page="biz">Мои предприятия</button>
-    <button data-page="build">Строительство</button>
-    <button data-page="country">Страна</button>
+    <button data-page="biz" data-pin="1">Мои предприятия</button>
+    <button data-page="build" data-pin="1">Строительство</button>
+    <button data-page="country" data-pin="1">Страна</button>
     <button data-page="gov">Государство</button>
     <button data-page="war">Война</button>
     <button data-page="map">Карта</button>
     <button data-page="top">Рейтинг</button>
+    <button id="navMore" class="more" onclick="toggleNavSheet()">Ещё</button>
 </nav>
+</div>
+
+<!-- Лист с непризнанными разделами: живёт только на телефоне -->
+<div id="navSheet" onclick="closeNavSheet(event)">
+    <div class="sheet-body" id="navSheetBody"></div>
+</div>
 
 <main>
     <!-- ---------- рынок ---------- -->
     <section class="page on" id="page-market">
-        <div class="grid two">
-            <div class="card">
-                <h2>История цены — <span id="chartGood">—</span></h2>
-                <svg class="chart" id="priceChart"></svg>
-                <div class="legend">
-                    <span><i style="background:#4c9aff"></i>цена</span>
-                    <span><i style="background:#8b97a8"></i>себестоимость с наценкой (якорь)</span>
-                </div>
+        <details class="card" data-sec="market-table" data-main>
+            <summary>Рынок области — <span id="marketRegion">—</span></summary>
+            <details class="help">
+                <summary>как устроен рынок области</summary>
+                <p class="muted">
+                    Рынок принадлежит области, а не стране: у соседей свои цены и свой
+                    склад. Столбец «в стране» — средняя цена в остальных областях
+                    вашего государства.</p>
+                <p class="muted" id="accessNote"></p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Доступность рынка</span>
+                     <span class="v num" id="mAccess">—</span></div>
+                <div class="stat"><span class="k">Торговых палат, ур.</span>
+                     <span class="v num" id="mChambers">—</span></div>
+                <div class="stat"><span class="k">Вывозная пошлина</span>
+                     <span class="v num" id="mTariff">—</span></div>
+                <div class="stat"><span class="k">Ввозная пошлина</span>
+                     <span class="v num" id="mImport">—</span></div>
             </div>
-            <div class="card">
-                <h2>Как устроена цена</h2>
-                <p class="muted" style="font-size:13px">
-                    У каждого товара есть <b style="color:var(--text)">якорь</b> — сглаженная
-                    себестоимость производства. Вокруг него цена гуляет в мягком коридоре
-                    от 55% до 400% себестоимости: чем ближе к краю, тем труднее её туда
-                    продавить, поэтому границы недостижимы, но дефицитный товар честно
-                    дорожает втрое, а залежавшийся — падает ниже себестоимости.
-                </p>
-                <p class="muted" style="font-size:13px;margin-top:8px">
-                    У товаров, которых в стране ещё никто не делает, себестоимость
-                    считается по рецепту — от цен на сырьё и стоимости труда. Большая
-                    наценка на таком товаре и есть приглашение построить завод.
-                </p>
-                <div style="height:14px"></div>
-                <h2>Макроэкономика</h2>
-                <svg class="chart" id="macroChart" style="height:140px"></svg>
-                <div class="legend">
-                    <span><i style="background:#3fb950"></i>ИПЦ</span>
-                    <span><i style="background:#d29922"></i>безработица</span>
-                    <span><i style="background:#a371f7"></i>довольство</span>
-                </div>
-            </div>
-        </div>
-        <div class="card">
-            <h2>Рынок области — <span id="marketRegion">—</span></h2>
-            <p class="muted" style="font-size:13px;margin-bottom:10px">
-                Рынок принадлежит области, а не стране: у соседей свои цены и свой
-                склад. Обозы понемногу выравнивают их сами, а торговые площади
-                ускоряют обмен. Столбец «в стране» — средняя цена в остальных
-                областях вашего государства.</p>
             <div id="marketRegions"></div>
-            <table>
+            <div class="tw"><table id="tMarket">
                 <thead><tr>
                     <th>Товар</th><th></th><th class="right">Цена</th>
                     <th class="right">В стране</th>
@@ -121,56 +118,75 @@
                     <th class="right">Дефицит</th>
                 </tr></thead>
                 <tbody id="marketRows"></tbody>
-            </table>
+            </table></div>
+        </details>
+        <div class="grid two">
+            <details class="card" data-sec="market-price">
+                <summary>История цены — <span id="chartGood">—</span></summary>
+                <svg class="chart" id="priceChart"></svg>
+                <div class="legend">
+                    <span><i style="background:#4c9aff"></i>цена</span>
+                    <span><i style="background:#8b97a8"></i>себестоимость с наценкой (якорь)</span>
+                </div>
+            </details>
+            <details class="card" data-sec="market-macro">
+                <summary>Макроэкономика</summary>
+                <svg class="chart" id="macroChart"></svg>
+                <div class="legend">
+                    <span><i style="background:#3fb950"></i>ИПЦ</span>
+                    <span><i style="background:#d29922"></i>безработица</span>
+                    <span><i style="background:#a371f7"></i>довольство</span>
+                </div>
+            </details>
         </div>
+        <details class="card" data-sec="market-howto">
+            <summary>Как устроена цена</summary>
+            <p class="muted">
+                У каждого товара есть <b style="color:var(--text)">якорь</b> — сглаженная
+                себестоимость производства. Вокруг него цена гуляет в мягком коридоре
+                от 55% до 400% себестоимости: чем ближе к краю, тем труднее её туда
+                продавить, поэтому границы недостижимы, но дефицитный товар честно
+                дорожает втрое, а залежавшийся — падает ниже себестоимости.
+            </p>
+            <p class="muted">
+                У товаров, которых в стране ещё никто не делает, себестоимость
+                считается по рецепту — от цен на сырьё и стоимости труда. Большая
+                наценка на таком товаре и есть приглашение построить завод.
+            </p>
+        </details>
     </section>
 
     <!-- ---------- биржа мирового рынка ---------- -->
     <section class="page" id="page-exchange">
-        <div class="card">
-            <h2>Международная биржа</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:14px">
-                Двадцать областей составляют весь мир, поэтому вывезенный товар обязан
-                быть кем-то куплен — внешнего покупателя из ниоткуда здесь нет. Продаёт
-                тот, у кого дома дешевле мировой цены, покупает тот, у кого дороже и не
-                хватает. Объём с обеих сторон ограничен торговыми площадями, а разница
-                оседает пошлиной в казне вывозящей страны.
-            </p>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
-                <div class="stat"><span class="k">Ваша пропускная способность</span>
+        <details class="card" data-sec="ex-goods" data-main>
+            <summary>Товары на бирже</summary>
+            <details class="help">
+                <summary>как устроена международная биржа</summary>
+                <p class="muted">
+                    Двадцать областей составляют весь мир, поэтому вывезенный товар обязан
+                    быть кем-то куплен — внешнего покупателя из ниоткуда здесь нет. Продаёт
+                    тот, у кого дома дешевле мировой цены, покупает тот, у кого дороже и не
+                    хватает. Объём с обеих сторон ограничен <b>доступностью рынка</b> —
+                    той же, что выравнивает цены внутри страны, только здесь она означает
+                    не выравнивание, а просто объём вывоза и ввоза. Поднимают её
+                    «Торговые палаты». Пошлины назначает лидер: <b>вывозная</b> оседает в
+                    казне продавца, <b>ввозная</b> держит чужой товар за порогом, защищая
+                    своего производителя.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Доступность вашего рынка</span>
                      <span class="v num" id="xCap">—</span></div>
-                <div class="stat"><span class="k">Пошлина на перевозку</span>
+                <div class="stat"><span class="k">Вывозная пошлина</span>
                      <span class="v num" id="xTariff">—</span></div>
+                <div class="stat"><span class="k">Ввозная пошлина</span>
+                     <span class="v num" id="xImport">—</span></div>
                 <div class="stat"><span class="k">Стран в торговле</span>
                      <span class="v num" id="xTraders">—</span></div>
                 <div class="stat"><span class="k">Оборот за пейдей</span>
                      <span class="v num" id="xVolume">—</span></div>
             </div>
-        </div>
-        <div class="grid two">
-            <div class="card">
-                <h2>Мировая цена — <span id="xChartGood">—</span></h2>
-                <svg class="chart" id="worldChart"></svg>
-                <div class="legend">
-                    <span><i style="background:#e3b341"></i>мировая цена</span>
-                    <span><i style="background:#4c9aff"></i>цена в вашей стране</span>
-                </div>
-            </div>
-            <div class="card">
-                <h2>Котировки по странам — <span id="xQuoteGood">—</span></h2>
-                <table>
-                    <thead><tr><th>Государство</th>
-                        <th class="right" title="Средняя цена по стране, взвешенная по обороту областей">Средняя</th>
-                        <th class="right" title="Разброс цен между областями страны">По областям</th>
-                        <th class="right">К мировой</th><th class="right">Склад</th>
-                        <th class="right">Спрос</th><th class="right">Граница</th></tr></thead>
-                    <tbody id="xQuoteRows"></tbody>
-                </table>
-            </div>
-        </div>
-        <div class="card">
-            <h2>Товары на бирже</h2>
-            <table>
+            <div class="tw"><table id="tExGoods">
                 <thead><tr>
                     <th>Товар</th><th></th><th class="right">Мировая цена</th>
                     <th>Дешевле всего</th><th>Дороже всего</th>
@@ -178,35 +194,59 @@
                     <th class="right">Спрошено</th><th class="right">Продано</th>
                 </tr></thead>
                 <tbody id="xRows"></tbody>
-            </table>
+            </table></div>
+        </details>
+        <div class="grid two">
+            <details class="card" data-sec="ex-chart">
+                <summary>Мировая цена — <span id="xChartGood">—</span></summary>
+                <svg class="chart" id="worldChart"></svg>
+                <div class="legend">
+                    <span><i style="background:#e3b341"></i>мировая цена</span>
+                    <span><i style="background:#4c9aff"></i>цена в вашей стране</span>
+                </div>
+            </details>
+            <details class="card" data-sec="ex-quotes">
+                <summary>Котировки по странам — <span id="xQuoteGood">—</span></summary>
+                <div class="tw"><table id="tExQuotes">
+                    <thead><tr><th>Государство</th>
+                        <th class="right" title="Средняя цена по стране, взвешенная по обороту областей">Средняя</th>
+                        <th class="right" title="Разброс цен между областями страны">По областям</th>
+                        <th class="right">К мировой</th><th class="right">Склад</th>
+                        <th class="right">Спрос</th><th class="right">Граница</th></tr></thead>
+                    <tbody id="xQuoteRows"></tbody>
+                </table></div>
+            </details>
         </div>
-        <div class="card">
-            <h2>Сделки прошлого пейдея — <span id="xTradeGood">—</span></h2>
+        <details class="card" data-sec="ex-trades">
+            <summary>Сделки прошлого пейдея — <span id="xTradeGood">—</span></summary>
             <div class="grid two" id="xTrades"></div>
-        </div>
+        </details>
     </section>
 
     <!-- ---------- население ---------- -->
     <section class="page" id="page-people">
-        <div class="card">
-            <h2>Сословия — <span id="peopleRegion">—</span></h2>
+        <details class="card" data-sec="ppl-strata" data-main>
+            <summary>Сословия — <span id="peopleRegion">—</span></summary>
             <div id="peopleRegions"></div>
-            <p class="muted" style="font-size:13px;margin-bottom:14px">
-                Крестьяне кормятся с земли и потому почти не покупают еду. Кустари —
-                те же селяне, взявшиеся за ремесло: они держат страну в одежде и мебели,
-                пока нет фабрик. Горожане живут торговлей, ремеслом и искусством —
-                производят услуги, которые покупают все остальные.
-                Рабочие приходят на заводы за зарплатой и обратно в деревню уже
-                не возвращаются — отсюда и берётся безработица.
-            </p>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:16px">
+            <details class="help">
+                <summary>кто чем живёт</summary>
+                <p class="muted">
+                    Крестьяне кормятся с земли и потому почти не покупают еду. Кустари —
+                    те же селяне, взявшиеся за ремесло: они держат страну в одежде и мебели,
+                    пока нет фабрик. Горожане живут торговлей, ремеслом и искусством —
+                    производят услуги, которые покупают все остальные.
+                    Рабочие приходят на заводы за зарплатой и обратно в деревню уже
+                    не возвращаются — отсюда и берётся безработица.
+                </p>
+            </details>
+            <div class="grid stats">
                 <div class="stat"><span class="k">Рабочих всего</span><span class="v num" id="pWorkers">—</span></div>
                 <div class="stat"><span class="k">Заняты</span><span class="v num" id="pEmployed">—</span></div>
                 <div class="stat"><span class="k">Без работы</span><span class="v num" id="pIdle">—</span></div>
                 <div class="stat"><span class="k">Чтобы нанять, платите от</span><span class="v num good" id="pWage">—</span></div>
                 <div class="stat"><span class="k">Уровень жизни страны</span><span class="v num" id="pSol">—</span></div>
             </div>
-            <table>
+            <div class="tw"><table id="tStrata">
                 <thead><tr>
                     <th>Сословие</th><th>Класс</th><th class="right">Людей</th>
                     <th class="right">Доля</th><th style="width:140px"></th>
@@ -216,169 +256,265 @@
                     <th class="right">Довольство</th><th class="right">Сбережения</th>
                 </tr></thead>
                 <tbody id="strataRows"></tbody>
-            </table>
-        </div>
-        <div class="card">
-            <h2>Уровень жизни и роскошь</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:14px">
-                Уровень жизни — не «сколько съели», а во сколько раз больше обычной
-                корзины сословие себе позволило. <b>1.0</b> — живёт как положено,
-                ниже — недоедает, выше — начинает выбирать. Разбогатев, сословие
-                поднимает <b>ожидания</b>: сперва берёт больше обычного, той же еды и
-                одежды, потом добавляет мясо, вино, хорошее платье, обстановку и,
-                наконец, ложу в опере. Богатое общество и довольнее, и терпеливее:
-                мобилизацию и безработицу оно переносит куда легче, а значит,
-                позволяет держать армию больше.
-            </p>
-            <div id="ladderBox"></div>
-            <table style="margin-top:14px">
-                <thead><tr><th>Сословие</th><th class="right">Уровень жизни</th>
-                    <th style="width:180px"></th><th>Что уже себе позволяет</th></tr></thead>
-                <tbody id="solRows"></tbody>
-            </table>
-        </div>
-        <div class="grid two">
-            <div class="card">
-                <h2>Чем заняты кустари</h2>
-                <table><thead><tr><th>Ремесло</th><th class="right">Людей</th>
-                    <th class="right">Доля</th></tr></thead>
-                    <tbody id="craftRows"></tbody></table>
-                <p class="muted" style="font-size:12px;margin-top:10px">
-                    Кустари сами переходят туда, где выше маржа. Поставите фабрику —
-                    собьёте цену и разорите ремесло, а людей заберёте к себе.
+            </table></div>
+        </details>
+        <details class="card" data-sec="ppl-sol">
+            <summary>Уровень жизни и роскошь</summary>
+            <details class="help">
+                <summary>что такое уровень жизни</summary>
+                <p class="muted">
+                    Уровень жизни — не «сколько съели», а во сколько раз больше обычной
+                    корзины сословие себе позволило. <b>1.0</b> — живёт как положено,
+                    ниже — недоедает, выше — начинает выбирать. Разбогатев, сословие
+                    поднимает <b>ожидания</b>: сперва берёт больше обычного, той же еды и
+                    одежды, потом добавляет мясо, вино, хорошее платье, обстановку и,
+                    наконец, ложу в опере. Богатое общество и довольнее, и терпеливее:
+                    мобилизацию и безработицу оно переносит куда легче, а значит,
+                    позволяет держать армию больше.
                 </p>
-            </div>
-            <div class="card">
-                <h2>Сословия по областям</h2>
-                <table>
+            </details>
+            <div id="ladderBox"></div>
+            <div class="tw"><table id="tSol" style="margin-top:14px">
+                <thead><tr><th>Сословие</th><th class="right">Уровень жизни</th>
+                    <th style="width:140px"></th>
+                    <th>Что потребляет за пейдей (на человека)</th>
+                    <th>Что уже себе позволяет</th></tr></thead>
+                <tbody id="solRows"></tbody>
+            </table></div>
+            <details class="help">
+                <summary>как читать колонку потребления</summary>
+                <p class="muted">
+                    В колонке потребления — сколько единиц товара приходится на одного
+                    человека за пейдей и какую долю положенной сословию нормы это
+                    закрывает. <span class="bad">Красным</span> то, чего не хватает
+                    и вполовину, <span class="dim">серым</span> — то, чего не купили
+                    вовсе. Крестьянская еда со своего поля тоже считается.
+                </p>
+            </details>
+        </details>
+        <div class="grid two">
+            <details class="card" data-sec="ppl-crafts">
+                <summary>Чем заняты кустари</summary>
+                <div class="tw"><table id="tCrafts"><thead><tr><th>Ремесло</th><th class="right">Людей</th>
+                    <th class="right">Доля</th></tr></thead>
+                    <tbody id="craftRows"></tbody></table></div>
+                <details class="help">
+                    <summary>куда уходят кустари</summary>
+                    <p class="muted">
+                        Кустари сами переходят туда, где выше маржа. Поставите фабрику —
+                        собьёте цену и разорите ремесло, а людей заберёте к себе.
+                    </p>
+                </details>
+            </details>
+            <details class="card" data-sec="ppl-cities">
+                <summary>Сословия по областям</summary>
+                <div class="tw"><table id="tCityStrata">
                     <thead><tr><th>Область</th><th class="right">Урожай</th>
                         <th class="right">Крестьяне</th><th class="right">Кустари</th>
                         <th class="right">Рабочие</th><th class="right">Горожане</th>
                         <th class="right">Безработица</th>
                         <th class="right">Ур. жизни</th></tr></thead>
                     <tbody id="cityStrataRows"></tbody>
-                </table>
-            </div>
+                </table></div>
+            </details>
         </div>
     </section>
 
     <!-- ---------- мои предприятия ---------- -->
     <section class="page" id="page-biz">
-        <div class="card">
-            <h2>Итог прошлого пейдея</h2>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr))">
-                <div class="stat"><span class="k">Выручка</span><span class="v num" id="sRev">—</span></div>
+        <details class="card" data-sec="biz-sum" data-main>
+            <summary>Итог прошлого пейдея</summary>
+            <details class="help">
+                <summary>почему выручка меньше выпуска</summary>
+                <p class="muted">
+                    Выручка — это деньги, которые вам <b>реально заплатили</b>, а не
+                    стоимость всего, что вы выпустили. Товар лежит на прилавке, пока его
+                    не купят: если рынок затоварен, часть выпуска оседает на складе и
+                    прибыли не приносит, хотя зарплаты и налоги уже уплачены.
+                    Смотрите на столбец «сбыт».
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Выручка (продано)</span><span class="v num" id="sRev">—</span></div>
+                <div class="stat"><span class="k">Сбыт</span><span class="v num" id="sSell">—</span></div>
+                <div class="stat"><span class="k">Осело на складе</span><span class="v num" id="sUnsold">—</span></div>
                 <div class="stat"><span class="k">Сырьё</span><span class="v num" id="sInp">—</span></div>
                 <div class="stat"><span class="k">Зарплаты</span><span class="v num" id="sWage">—</span></div>
                 <div class="stat"><span class="k">Прибыль</span><span class="v num" id="sProfit">—</span></div>
                 <div class="stat"><span class="k">Рабочих</span><span class="v num" id="sEmp">—</span></div>
             </div>
-        </div>
+        </details>
+        <details class="card" id="bizWageCard" data-sec="biz-wage">
+            <summary>Зарплата на всех предприятиях</summary>
+            <details class="help">
+                <summary>зачем одна ставка на всех</summary>
+                <p class="muted">
+                    Рабочие идут туда, где платят больше, и держать разнобой между
+                    своими же цехами почти никогда не нужно. Одно число — на все ваши
+                    предприятия разом. Там, где местный МРОТ выше введённого, ставка
+                    поднимется до него.
+                </p>
+            </details>
+            <div class="acts">
+                <label class="wagefield"><span>З/п, ₡</span>
+                    <input type="number" id="bizWageAll" min="0" step="1"></label>
+                <button class="primary" onclick="setWageAll('mine')">Установить зп всем</button>
+                <span class="muted" id="bizWageHint" style="font-size:12px"></span>
+            </div>
+        </details>
         <div class="grid cards" id="bizList"></div>
-        <div class="card" id="whCard">
-            <h2>Товар на рынках (ваш)</h2>
-            <p class="muted" style="font-size:12px;margin-bottom:10px">
-                Товар лежит на рынке той страны, где он произведён, и оценивается по
-                её ценам. Завод за границей продаёт местным жителям, а выручка
-                приходит вам.</p>
-            <table><thead><tr><th>Товар</th><th>Рынок</th><th class="right">Количество</th>
+        <details class="card" id="whCard" data-sec="biz-wh">
+            <summary>Товар на рынках (ваш)</summary>
+            <details class="help">
+                <summary>где лежит ваш товар</summary>
+                <p class="muted">
+                    Товар лежит на рынке той страны, где он произведён, и оценивается по
+                    её ценам. Завод за границей продаёт местным жителям, а выручка
+                    приходит вам.</p>
+            </details>
+            <div class="tw"><table id="tWarehouse"><thead><tr><th>Товар</th><th>Рынок</th><th class="right">Количество</th>
                 <th class="right">Оценка</th></tr></thead>
-                <tbody id="whRows"></tbody></table>
-        </div>
+                <tbody id="whRows"></tbody></table></div>
+        </details>
     </section>
 
     <!-- ---------- строительство ---------- -->
     <section class="page" id="page-build">
-        <div class="card">
-            <h2>Куда вложиться</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:14px">
-                «Прибыль на работника» — выручка минус сырьё, зарплата и содержание
-                по текущим ценам. Столбец «сырьё» важнее всего: завод, построенный
-                раньше своей сырьевой базы, будет стоять и жечь деньги.
-                В стране нет ни рудников, ни металлургии — всю цепочку придётся
-                поднимать самому.
-            </p>
+        <details class="card" data-sec="build-main" data-main>
+            <summary>Куда вложиться</summary>
+            <details class="help">
+                <summary>как читать эту таблицу</summary>
+                <p class="muted">
+                    «Прибыль на работника» — выручка минус сырьё, зарплата и содержание
+                    по текущим ценам; рядом та же цифра <b>с поправкой на сбыт</b>: если
+                    рынок затоварен и продаётся половина выпуска, половина этой прибыли
+                    бумажная. Столбец «сырьё» важнее всего: завод, построенный
+                    раньше своей сырьевой базы, будет стоять и жечь деньги.
+                </p>
+                <p class="muted" id="chainNote"></p>
+            </details>
             <div id="buildRegions"></div>
+            <div class="filters">
+                <input id="buildSearch" type="search" placeholder="Поиск: отрасль, товар, сырьё"
+                       oninput="renderBuild()">
+                <div class="regions" id="buildSectors"></div>
+            </div>
             <div class="muted" style="font-size:13px;margin-bottom:14px" id="buildHint"></div>
-            <table>
+            <div class="tw"><table id="tBuild">
                 <thead><tr>
                     <th>Отрасль</th><th>Производит</th><th>Потребляет</th>
-                    <th class="right">Прибыль/раб.</th><th class="right">Сырьё</th>
+                    <th class="right" title="По текущим ценам, если весь выпуск удастся продать">Прибыль/раб.</th>
+                    <th class="right" title="Какая доля выставленного на прилавок нашла покупателя в прошлый пейдей">Сбыт</th>
+                    <th class="right" title="Прибавка к выпуску за производственную цепочку и соседей по отрасли">Цепочка</th>
+                    <th class="right">Сырьё</th>
                     <th class="right">Спрос на товар</th><th class="right">Дефицит</th>
                     <th class="right">Гос / Част</th><th class="right">Цена</th><th></th>
                 </tr></thead>
                 <tbody id="buildRows"></tbody>
-            </table>
-        </div>
-        <div class="card" id="adminCard">
-            <h2>Административные здания</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:14px">
-                Строит только государство и только за счёт казны. Ничего не производят:
-                содержат служащих и создают спрос на еду и мебель. Пригодятся позже —
-                под внешнюю торговлю и развитие технологий.
-            </p>
-            <table>
+            </table></div>
+        </details>
+        <details class="card" id="adminCard" data-sec="build-admin">
+            <summary>Административные здания</summary>
+            <details class="help">
+                <summary>чем полезны административные здания</summary>
+                <p class="muted">
+                    Строит только государство и только за счёт казны. Ничего не производят:
+                    содержат служащих и создают спрос на еду и мебель. Пригодятся позже —
+                    под внешнюю торговлю и развитие технологий.
+                </p>
+            </details>
+            <div class="tw"><table id="tAdmin">
                 <thead><tr><th>Здание</th><th>Что делает</th><th>Потребляет</th>
                     <th class="right">Мест</th><th class="right">Содержание/пейдей</th>
                     <th class="right">Цена</th><th></th></tr></thead>
                 <tbody id="adminRows"></tbody>
-            </table>
-        </div>
+            </table></div>
+        </details>
     </section>
 
     <!-- ---------- страна ---------- -->
     <section class="page" id="page-country">
-        <div class="card">
-            <h2>Области государства</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:12px">
-                У каждой области свой рынок со своими ценами и свой уклад. Нищая
-                область копит озлобление, из него вырастает бунт с погромами заводов,
-                а из затянувшегося бунта — гражданская война и отделение.
-                Кликните область, чтобы смотреть её рынок и население.
-            </p>
-            <table>
+        <details class="card" data-sec="country-cities" data-main>
+            <summary>Области государства</summary>
+            <details class="help">
+                <summary>чем живут области</summary>
+                <p class="muted">
+                    У каждой области свой рынок со своими ценами и свой уклад. Нищая
+                    область копит озлобление, из него вырастает бунт с погромами заводов,
+                    а из затянувшегося бунта — гражданская война и отделение.
+                    Кликните область, чтобы смотреть её рынок и население.
+                </p>
+            </details>
+            <div class="tw"><table id="tCities">
                 <thead><tr>
                     <th>Область</th><th class="right">Население</th>
                     <th class="right">Безработица</th><th class="right">Довольство</th>
                     <th class="right">Уровень жизни</th>
                     <th class="right">Ср. зарплата</th>
+                    <th class="right" title="Насколько рынок области включён в общую экономику. Растёт от «Торговых палат»">Доступность рынка</th>
                     <th style="width:110px">Озлобление</th><th>Состояние</th>
                 </tr></thead>
                 <tbody id="cityRows"></tbody>
-            </table>
-        </div>
+            </table></div>
+        </details>
         <div class="grid two">
-            <div class="card">
-                <h2>ВВП и казна</h2>
+            <details class="card" data-sec="country-gdp">
+                <summary>ВВП и казна</summary>
                 <svg class="chart" id="gdpChart"></svg>
                 <div class="legend">
                     <span><i style="background:#4c9aff"></i>ВВП</span>
                     <span><i style="background:#e3b341"></i>казна</span>
                 </div>
-            </div>
-            <div class="card">
-                <h2>Хроника</h2>
+            </details>
+            <details class="card" data-sec="country-events">
+                <summary>Хроника</summary>
                 <ul class="events" id="eventRows"></ul>
-            </div>
+            </details>
         </div>
     </section>
 
     <!-- ---------- государство ---------- -->
     <section class="page" id="page-gov">
-        <div class="card">
-            <h2>Экономический курс</h2>
+        <details class="card" data-sec="gov-policy" data-main>
+            <summary>Экономический курс</summary>
             <p class="muted" id="govNote" style="font-size:13px;margin-bottom:16px"></p>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(190px,1fr))">
+            <div class="grid fields">
                 <div><label class="muted" style="font-size:12px">Налог на прибыль, %</label>
                      <input id="gCorp" type="number" step="1" min="0" max="75"></div>
                 <div><label class="muted" style="font-size:12px">Налог с продаж, %</label>
                      <input id="gSales" type="number" step="1" min="0" max="50"></div>
-                <div><label class="muted" style="font-size:12px">Подоходный налог, %</label>
+                <div><label class="muted" style="font-size:12px"
+                        title="Удерживается с фонда оплаты труда предприятий и со строек. Платят его только рабочие — у прочих сословий зарплаты нет">
+                        Подоходный налог, %</label>
                      <input id="gInc" type="number" step="1" min="0" max="60"></div>
+                <div><label class="muted" style="font-size:12px"
+                        title="Твёрдая сумма с каждой души. Ложится на всех поровну, а потому тяжелее всего — на бедные сословия. Идёт в казну даже когда в стране ничем не торгуют">
+                        Подушная подать, ₡ с души</label>
+                     <input id="gPoll" type="number" step="0.05" min="0" max="500"></div>
+                <div><label class="muted" style="font-size:12px"
+                        title="Доля рыночной выручки крестьян и кустарей. Берётся с тех, кто не получает зарплаты и потому не платит подоходного. В неурожай уменьшается сам собой">
+                        Оброк с деревни, %</label>
+                     <input id="gTithe" type="number" step="1" min="0" max="50"></div>
+                <div><label class="muted" style="font-size:12px"
+                        title="Доля кассы сословия за пейдей. Единственный налог с накопленного, а не с дохода: тяжелее всех для высшего класса. Гонит лежачие деньги в оборот">
+                        Налог на сбережения, %</label>
+                     <input id="gWealth" type="number" step="0.5" min="0" max="20"></div>
+                <div><label class="muted" style="font-size:12px"
+                        title="Надбавка к налогу с продаж на мясо, вино, дорогое платье, обстановку и оперу. Платит только тот, кто уже живёт лучше обычного">
+                        Акциз на роскошь, %</label>
+                     <input id="gExcise" type="number" step="1" min="0" max="80"></div>
                 <div><label class="muted" style="font-size:12px">Госрасходы, % казны за пейдей</label>
                      <input id="gSpend" type="number" step="1" min="0" max="100"></div>
                 <div><label class="muted" style="font-size:12px">Земельная рента, %</label>
                      <input id="gRent" type="number" step="1" min="0" max="50"></div>
+                <div><label class="muted" style="font-size:12px"
+                        title="Доля стоимости вывезенного, оседающая в казне. Кормит казну с каждой сделки, но отбивает у своих охоту вывозить">
+                        Вывозная пошлина, %</label>
+                     <input id="gTariff" type="number" step="1" min="0" max="60"></div>
+                <div><label class="muted" style="font-size:12px"
+                        title="Защита своих производителей: чужой товар обходится в мировую цену плюс эту долю. Пока дома дешевле — импорт не придёт">
+                        Ввозная пошлина, %</label>
+                     <input id="gImport" type="number" step="1" min="0" max="60"></div>
                 <div><label class="muted" style="font-size:12px">МРОТ, ₡</label>
                      <input id="gMin" type="number" step="1" min="0"></div>
                 <div><label class="muted" style="font-size:12px"
@@ -392,71 +528,133 @@
             </div>
             <div style="margin-top:16px"><button class="primary" id="govSave"
                  onclick="savePolicy()">Утвердить курс</button></div>
-        </div>
-        <div class="card">
-            <h2>Выборы лидера</h2>
+        </details>
+        <details class="card" data-sec="gov-elections">
+            <summary>Выборы лидера</summary>
             <div id="govElections"></div>
-        </div>
-        <div class="card">
-            <h2>Доверие лидеру</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:12px">
-                Недоверие большинства граждан-промышленников (половина плюс один голос)
-                смещает лидера и назначает внеочередные выборы. Голос можно менять
-                когда угодно — он держится до следующих выборов.
-            </p>
+        </details>
+        <details class="card" data-sec="gov-confidence">
+            <summary>Доверие лидеру</summary>
+            <details class="help">
+                <summary>как работает вотум недоверия</summary>
+                <p class="muted">
+                    Недоверие большинства граждан-промышленников (половина плюс один голос)
+                    смещает лидера и назначает внеочередные выборы. Голос можно менять
+                    когда угодно — он держится до следующих выборов.
+                </p>
+            </details>
             <div id="confidenceBox"></div>
             <div class="acts" style="margin-top:12px">
                 <button class="primary" onclick="voteConfidence('trust')">Доверяю лидеру</button>
                 <button class="danger" onclick="voteConfidence('distrust')">Не доверяю лидеру</button>
             </div>
-        </div>
-        <div class="card">
-            <h2>Промышленники государства</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:12px">
-                Дело, чья касса упёрлась в порог банкротства, встаёт целиком: на пустой
-                кассе не нанять людей, чтобы заработать на найм людей. Вытащить из ямы
-                может только субсидия из казны — или собственные запасы владельца.
-            </p>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));margin-bottom:14px">
+        </details>
+        <details class="card" data-sec="gov-citizens">
+            <summary>Промышленники государства</summary>
+            <details class="help">
+                <summary>что бывает при банкротстве</summary>
+                <p class="muted">
+                    Дело, чья касса упёрлась в порог банкротства, встаёт целиком и
+                    <b>само уже не поднимется</b>: цеха запечатаны, хозяин не может ни
+                    запустить их, ни строиться. Дальше решает государство. Сначала
+                    субсидия — деньгами из казны надо вывести кассу выше порога выхода;
+                    потом решение, что открывать: <b>всё дело</b> или <b>только
+                    прибыльное</b>. Убыточные цеха останутся под замком, пока их не
+                    откроют отдельно или не снесут.
+                </p>
+            </details>
+            <div class="grid stats">
                 <div class="stat"><span class="k">Банкротов</span><span class="v num" id="cBankrupt">—</span></div>
                 <div class="stat"><span class="k">Порог банкротства</span><span class="v num" id="cLimit">—</span></div>
+                <div class="stat"><span class="k">Порог выхода</span><span class="v num" id="cExit">—</span></div>
                 <div class="stat"><span class="k">Субсидий выдано</span><span class="v num" id="cSubs">—</span></div>
                 <div class="stat"><span class="k">В казне</span><span class="v num" id="cTreasury">—</span></div>
             </div>
-            <table>
+            <div class="tw"><table id="tCitizens">
                 <thead><tr><th>Промышленник</th><th class="right">Касса</th>
                     <th class="right">Капитал</th><th class="right">Предприятий</th>
                     <th class="right">Рабочих</th><th class="right">Прибыль</th>
-                    <th>Состояние</th><th class="right">Субсидия</th></tr></thead>
+                    <th>Состояние</th><th class="right">Субсидия</th>
+                    <th class="right">Банкротство</th></tr></thead>
                 <tbody id="citizenRows"></tbody>
-            </table>
-        </div>
-        <div class="card">
-            <h2>Казна государства</h2>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
+            </table></div>
+        </details>
+        <details class="card" data-sec="gov-treasury">
+            <summary>Казна государства</summary>
+            <div class="grid stats">
                 <div class="stat"><span class="k">Остаток</span><span class="v num" id="gTreasury">—</span></div>
                 <div class="stat"><span class="k">ВВП за пейдей</span><span class="v num" id="gGdp">—</span></div>
                 <div class="stat"><span class="k">Средняя зарплата</span><span class="v num" id="gWage">—</span></div>
                 <div class="stat"><span class="k">Индустриализация</span><span class="v num" id="gInd">—</span></div>
             </div>
-            <p class="muted" style="font-size:13px;margin-top:14px">
-                Казна строит государственные предприятия и административные здания —
-                кнопки во вкладке «Строительство». Их прибыль возвращается в казну,
-                а кассовые разрывы она закрывает сама.
-            </p>
-        </div>
-        <div class="card">
-            <h2>Государственные предприятия</h2>
+            <details class="help">
+                <summary>на что идёт казна</summary>
+                <p class="muted">
+                    Казна строит государственные предприятия и административные здания —
+                    кнопки во вкладке «Строительство». Их прибыль возвращается в казну,
+                    а кассовые разрывы она закрывает сама.
+                </p>
+            </details>
+        </details>
+        <details class="card" data-sec="gov-budget">
+            <summary>Роспись казны за пейдей</summary>
+            <details class="help">
+                <summary>как сходится роспись</summary>
+                <p class="muted">
+                    Куда пришло и куда ушло — до червонца. Каждое движение казны помечено
+                    статьёй, поэтому <b>доходы минус расходы в точности равны изменению
+                    остатка</b>. Наведите на статью, чтобы прочесть, на кого она ложится.
+                    Если итог в минусе — либо поднимайте налоги, либо срезайте
+                    <b>госрасходы</b>: именно они возвращают деньги населению и потому
+                    съедают бюджет первыми.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Было в казне</span><span class="v num" id="bOpen">—</span></div>
+                <div class="stat"><span class="k">Доходы</span><span class="v num good" id="bIn">—</span></div>
+                <div class="stat"><span class="k">Расходы</span><span class="v num bad" id="bOut">—</span></div>
+                <div class="stat"><span class="k">Итог пейдея</span><span class="v num" id="bNet">—</span></div>
+                <div class="stat"><span class="k">Стало в казне</span><span class="v num" id="bClose">—</span></div>
+            </div>
+            <div class="grid two">
+                <div>
+                    <h3 class="subhead">Доходы</h3>
+                    <div class="tw"><table id="tBudgetIn">
+                        <thead><tr><th>Статья</th><th class="right">₡ за пейдей</th>
+                            <th class="right">на душу</th><th class="right">доля</th></tr></thead>
+                        <tbody id="budgetIn"></tbody>
+                    </table></div>
+                </div>
+                <div>
+                    <h3 class="subhead">Расходы</h3>
+                    <div class="tw"><table id="tBudgetOut">
+                        <thead><tr><th>Статья</th><th class="right">₡ за пейдей</th>
+                            <th class="right">на душу</th><th class="right">доля</th></tr></thead>
+                        <tbody id="budgetOut"></tbody>
+                    </table></div>
+                </div>
+            </div>
+        </details>
+        <details class="card" data-sec="gov-buildings">
+            <summary>Государственные предприятия</summary>
+            <div class="acts" id="govWageBox" style="margin-bottom:14px">
+                <label class="wagefield"><span>З/п, ₡</span>
+                    <input type="number" id="govWageAll" min="0" step="1"></label>
+                <button class="primary" id="govWageBtn"
+                        onclick="setWageAll('state')">Установить зп всем</button>
+                <span class="muted" style="font-size:12px">Одна ставка на все казённые
+                    предприятия страны сразу.</span>
+            </div>
             <div id="govBuildings"></div>
-        </div>
+        </details>
     </section>
 
     <!-- ---------- война и дипломатия ---------- -->
     <section class="page" id="page-war">
-        <div class="card">
-            <h2>Армия</h2>
+        <details class="card" data-sec="war-army" data-main>
+            <summary>Армия</summary>
             <p class="muted" id="warNote" style="font-size:13px;margin-bottom:16px"></p>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:16px">
+            <div class="grid stats">
                 <div class="stat"><span class="k">Солдат</span><span class="v num" id="aSold">—</span></div>
                 <div class="stat"><span class="k">Бюджет тянет</span><span class="v num" id="aAfford">—</span></div>
                 <div class="stat" title="Запас оружия на армейских складах к штатному. Это и есть боеспособность: закупленное оружие остаётся у армии, а не сгорает за пейдей"><span class="k">Вооружены</span><span class="v num" id="aEquip">—</span></div>
@@ -465,85 +663,94 @@
                 <div class="stat"><span class="k">Боевая сила</span><span class="v num" id="aStr">—</span></div>
                 <div class="stat"><span class="k">Расход казны</span><span class="v num" id="aCost">—</span></div>
             </div>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(190px,1fr))">
+            <div class="grid fields">
                 <div><label class="muted" style="font-size:12px">Военный бюджет, ₡ за пейдей</label>
                      <input id="aBudget" type="number" step="1000" min="0"></div>
                 <div><label class="muted" style="font-size:12px">Жалованье солдату, ₡</label>
                      <input id="aPay" type="number" step="1" min="0"></div>
                 <div style="align-self:end" class="muted" id="aHint"></div>
             </div>
-            <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+            <div class="acts" style="margin-top:16px">
                 <button class="primary" id="armySave" onclick="saveArmy()">Утвердить военный бюджет</button>
                 <button class="danger" id="mobBtn" onclick="mobilize()">Объявить мобилизацию</button>
                 <button id="demobBtn" onclick="demobilize()">Отменить мобилизацию</button>
             </div>
             <div id="mobState" style="margin-top:12px"></div>
-        </div>
+        </details>
 
-        <div class="card" id="annexCard">
-            <h2>Занятые области — судьба промышленников</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:12px">
-                На отнятой земле остались чужие заводы. Оставить хозяев в деле — они
-                продолжат работать на вас и платить вам налоги; выдворить — заводы
-                снесут, а владельцу вернут малую часть вложенного. Не решите в срок —
-                промышленников оставят в деле.
-            </p>
+        <details class="card" id="annexCard" data-sec="war-annex">
+            <summary>Занятые области — судьба промышленников</summary>
+            <details class="help">
+                <summary>что делать с чужими заводами</summary>
+                <p class="muted">
+                    На отнятой земле остались чужие заводы. Оставить хозяев в деле — они
+                    продолжат работать на вас и платить вам налоги; выдворить — заводы
+                    снесут, а владельцу вернут малую часть вложенного. Не решите в срок —
+                    промышленников оставят в деле.
+                </p>
+            </details>
             <div id="annexList"></div>
-        </div>
+        </details>
 
-        <div class="card">
-            <h2>Идущие войны</h2>
+        <details class="card" data-sec="war-wars">
+            <summary>Идущие войны</summary>
             <div id="warList"></div>
-        </div>
+        </details>
 
-        <div class="card">
-            <h2>Предложения на столе</h2>
+        <details class="card" data-sec="war-offers">
+            <summary>Предложения на столе</summary>
             <div id="offerList"></div>
-        </div>
+        </details>
 
-        <div class="card">
-            <h2>Соседи</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:14px">
-                Соседи — все, кто граничит хоть с одной вашей областью: отбили область
-                у дальнего государства — и оно стало ближним.
-                Воевать можно только через общую границу. Союзники втягиваются в войну
-                автоматически — и вашу, и чужую. Выйти из войны поодиночке можно
-                сепаратным миром: он прекращает бои только с этим противником,
-                для остальных война продолжается.
-            </p>
-            <table>
+        <details class="card" data-sec="war-neighbors">
+            <summary>Соседи</summary>
+            <details class="help">
+                <summary>кто считается соседом</summary>
+                <p class="muted">
+                    Соседи — все, кто граничит хоть с одной вашей областью: отбили область
+                    у дальнего государства — и оно стало ближним.
+                    Воевать можно только через общую границу. Союзники втягиваются в войну
+                    автоматически — и вашу, и чужую. Выйти из войны поодиночке можно
+                    сепаратным миром: он прекращает бои только с этим противником,
+                    для остальных война продолжается.
+                </p>
+            </details>
+            <div class="tw"><table id="tNeighbors">
                 <thead><tr><th>Государство</th><th>Лидер</th><th class="right">Население</th>
                     <th class="right">Армия</th><th class="right">Боевая сила</th>
                     <th>Отношения</th><th></th></tr></thead>
                 <tbody id="neighborRows"></tbody>
-            </table>
-        </div>
+            </table></div>
+        </details>
     </section>
 
     <!-- ---------- карта ---------- -->
     <section class="page" id="page-map">
-        <div class="card">
-            <h2>Карта государств</h2>
-            <p class="muted" style="font-size:13px;margin-bottom:12px">
-                Двадцать областей-государств. Рёбра — сухопутное соседство.
-                Кликните узел, чтобы посмотреть сводку государства.</p>
-            <svg id="mapSvg" viewBox="0 0 100 80" style="width:100%;max-width:760px;height:auto;background:var(--panel);border-radius:8px"></svg>
+        <details class="card" data-sec="map-main" data-main>
+            <summary>Карта государств</summary>
+            <details class="help">
+                <summary>что показывает карта</summary>
+                <p class="muted">
+                    Двадцать областей-государств. Рёбра — сухопутное соседство.
+                    Кликните узел, чтобы посмотреть сводку государства.</p>
+            </details>
+            <svg id="mapSvg" viewBox="0 0 100 80"></svg>
             <div id="mapInfo" style="margin-top:14px"></div>
-        </div>
+        </details>
     </section>
 
     <!-- ---------- рейтинг ---------- -->
     <section class="page" id="page-top">
-        <div class="card">
-            <h2>Промышленники мира</h2>
-            <table>
+        <details class="card" data-sec="top-main" data-main>
+            <summary>Промышленники мира</summary>
+            <div class="tw"><table id="tTop">
                 <thead><tr><th>#</th><th>Игрок</th><th>Государство</th><th class="right">Капитал</th>
                     <th class="right">Касса</th><th class="right">Предприятий</th>
                     <th class="right">Уровней</th><th class="right">Рабочих</th>
                     <th class="right">Прибыль/пейдей</th></tr></thead>
                 <tbody id="topRows"></tbody>
-            </table>
-        </div>
+            </table></div>
+        </details>
     </section>
 </main>
 </div>

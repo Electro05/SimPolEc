@@ -177,6 +177,51 @@ def craft_margin(city: City, craft: str, crafts: dict[str, dict]) -> float:
     return (local.price - input_cost) * spec["out"]
 
 
+def craft_feasibility(city: City, craft: str, crafts: dict[str, dict],
+                      people: float) -> float:
+    """Сколько кустарей ремесло вообще способно прокормить сырьём, в долях.
+
+    Одной маржи для выбора ремесла мало, и это не мелочь, а причина, по которой
+    разваливалась вся текстильная цепочка.
+
+    У товара, которого в стране никто не делает, цена стоит у потолка коридора,
+    и расчётная маржа кустаря по ней выходит самой заманчивой в списке. Вот
+    только сырья для него на прилавке нет ни унции: инструменты и оружие не
+    сделать без стали, а сталь не плавит никто. Пока это не учитывалось,
+    кустари толпой уходили в ремёсла, которых физически не могли исполнить, —
+    в живой партии до 87% сословия стояло на инструментах и оружии, — не
+    зарабатывали ничего и вымирали: за две сотни пейдеев от трети населения
+    оставались единицы. А вместе с кустарями пропадала ткань и одежда, которые
+    делать было больше некому: хлопок горами лежал на складах при дефиците
+    одежды в 99%.
+
+    Мерка простая и не требует знать, кто чем уже занят: сколько человек можно
+    занять этим ремеслом на то сырьё, что лежит на прилавке. Хватает на всё
+    сословие — единица, нет сырья вовсе — ноль. Ремесло без сырья (лес, хлопок,
+    зерно) исполнимо всегда: там нужны только руки.
+
+    Побочный, но важный эффект — цепочка поднимается сама собой, снизу вверх:
+    пока ткани нет, шить не из чего, и кустари берутся ткать; появилась
+    ткань — открывается шитьё.
+    """
+    spec = crafts.get(craft)
+    if spec is None:
+        return 0.0
+    if not spec["inputs"] or people <= EPS:
+        return 1.0
+    worst = 1.0
+    for key, per_unit in spec["inputs"].items():
+        local = city.goods.get(key)
+        if local is None:
+            return 0.0
+        # сколько сырья ушло бы, возьмись за это ремесло всё сословие
+        need = people * spec["out"] * per_unit
+        if need <= EPS:
+            continue
+        worst = min(worst, max(0.0, local.stock) / need)
+    return min(1.0, worst)
+
+
 def plan_artisans(world: World, country: Country, city: City, mix: dict[str, float],
                   crafts: dict[str, dict]) -> dict:
     """Что кустари намерены сделать за пейдей и сколько сырья для этого нужно."""
@@ -185,7 +230,14 @@ def plan_artisans(world: World, country: Country, city: City, mix: dict[str, flo
     if st.people <= EPS:
         return plan
 
-    budget = max(0.0, st.cash)
+    # Сперва полный замысел, и только потом он целиком ужимается под кассу.
+    # Раньше деньги раздавались по ходу обхода, и ремесло, стоявшее в списке
+    # отраслей раньше, выгребало кассу подчистую, а последним не доставалось
+    # ничего: кто из кустарей будет при деле, решал порядок словаря, а не
+    # выгода. Мебельщики с ткачами оставались без сырья просто потому, что
+    # «Мебельная фабрика» описана ниже «Фермы».
+    draft: dict[str, dict] = {}
+    total_cost = 0.0
     for craft, share in mix.items():
         spec = crafts.get(craft)
         if spec is None or share <= EPS:
@@ -196,19 +248,24 @@ def plan_artisans(world: World, country: Country, city: City, mix: dict[str, flo
         planned = people * spec["out"] * glut_scale(lg(city, craft))
         if planned <= EPS:
             continue
-
-        # кустарь не покупает в долг: план ограничен его же деньгами
         cost = sum(planned * per_unit * lg(city, k).price
                    for k, per_unit in spec["inputs"].items())
-        if cost > budget + EPS and cost > EPS:
-            planned *= max(0.0, budget / cost)
-            cost = budget
-        budget = max(0.0, budget - cost)
+        draft[craft] = {"planned": planned, "spec": spec, "cost": cost}
+        total_cost += cost
 
+    # кустарь не покупает в долг: план ограничен его же деньгами. Ремесло, на
+    # которое сырья покупать не надо (лес, хлопок, зерно), безденежьем не
+    # ограничено — там нужны только руки.
+    budget = max(0.0, st.cash)
+    scale = 1.0 if total_cost <= budget + EPS else max(0.0, budget / total_cost)
+    for craft, item in draft.items():
+        planned = item["planned"] * (scale if item["cost"] > EPS else 1.0)
+        if planned <= EPS:
+            continue
         plan[craft] = {
             "planned": planned,
             "inputs": {k: planned * per_unit
-                       for k, per_unit in spec["inputs"].items()},
+                       for k, per_unit in item["spec"]["inputs"].items()},
         }
     return plan
 
@@ -254,7 +311,13 @@ def artisan_mix(world: World, country: Country, city: City,
     if sum(prev.values()) <= EPS:
         prev = {k: base for k in keys}
 
-    margins = {c: max(craft_margin(city, c, crafts), 0.0) for c in keys}
+    # Тянет к ремеслу выгода, но только к тому, которое можно ИСПОЛНИТЬ: маржа
+    # взвешивается тем, на скольких человек хватит сырья (см. craft_feasibility).
+    # Без этого веса сословие уходило в ремёсла, для которых на рынке нет сырья,
+    # и вымирало от бескормицы.
+    people = city.s("artisans").people
+    margins = {c: max(craft_margin(city, c, crafts), 0.0)
+               * craft_feasibility(city, c, crafts, people) for c in keys}
     total = sum(margins.values())
     if total <= EPS:
         target = {c: base for c in keys}
@@ -344,6 +407,7 @@ def consume(world: World, country: Country, city: City, market, own_food: float)
         basket = stratum_basket(key)
         st = city.s(key)
         if st.people <= EPS:
+            st.consumed = {}
             result[key] = {"fill": {}, "spent": 0.0, "sol": 0.0}
             continue
         level = config.STRATA[key]["level"]
@@ -435,14 +499,26 @@ def consume(world: World, country: Country, city: City, market, own_food: float)
         # уровень жизни прыгал бы от одной только инфляции, хотя человек ест
         # ровно то же самое.
         consumed_value = covered_food * lg(city, "food").anchor
+        # Расшифровка уровня жизни: что и сколько сословие взяло за этот пейдей.
+        taken: dict[str, float] = {}
+        if covered_food > EPS:
+            taken["food"] = covered_food        # своё, с поля, а не с рынка
         for g, want in plan.items():
             price = lg(city, g).price
-            bought = market.buy(g, want, price, sales_tax=country.sales_tax)
+            # Акциз ложится только на роскошь: мясо, вино, дорогое платье,
+            # обстановку и оперу. Хлеб бедняка он не трогает вовсе — в этом
+            # весь смысл отдельной ставки.
+            excise = country.excise_tax if g in config.LUXURY_BASKET else 0.0
+            bought = market.buy(g, want, price, sales_tax=country.sales_tax,
+                                excise=excise)
             paid += bought * price
             consumed_value += bought * lg(city, g).anchor
+            if bought > EPS:
+                taken[g] = taken.get(g, 0.0) + bought
             base_qty = base_needs.get(g, 0.0)
             got = bought + (covered_food if g == "food" else 0.0)
             fill[g] = min(1.0, got / base_qty) if base_qty > EPS else 1.0
+        st.consumed = taken
 
         # --- уровень жизни: во сколько обычных корзин вышло -----------------
         sol = consumed_value / (st.people * normal_basket_value(city, key))
@@ -566,12 +642,30 @@ def drift_and_switch(world: World, city: City, employed: float) -> None:
     if workers.idle_streak >= config.IDLE_TICKS_BEFORE_DRIFT and idle > EPS:
         move_people(workers, city.s("town_low"), idle * config.IDLE_DRIFT_SHARE)
 
+    # Деревня выбирает между полем и ремеслом по тому, КАК ЖИВЁТСЯ, а не по
+    # тому, сколько денег прошло через руки. Разница принципиальная: крестьянин
+    # ест со своего поля и потому при вдвое меньшем денежном доходе живёт
+    # заметно сытнее кустаря, которому хлеб приходится покупать. Пока
+    # сравнивали денежные доходы, кустарь мог «выигрывать» у крестьянина,
+    # сидя при этом впроголодь.
+    # Идут в ремесло на заработок, а бегут из него от голода — и это две разные
+    # мерки. Деньгами ремесло манит: у кустаря на руках живые червонцы, каких у
+    # крестьянина нет. Зато прокормиться на них труднее, и когда ремесло
+    # перестаёт кормить, уходят обратно к земле, сколько бы оно ни платило.
+    # Две мерки дают равновесие: опустеют мастерские — вырастет маржа
+    # оставшихся, и деревня потянется обратно.
     peasants, artisans = city.s("peasants"), city.s("artisans")
     pi, ai = peasants.income_per_capita, artisans.income_per_capita
+    ps, as_ = peasants.living_standard, artisans.living_standard
     if ai > pi * 1.12 and peasants.people > EPS:
         move_people(peasants, artisans, peasants.people * config.CRAFT_SWITCH_SHARE)
-    elif pi > ai * 1.12 and artisans.people > EPS:
-        move_people(artisans, peasants, artisans.people * config.CRAFT_SWITCH_SHARE)
+    elif ps > as_ * 1.12 and artisans.people > EPS:
+        # Ремесло, которое не кормит, пустеет тем быстрее, чем хуже кустарю
+        # живётся и чем сытнее на земле. Уходят к земле: там он хотя бы сыт.
+        pull = min(1.0, (ps - as_) / max(ps, EPS))
+        share = (config.CRAFT_SWITCH_SHARE
+                 + config.CRAFT_FLEE_SHARE * pull * misery(as_))
+        move_people(artisans, peasants, artisans.people * share)
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +742,7 @@ def pay_army(world: World, country: Country) -> float:
     obligation = soldiers * country.soldier_pay
     want = min(obligation, max(0.0, country.army_budget))
     paid = min(want, max(0.0, country.treasury))
-    country.treasury -= paid
+    country.spend("army_pay", paid)
     country.last_army_cost = paid
     # Доля закрытого жалованья считается от полного долга перед армией, а не
     # от урезанного бюджета: солдат сверх бюджета — это тоже недоплаченный
@@ -790,7 +884,7 @@ def restock_shells(world: World, country: Country, city: City, market,
         return 0.0
 
     got = market.buy("shells", want, price)
-    country.treasury -= got * price
+    country.spend("army_supply", got * price)
     country.army_shells += got
     country.last_shells_bought += got
     return got
@@ -863,7 +957,7 @@ def restock_weapons(world: World, country: Country, city: City, market,
         return 0.0
 
     got = market.buy("weapons", want, price)
-    country.treasury -= got * price
+    country.spend("army_supply", got * price)
     country.army_weapons += got
     country.last_weapons_bought += got
     return got
@@ -936,13 +1030,15 @@ def reference_wage(world: World, country: Country) -> float:
     """
     base = country.min_wage
     # доходы деревни в городах этой страны
+    village = 0.0
     for city in world.cities.values():
         if city.country_id != country.id:
             continue
         for key in ("peasants", "artisans"):
             st = city.s(key)
             if st.people > 1:
-                base = max(base, st.income_per_capita)
+                village = max(village, st.income_per_capita)
+    base = max(base, village)
 
     # есть ли свободные рабочие (не занятые на заводах) в стране?
     total_workers = 0.0
@@ -965,7 +1061,13 @@ def reference_wage(world: World, country: Country) -> float:
 
     # На нулевом пейдее доходов ещё никто не получал: ориентир — стоимость
     # корзины, иначе первого завода не нанять никого.
-    if base <= country.min_wage + EPS:
+    #
+    # Условие тут именно «деревня НИЧЕГО не заработала», а не «заработала
+    # меньше МРОТ». Со вторым запасной путь срабатывал в любой неурожайный
+    # пейдей: ставка прыгала с пяти червонцев на полсотни, за ней подскакивала
+    # расчётная себестоимость всего деревенского, а с нею якорь и цены — и
+    # экономику трясло на ровном месте.
+    if village <= EPS:
         base = max(base, max((material_basket_cost(c)
                               for c in country_cities(world, country)),
                              default=0.0))
@@ -973,7 +1075,19 @@ def reference_wage(world: World, country: Country) -> float:
 
 
 def notional_unit_cost(world: World, city: City, key: str, wage: float) -> float | None:
-    """Во сколько обошёлся бы товар, если бы его кто-то делал."""
+    """Во сколько обошёлся бы товар, если бы его кто-то делал.
+
+    Считается ровно по рецепту отрасли и в правильных единицах, а это разные
+    единицы: зарплата и содержание идут НА РАБОТНИКА, а сырьё — НА ЕДИНИЦУ
+    ВЫПУСКА. Значит, делить на выработку надо только труд с содержанием, а
+    стоимость сырья прибавляется как есть.
+
+    Прежняя формула делила наоборот, и промахивалась тем сильнее, чем больше
+    сырья съедает рецепт: сталь по ней выходила вдвое дешевле настоящей, а
+    вместе с себестоимостью занижались и якорь, и коридор цены, и «наценка ×N»
+    в интерфейсе. Игрок видел на рынке ×1.0, строил завод — и тот уходил в
+    минус, потому что настоящая себестоимость была вдвое выше показанной.
+    """
     if key in config.PEASANT_YIELD:
         share = config.PEASANT_EFFORT.get(key, 0.25)
         return wage * share / config.PEASANT_YIELD[key]
@@ -983,8 +1097,8 @@ def notional_unit_cost(world: World, city: City, key: str, wage: float) -> float
             continue
         inputs = sum(q * lg(city, g).price for g, q in ind.inputs.items())
         upkeep = config.UPKEEP_PER_LEVEL / max(ind.jobs_per_level, 1)
-        jobs = ind.jobs_per_level
-        return wage + (inputs + upkeep) / max(ind.output_per_worker, EPS)
+        per_worker = max(ind.output_per_worker, EPS)
+        return (wage + upkeep) / per_worker + inputs
     return None
 
 

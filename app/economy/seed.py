@@ -56,51 +56,52 @@ GOODS = [
 # ---------------------------------------------------------------------------
 # Отрасли. Ни одна не построена — это чертежи, доступные игроку.
 # ---------------------------------------------------------------------------
+# Сектор (последний столбец) — это и фильтр в строительстве, и основа бонуса
+# за цепочку: предприятия одного сектора и одной цепочки, поставленные одним
+# хозяином в одной области, работают заметно лучше разрозненных. Роскошь не
+# выделена в отдельный сектор намеренно — она растёт из того же сырья, что и
+# обычный товар, и должна достраиваться к уже поднятой цепочке: ателье к
+# ткацкой фабрике, скотоводство к ферме.
 J = config.JOBS_PER_LEVEL
 INDUSTRIES = [
-    # key, название, выход, ед/работник, мест/уровень, входы, множитель цены
-    ("farm",       "Ферма",                  "grain",      26.0, J, {}, 0.9),
-    ("logging",    "Лесозаготовка",          "wood",        9.0, J, {}, 1.0),
-    ("plantation", "Плантация",              "cotton",      9.0, J, {}, 0.9),
-    ("coalmine",   "Угольная шахта",         "coal",        8.0, J, {}, 1.1),
-    ("mine",       "Рудник",                 "ore",         7.0, J, {}, 1.1),
-    ("sulfurmine", "Серный рудник",          "sulfur",      7.0, J, {}, 1.1),
+    # key, название, выход, ед/работник, мест/уровень, входы, множитель, сектор
+    ("farm",       "Ферма",                  "grain",      26.0, J, {}, 0.9, "agro"),
+    ("logging",    "Лесозаготовка",          "wood",        9.0, J, {}, 1.0, "forest"),
+    ("plantation", "Плантация",              "cotton",      9.0, J, {}, 0.9, "textile"),
+    ("coalmine",   "Угольная шахта",         "coal",        8.0, J, {}, 1.1, "mining"),
+    ("mine",       "Рудник",                 "ore",         7.0, J, {}, 1.1, "mining"),
+    ("sulfurmine", "Серный рудник",          "sulfur",      7.0, J, {}, 1.1, "military"),
 
-    ("sawmill",    "Лесопилка",              "boards",      4.5, J, {"wood": 2.0}, 1.2),
-    ("weaver",     "Ткацкая фабрика",        "cloth",       4.5, J, {"cotton": 2.0}, 1.2),
+    ("sawmill",    "Лесопилка",              "boards",      4.5, J, {"wood": 2.0}, 1.2, "forest"),
+    ("weaver",     "Ткацкая фабрика",        "cloth",       4.5, J, {"cotton": 2.0}, 1.2, "textile"),
     ("smelter",    "Металлургический завод", "steel",       3.2, J,
-     {"ore": 2.0, "coal": 1.0}, 1.6),
+     {"ore": 2.0, "coal": 1.0}, 1.6, "mining"),
 
-    ("foodplant",  "Пищевой завод",          "food",       11.0, J, {"grain": 2.0}, 1.2),
-    ("tailor",     "Швейная фабрика",        "clothes",     2.6, J, {"cloth": 2.0}, 1.3),
-    ("furniture",  "Мебельная фабрика",      "furniture",   1.7, J, {"boards": 4.0}, 1.4),
+    ("foodplant",  "Пищевой завод",          "food",       11.0, J, {"grain": 2.0}, 1.2, "agro"),
+    ("tailor",     "Швейная фабрика",        "clothes",     2.6, J, {"cloth": 2.0}, 1.3, "textile"),
+    ("furniture",  "Мебельная фабрика",      "furniture",   1.7, J, {"boards": 4.0}, 1.4, "forest"),
     ("toolworks",  "Инструментальный завод", "tools",       1.6, J,
-     {"steel": 2.0, "boards": 1.0}, 1.6),
+     {"steel": 2.0, "boards": 1.0}, 1.6, "tech"),
     ("electro",    "Завод электроники",      "electronics", 0.9, J,
-     {"steel": 1.0, "tools": 1.0}, 2.2),
+     {"steel": 1.0, "tools": 1.0}, 2.2, "tech"),
 
     # Оружейная промышленность. Обе отрасли сидят на стали, поэтому воевать
     # может лишь страна, поднявшая всю цепочку от руды и угля.
     ("armsworks",  "Оружейный завод",        "weapons",     1.2, J,
-     {"steel": 2.0, "wood": 1.0}, 1.8),
+     {"steel": 2.0, "wood": 1.0}, 1.8, "military"),
     ("shellworks", "Снарядный завод",        "shells",      2.2, J,
-     {"steel": 1.0, "sulfur": 2.0}, 1.7),
+     {"steel": 1.0, "sulfur": 2.0}, 1.7, "military"),
 
     # Роскошь. Всё это переводит дешёвое сырьё в дорогой товар, поэтому
     # окупается только там, где людям есть на что его покупать.
     ("ranch",      "Скотоводческая ферма",   "meat",        1.2, J,
-     {"grain": 4.0}, 1.2),
+     {"grain": 4.0}, 1.2, "agro"),
     ("winery",     "Винодельня",             "wine",        0.8, J,
-     {"grain": 3.0}, 1.3),
+     {"grain": 3.0}, 1.3, "agro"),
     ("couture",    "Ателье",                 "fine_clothes", 0.9, J,
-     {"cloth": 4.0}, 1.5),
+     {"cloth": 4.0}, 1.5, "textile"),
     ("finewood",   "Мебельная мануфактура",  "fine_furniture", 0.6, J,
-     {"boards": 6.0, "cloth": 1.0}, 1.7),
-
-    # Рынок — увеличивает долю местной продукции, уходящую на мировой рынок.
-    # Не производит товаров и почти не содержит штат; его смысл — пропускная
-    # способность внешней торговли государства.
-    ("market",     "Торговая площадь",       None,          0.0, 200, {}, 1.0),
+     {"boards": 6.0, "cloth": 1.0}, 1.7, "forest"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -108,16 +109,23 @@ INDUSTRIES = [
 # потребляют товары. Строит только государство.
 # ---------------------------------------------------------------------------
 ADMIN = [
-    # key, название, мест/уровень, потребление на уровень, множитель, описание
+    # key, название, мест/уровень, потребление на уровень, множитель, описание,
+    # предел уровней (0 — без предела)
     ("townhall", "Ратуша", 900, {"food": 420.0, "furniture": 26.0}, 1.5,
-     "Управа города. Содержит служащих и создаёт спрос на еду и мебель."),
+     "Управа города. Содержит служащих и создаёт спрос на еду и мебель.", 0),
     ("trade_chamber", "Торговая палата", 700,
-     {"food": 320.0, "tools": 18.0}, 2.0,
-     "Ведомство внешней торговли. Пока только содержит штат — "
-     "торговля между странами появится позже."),
+     {"food": 320.0, "tools": 18.0}, config.TRADE_CHAMBER_COST_MULT,
+     "Ведомство торговли — единственное, что поднимает ДОСТУПНОСТЬ РЫНКА "
+     "области. Без палат область живёт своим прилавком и доступна общей "
+     "экономике на 10%; каждый уровень палаты добавляет ещё 10%, девятый "
+     "выводит на 100%. Внутри страны доступность выравнивает цены с соседями "
+     "(на сотне рынки областей практически сливаются в один), с заграницей — "
+     "задаёт объём вывоза и ввоза. Стоит дорого и дорожает с каждым уровнем: "
+     "единый рынок страна строит десятилетиями.",
+     config.TRADE_CHAMBER_MAX_LEVEL),
     ("academy", "Академия", 600, {"food": 280.0, "furniture": 18.0}, 1.8,
      "Учебное заведение. Пока только содержит штат — "
-     "развитие технологий появится позже."),
+     "развитие технологий появится позже.", 0),
 ]
 
 # ---------------------------------------------------------------------------
@@ -202,21 +210,23 @@ PROVINCES = [
 
 
 def _make_industries(world: World) -> None:
-    for key, name, out, opw, jpl, inputs, mult in INDUSTRIES:
-        kind = "market" if key == "market" else "industry"
+    for key, name, out, opw, jpl, inputs, mult, sector in INDUSTRIES:
         world.industries[key] = Industry(
             key=key, name=name, output_good=out, output_per_worker=opw,
-            jobs_per_level=jpl, inputs=dict(inputs), build_cost_mult=mult, kind=kind)
-    for key, name, jpl, upkeep, mult, desc in ADMIN:
+            jobs_per_level=jpl, inputs=dict(inputs), build_cost_mult=mult,
+            kind="industry", sector=sector)
+    for key, name, jpl, upkeep, mult, desc, cap in ADMIN:
         world.industries[key] = Industry(
             key=key, name=name, output_good=None, output_per_worker=0.0,
             jobs_per_level=jpl, inputs={}, build_cost_mult=mult, kind="admin",
-            upkeep_goods=dict(upkeep), description=desc)
+            sector="infra", upkeep_goods=dict(upkeep), description=desc,
+            max_level=cap)
     for key, name, out, opw, jpl, inputs, upkeep, mult, desc in CULTURE:
         world.industries[key] = Industry(
             key=key, name=name, output_good=out, output_per_worker=opw,
             jobs_per_level=jpl, inputs=dict(inputs), build_cost_mult=mult,
-            kind="admin", upkeep_goods=dict(upkeep), description=desc)
+            kind="admin", sector="infra", upkeep_goods=dict(upkeep),
+            description=desc)
 
 
 def build_world() -> World:
@@ -275,9 +285,17 @@ def build_world() -> World:
             corporate_tax=config.CORPORATE_TAX,
             sales_tax=config.SALES_TAX,
             income_tax=config.INCOME_TAX,
+            # Налоги, ложащиеся на население: подоходный берётся только с
+            # заводских зарплат, а их в доиндустриальной стране нет ни у кого.
+            poll_tax=config.POLL_TAX,
+            tithe=config.TITHE,
+            wealth_tax=config.WEALTH_TAX,
+            excise_tax=config.EXCISE_TAX,
             public_spending_rate=config.PUBLIC_SPENDING_RATE,
             min_wage=config.MIN_WAGE,
             land_rent=config.LAND_RENT,
+            tariff=config.WORLD_TRADE_TARIFF,
+            import_tariff=config.IMPORT_TARIFF_DEFAULT,
             leader_id=None,           # AI управляет до первых выборов
             foreign_investment_open=False,
             color=color,
@@ -288,6 +306,9 @@ def build_world() -> World:
             # стоят с пустыми арсеналами и разом выгребают рынок оружия.
             army_weapons=pop * START_SHARES["soldiers"] * config.WEAPONS_PER_SOLDIER,
             army_equip=1.0,
+            # Роспись казны начинается с того, что в ней уже лежит: иначе
+            # первый же отчёт разошёлся бы с остатком на всю стартовую сумму.
+            budget_opening=config.START_TREASURY,
         )
         w.countries[cid] = country
 
@@ -387,6 +408,52 @@ def migrate_world(world: World) -> list[str]:
     for key, ind in world.industries.items():
         if key not in known:
             added.append(f"отрасль «{ind.name}»")
+
+    # --- «Торговая площадь» уступила место «Торговой палате» ----------------
+    # Пропускную способность области теперь задаёт одна постройка — казённая
+    # палата. Держать рядом второе здание того же смысла незачем, поэтому
+    # площади сносим и возвращаем хозяевам вложенное, как при обычном сносе.
+    if "market" in world.industries:
+        mult = world.industries["market"].build_cost_mult
+        razed = 0
+        for b in [x for x in world.buildings.values() if x.industry_key == "market"]:
+            owner = world.players.get(b.owner_id)
+            if owner is not None:
+                refund = sum(config.BUILD_COST_BASE * mult
+                             * lv ** config.BUILD_COST_EXPONENT
+                             for lv in range(1, b.level + 1))
+                owner.cash += refund * config.DEMOLISH_REFUND
+            world.buildings.pop(b.id, None)
+            razed += 1
+        world.industries.pop("market", None)
+        added.append("«Торговая площадь» упразднена"
+                     + (f" (снесено {razed}, вложенное возвращено)" if razed else ""))
+
+    # --- пошлины стали настройкой государства, а не общей константой -------
+    for country in world.countries.values():
+        if not country.tariff:
+            country.tariff = config.WORLD_TRADE_TARIFF
+        if not country.import_tariff:
+            country.import_tariff = config.IMPORT_TARIFF_DEFAULT
+
+    # --- налоги с населения и роспись казны --------------------------------
+    # В старом мире с населения не брали ничего, кроме подоходного с заводских
+    # зарплат, — то есть почти ничего. Ставки заводим по умолчанию, чтобы у
+    # лидера уже сохранённой партии появились те же рычаги; роспись начинаем с
+    # текущего остатка, иначе первый отчёт разойдётся с казной.
+    defaults = {"poll_tax": config.POLL_TAX, "tithe": config.TITHE,
+                "wealth_tax": config.WEALTH_TAX, "excise_tax": config.EXCISE_TAX}
+    touched = False
+    for country in world.countries.values():
+        for field_name, value in defaults.items():
+            if getattr(country, field_name, 0.0) <= 0.0:
+                setattr(country, field_name, value)
+                touched = True
+        if not country.budget_opening:
+            country.budget_opening = country.treasury
+    if touched:
+        added.append("налоги с населения (подушная подать, оброк, "
+                     "налог на сбережения, акциз на роскошь)")
 
     # --- версия 3 -> 4: рынок переезжает из страны в области ---------------
     if models._LEGACY_COUNTRY_GOODS:

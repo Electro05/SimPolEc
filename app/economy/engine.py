@@ -84,8 +84,18 @@ class RegionMarket:
 
         self.incoming: dict[str, dict[int, float]] = defaultdict(dict)
         self.revenue: dict[int, float] = defaultdict(float)
+        # Кто и ЧЕГО ИМЕННО продал за пейдей: деньги и штуки по каждому товару.
+        # Общей суммы по владельцу мало — выручку надо приписать конкретному
+        # цеху, иначе прибыль лесопилки считалась бы вместе с продажей мебели
+        # (см. settle_profits).
+        self.sales: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.sold_units: dict[int, dict[str, float]] = defaultdict(
+            lambda: defaultdict(float))
         self.produced: dict[str, float] = defaultdict(float)
+        # Налог с продаж и акциз считаются порознь: в казне это две разные
+        # статьи, и лидеру важно видеть, сколько ему приносит именно роскошь.
         self.tax_collected = 0.0
+        self.excise_collected = 0.0
 
     def available(self, key: str) -> float:
         return sum(self.lots[key].values())
@@ -101,7 +111,14 @@ class RegionMarket:
         target[key][owner_id] = target[key].get(owner_id, 0.0) + qty
         self.produced[key] += qty
 
-    def buy(self, key: str, qty: float, price: float, sales_tax: float = 0.0) -> float:
+    def buy(self, key: str, qty: float, price: float, sales_tax: float = 0.0,
+            excise: float = 0.0) -> float:
+        """Купить товар с прилавка. `excise` — надбавка к налогу с продаж.
+
+        Акциз устроен ровно как налог с продаж и удерживается из тех же денег,
+        но считается отдельно: он ложится только на роскошь, и в росписи казны
+        это своя статья.
+        """
         if qty <= EPS:
             return 0.0
         holders = self.lots[key]
@@ -109,16 +126,29 @@ class RegionMarket:
         if total <= EPS:
             return 0.0
 
+        # Сумма ставок не может съесть выручку продавца целиком.
+        sales_tax = max(0.0, sales_tax)
+        excise = max(0.0, excise)
+        levy = min(0.95, sales_tax + excise)
+        if levy < sales_tax + excise - EPS:
+            scale = levy / (sales_tax + excise)
+            sales_tax *= scale
+            excise *= scale
+
         taken = min(qty, total)
         share = taken / total
         self.tax_collected += taken * price * sales_tax
+        self.excise_collected += taken * price * excise
 
         for owner_id in list(holders):
             part = holders[owner_id] * share
             holders[owner_id] -= part
             if holders[owner_id] <= EPS:
                 del holders[owner_id]
-            self.revenue[owner_id] += part * price * (1.0 - sales_tax)
+            gain = part * price * (1.0 - sales_tax - excise)
+            self.revenue[owner_id] += gain
+            self.sales[owner_id][key] += gain
+            self.sold_units[owner_id][key] += part
         return taken
 
     def flush(self) -> None:
@@ -128,6 +158,14 @@ class RegionMarket:
                 self.lots[key][owner_id] = self.lots[key].get(owner_id, 0.0) + qty
         self.incoming.clear()
 
+        # Порча снимается с САМИХ ЛОТОВ, а не только с того, что расходится по
+        # складам владельцев. Раньше испорченное списывалось лишь в per_owner, а
+        # city.goods[key].stock считался по нетронутым лотам — и рынок каждый
+        # пейдей видел на 8% больше еды (и на 12% больше мяса), чем её было на
+        # самом деле. Этим призраком питались сразу трое: цена (лишнее
+        # предложение давило её вниз), обозы и биржа (везли товар, которого уже
+        # нет). Теперь склад в отчёте и склад по-настоящему — одно и то же.
+        fresh: dict[str, dict[int, float]] = defaultdict(dict)
         per_owner: dict[int, dict[str, float]] = defaultdict(dict)
         for key, holders in self.lots.items():
             good = self.world.goods.get(key)
@@ -138,7 +176,9 @@ class RegionMarket:
             for owner_id, qty in holders.items():
                 qty *= decay
                 if qty > EPS:
+                    fresh[key][owner_id] = qty
                     per_owner[owner_id][key] = qty
+        self.lots = fresh
 
         for owner_id, store in self.stores.items():
             store.clear()
@@ -148,6 +188,76 @@ class RegionMarket:
             if lg is None:
                 continue
             lg.stock = self.available(key) if good.storable else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Производственные цепочки
+# ---------------------------------------------------------------------------
+def chain_report(world: World, others: list, industry_key: str) -> dict:
+    """Насколько предприятие вписано в хозяйство своего владельца.
+
+    Разрозненные заводы работают хуже связанных, и считаются две разные вещи:
+
+    * **звено цепочки** — сосед по двору, который делает сырьё для этого цеха
+      или, наоборот, пускает его выпуск в дело. Ничего не ждёт поставки с
+      рынка, обоз один на всех;
+    * **сосед по отрасли** — предприятие того же сектора: общие мастерские,
+      мастера, ремонт и снабжение.
+
+    Одно и то же предприятие может дать обе прибавки сразу — в этом весь
+    смысл: выгоднее поднимать цепочку внутри одной отрасли, чем хвататься за
+    всё подряд. `others` — прочие предприятия ТОГО ЖЕ хозяина в ТОЙ ЖЕ области.
+    """
+    ind = world.industries.get(industry_key)
+    if ind is None:
+        return {"bonus": 0.0, "links": [], "mates": []}
+
+    links: dict[str, str] = {}
+    mates: dict[str, str] = {}
+    for b in others:
+        if b.industry_key == industry_key or b.effective_level <= 0:
+            continue
+        other = world.industries.get(b.industry_key)
+        if other is None:
+            continue
+        supplies = bool(other.output_good and other.output_good in ind.inputs)
+        consumes = bool(ind.output_good and ind.output_good in other.inputs)
+        if supplies or consumes:
+            links[b.industry_key] = other.name
+        if other.sector == ind.sector:
+            mates[b.industry_key] = other.name
+
+    bonus = min(config.CHAIN_BONUS_CAP,
+                len(links) * config.CHAIN_LINK_BONUS
+                + len(mates) * config.CHAIN_SECTOR_BONUS)
+    return {"bonus": bonus, "links": list(links.values()),
+            "mates": list(mates.values())}
+
+
+def chain_bonus_for(world: World, owner_id: int, city_id: int,
+                    industry_key: str, skip_id: int | None = None) -> dict:
+    """То же, но для одного предприятия (или для ещё не построенного).
+
+    Без `skip_id` считает, что даст цепочка НОВОМУ цеху этой отрасли, —
+    именно это и показывается во вкладке «Строительство».
+    """
+    others = [b for b in world.buildings.values()
+              if b.owner_id == owner_id and b.city_id == city_id
+              and b.id != skip_id]
+    return chain_report(world, others, industry_key)
+
+
+def update_chain_bonuses(world: World, cities: list) -> None:
+    """Пересчитать бонус цепочки всем предприятиям страны за один проход."""
+    ids = {c.id for c in cities}
+    groups: dict[tuple[int, int], list] = defaultdict(list)
+    for b in world.buildings.values():
+        if b.city_id in ids:
+            groups[(b.owner_id, b.city_id)].append(b)
+    for blds in groups.values():
+        for b in blds:
+            others = [x for x in blds if x.id != b.id]
+            b.chain_bonus = chain_report(world, others, b.industry_key)["bonus"]
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +372,8 @@ def _riot(world: World, city, country: Country) -> None:
     for b in world.city_buildings(city.id):
         if b.effective_level > 0 and r.random() < config.REVOLT_BUILDING_DAMAGE:
             b.damage = min(b.level, b.damage + 1)
-    country.treasury -= max(0.0, country.treasury) * config.REVOLT_TREASURY_LOSS
+    country.spend("losses",
+                  max(0.0, country.treasury) * config.REVOLT_TREASURY_LOSS)
 
 
 def _secede(world: World, city, country: Country) -> str | None:
@@ -275,18 +386,21 @@ def _secede(world: World, city, country: Country) -> str | None:
     new_id = world.next_country_id
     world.next_country_id += 1
     name = f"Свободная {city.name}"
+    share = max(0.0, country.treasury) * 0.15
     rebel = CountryModel(
         id=new_id, name=name, capital_city_id=city.id,
-        treasury=max(0.0, country.treasury) * 0.15,
+        treasury=0.0,
         corporate_tax=country.corporate_tax, sales_tax=country.sales_tax,
         income_tax=country.income_tax,
         public_spending_rate=country.public_spending_rate,
         min_wage=country.min_wage, land_rent=country.land_rent,
+        tariff=country.tariff, import_tariff=country.import_tariff,
         leader_id=None, color="#c1121f",
         soldier_pay=country.soldier_pay,
         bankruptcy_limit=country.bankruptcy_limit,
     )
-    country.treasury -= rebel.treasury
+    country.spend("losses", share)
+    rebel.collect("spoils", share)
     world.countries[new_id] = rebel
     city.country_id = new_id
     city.unrest = 0.0
@@ -322,20 +436,71 @@ def _secede(world: World, city, country: Country) -> str | None:
         left = world.country_regions(country.id)
         country.capital_city_id = left[0].id if left else 0
 
-    # и сразу война за независимость
-    declare_war(world, country.id, new_id)
+    # и сразу война за независимость — та самая, в которой мира не бывает
+    declare_war(world, country.id, new_id, kind="revolt")
     return name
 
 
 # ---------------------------------------------------------------------------
 # Банкротство
 # ---------------------------------------------------------------------------
-def update_bankruptcy(world: World, country: Country) -> list[str]:
-    """Пересчитать, кто из промышленников страны разорился, а кто выбрался.
+def bankruptcy_exit_level(country: Country) -> float:
+    """Касса, выше которой государство вправе снять банкротство."""
+    return country.bankruptcy_limit * (1.0 - config.BANKRUPTCY_EXIT_MARGIN)
 
-    Порог задаёт само государство. Выход из банкротства требует подняться
-    заметно выше порога — иначе дело мигало бы «банкрот / не банкрот» каждый
-    пейдей, дёргая занятость всего города.
+
+def halt_buildings(world: World, player: Player) -> int:
+    """Остановить всё хозяйство разорившегося и запечатать его.
+
+    Не просто «выключить»: `halted` означает, что цех не запустится сам и что
+    хозяин не запустит его кнопкой. Пока государство не решит иначе, дело
+    стоит целиком.
+    """
+    n = 0
+    for b in world.buildings.values():
+        if b.owner_id != player.id:
+            continue
+        b.active = False
+        b.halted = True
+        b.employed = 0.0
+        n += 1
+    return n
+
+
+def release_bankrupt(world: World, player: Player, mode: str = "all") -> dict:
+    """Снять банкротство и решить, какие цеха распечатать.
+
+    Решение принимает государство, и у него есть выбор: поднять всё дело разом
+    или открыть только то, что в последний рабочий пейдей давало прибыль.
+    Убыточное при этом остаётся под замком — его можно открыть позже или
+    снести. Именно поэтому и запоминается `last_active_profit`: у стоящего
+    цеха все текущие показатели обнулены.
+    """
+    player.bankrupt = False
+    opened, sealed = [], []
+    for b in world.buildings.values():
+        if b.owner_id != player.id or not b.halted:
+            continue
+        if mode == "profitable" and b.last_active_profit < 0:
+            sealed.append(b)
+            continue
+        b.halted = False
+        b.active = True
+        opened.append(b)
+    return {"opened": len(opened), "sealed": len(sealed),
+            "industries": sorted({world.industries[b.industry_key].name
+                                  for b in opened})}
+
+
+def update_bankruptcy(world: World, country: Country) -> list[str]:
+    """Объявить банкротом того, у кого кончился кредит.
+
+    Обратной дороги своими силами здесь нет намеренно. Раньше банкротство
+    снималось само, стоило кассе всплыть, — и экономика попадала в круг, из
+    которого не выбиралась: рынок затоварен, продаж нет, налоги платить надо,
+    касса проваливается; через пейдей склад распродаётся, дело оживает, снова
+    выпускает на полную — и разоряется опять. Теперь дело встаёт целиком и
+    ждёт решения государства (см. release_bankrupt).
     """
     news: list[str] = []
     limit = country.bankruptcy_limit
@@ -343,18 +508,16 @@ def update_bankruptcy(world: World, country: Country) -> list[str]:
     # лишь подползает к нему сверху. Поэтому банкротство объявляем, когда
     # кредита почти не осталось.
     trigger = limit + abs(limit) * config.BANKRUPTCY_TRIGGER_MARGIN
-    exit_at = limit * (1.0 - config.BANKRUPTCY_EXIT_MARGIN)
     for p in world.players.values():
-        if p.is_state or p.country_id != country.id:
+        if p.is_state or p.bankrupt or p.country_id != country.id:
             continue
-        if not p.bankrupt and p.cash <= trigger:
+        if p.cash <= trigger:
             p.bankrupt = True
             p.bankrupt_since = world.tick
-            news.append(f"{p.username} разорился: дело встало "
-                        f"({p.cash:,.0f} ₡ при пороге {limit:,.0f} ₡)")
-        elif p.bankrupt and p.cash > exit_at:
-            p.bankrupt = False
-            news.append(f"{p.username} рассчитался с долгами и снова в деле")
+            stopped = halt_buildings(world, p)
+            news.append(f"{p.username} признан банкротом: {stopped} предприятий "
+                        f"остановлены ({p.cash:,.0f} ₡ при пороге {limit:,.0f} ₡). "
+                        f"Дело откроет только решение государства")
     return news
 
 
@@ -376,7 +539,9 @@ def support_state_sector(world: World, country: Country) -> float:
         ind = world.industries[b.industry_key]
         lv = b.effective_level
         jobs = lv * ind.jobs_per_level * max(0.0, min(1.0, b.throttle))
-        planned = jobs * ind.output_per_worker
+        # Цепочка поднимает выпуск, а значит и аппетит цеха к сырью: дотацию
+        # надо считать по тому же плану, по которому цех будет работать.
+        planned = jobs * ind.output_per_worker * (1.0 + b.chain_bonus)
         # сырьё считаем по ценам ТОЙ области, где стоит цех
         need += (jobs * max(b.wage, country.min_wage)
                  + lv * config.UPKEEP_PER_LEVEL
@@ -390,8 +555,54 @@ def support_state_sector(world: World, country: Country) -> float:
         return 0.0
     grant = min(gap, country.treasury * config.SUBSIDY_LIMIT)
     state.cash += grant
-    country.treasury -= grant
+    country.spend("state_subsidy", grant)
     return grant
+
+
+# ---------------------------------------------------------------------------
+# Налоги, которые платит население
+# ---------------------------------------------------------------------------
+def collect_head_taxes(world: World, country: Country, cities: list) -> None:
+    """Подушная подать и налог на сбережения — со всех сословий страны.
+
+    Зачем они вообще понадобились. Подоходный налог в этой экономике
+    удерживается с фонда оплаты труда предприятий, а зарплату получают одни
+    рабочие: крестьяне, кустари и горожане живут выручкой с рынка и мимо
+    подоходного проходят целиком. В доиндустриальной стране рабочих нет вовсе,
+    и казна остаётся с одним налогом с продаж — то есть почти ни с чем. Эти два
+    сбора и есть то, чем государство берёт с остальных.
+
+    **Подушная подать** — твёрдая сумма с души, кто бы она ни была. Ровно этим
+    она и сильна, и опасна: доход казны не зависит ни от урожая, ни от цен, но
+    с бедняка берут столько же, сколько с богача, и по довольству низших
+    сословий подать бьёт больнее всего. С пустого кошелька её не взять, поэтому
+    больше POLL_TAX_MAX_SHARE кассы сословия за пейдей не забирают: иначе
+    первый же неурожай оставлял бы деревню без гроша на хлеб.
+
+    **Налог на сбережения** берётся с накопленного, а не с дохода. Тяжелее
+    всего он для высшего класса, у которого на счетах лежат сотни червонцев на
+    душу, и почти незаметен для тех, кто проедает заработок в тот же пейдей.
+    Побочно он гонит лежачие деньги обратно в оборот.
+    """
+    poll = max(0.0, country.poll_tax)
+    wealth = max(0.0, min(1.0, country.wealth_tax))
+    if poll <= EPS and wealth <= EPS:
+        return
+
+    cap = max(0.0, min(1.0, config.POLL_TAX_MAX_SHARE))
+    for city in cities:
+        for key in config.STRATA_ORDER:
+            st = city.s(key)
+            if st.people <= EPS or st.cash <= EPS:
+                continue
+            due = min(st.people * poll, st.cash * cap)
+            taken = min(due, st.cash)
+            st.cash -= taken
+            country.collect("poll_tax", taken)
+            if wealth > EPS and st.cash > EPS:
+                levy = st.cash * wealth
+                st.cash -= levy
+                country.collect("wealth_tax", levy)
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +657,7 @@ def _empty_country_result(country: Country) -> dict:
         "total_wages": 0.0, "subsidy": 0.0, "employed_total": 0.0,
         "total_workers": 0.0, "pop": 0.0, "village": 0.0,
         "artisan_spend": 0.0, "public_spend": 0.0, "value_added": 0.0,
-        "army_cost": 0.0, "mobilized": 0.0, "bankruptcies": [],
+        "army_cost": 0.0, "mobilized": 0.0,
         "living_standard": 1.0,
     }
 
@@ -532,6 +743,9 @@ def run_country(world: World, country: Country) -> dict:
                 input_demand[city.id][g] += q
 
     # --- Фаза 4: предприятия --------------------------------------------
+    # Цепочка считается первой: от неё зависит и выпуск, и то, сколько сырья
+    # цеху понадобится, — а значит и размер дотации казённому сектору.
+    update_chain_bonuses(world, cities)
     subsidy = support_state_sector(world, country)
     plans: list[tuple] = []
 
@@ -541,6 +755,7 @@ def run_country(world: World, country: Country) -> dict:
             continue
         b.last_output = b.last_revenue = b.last_costs = 0.0
         b.last_inputs = b.last_wages = b.last_profit = 0.0
+        b.last_sold = b.last_unsold = b.last_stock = 0.0
         if not b.active or b.employed <= EPS:
             continue
         ind = inds[b.industry_key]
@@ -563,7 +778,10 @@ def run_country(world: World, country: Country) -> dict:
         # услуги), и содержание штата при этом никуда не девается.
         needs = {g: b.effective_level * q for g, q in ind.upkeep_goods.items()}
         if ind.output_good:
-            planned = employed * ind.output_per_worker * morale[b.city_id]
+            # Цепочка прибавляет к выпуску, а не к цене: связанное хозяйство
+            # работает ровнее, чем такой же цех сам по себе.
+            planned = (employed * ind.output_per_worker * morale[b.city_id]
+                       * (1.0 + b.chain_bonus))
             for g, r in ind.inputs.items():
                 needs[g] = needs.get(g, 0.0) + planned * r
         else:
@@ -625,8 +843,14 @@ def run_country(world: World, country: Country) -> dict:
             got = market.buy(g, q * fill, p0[g])
             spent_inputs += got * p0[g]
 
-        # Нет сырья — цех простаивает, но люди остаются на местах и получают
-        # полную зарплату; выпуск режется по доле подвезённого сырья.
+        # Нет сырья — цех простаивает, и за простой платят не полностью.
+        # Люди остаются на местах, но получают лишь IDLE_WAGE_SHARE ставки за
+        # те смены, на которые нечего было привезти. Полная оплата простоя
+        # разоряла бы всякого, кто поставил завод раньше своей сырьевой базы:
+        # цех месяцами платит полный фонд, выпуская считанные штуки, и хозяин
+        # уходит в банкротство, так и не дождавшись поставок.
+        paid_share = fill + (1.0 - fill) * config.IDLE_WAGE_SHARE
+        wages_paid = wage_bill * paid_share
         output = planned * fill if ind.output_good else 0.0
         if output > EPS:
             # Услуги нельзя положить на склад: их оказывают и потребляют в тот
@@ -634,28 +858,28 @@ def run_country(world: World, country: Country) -> dict:
             market.deposit(ind.output_good, b.owner_id, output,
                            immediate=not world.goods[ind.output_good].storable)
             production[b.city_id][ind.output_good] += output
-            prod_cost[b.city_id][ind.output_good] += spent_inputs + wage_bill + upkeep
+            prod_cost[b.city_id][ind.output_good] += spent_inputs + wages_paid + upkeep
 
-        owner.cash -= spent_inputs + wage_bill + upkeep
-        total_wages += wage_bill
+        owner.cash -= spent_inputs + wages_paid + upkeep
+        total_wages += wages_paid
         if ind.output_good:
             value_added += output * p0[ind.output_good] - spent_inputs
 
         b.last_output = output
         b.last_inputs = spent_inputs
-        b.last_wages = wage_bill
-        b.last_costs = spent_inputs + wage_bill + upkeep
-        wage_income[b.city_id] += wage_bill + upkeep
+        b.last_wages = wages_paid
+        b.last_costs = spent_inputs + wages_paid + upkeep
+        wage_income[b.city_id] += wages_paid + upkeep
 
     for cid, gross in wage_income.items():
         st = world.cities[cid].s("workers")
         st.income += gross * (1.0 - country.income_tax)
         st.cash += gross * (1.0 - country.income_tax)
-        country.treasury += gross * country.income_tax
+        country.collect("income_tax", gross * country.income_tax)
 
     # --- Фаза 5: госрасходы -----------------------------------------------
     public_spend = max(0.0, country.treasury) * country.public_spending_rate
-    country.treasury -= public_spend
+    country.spend("public_spending", public_spend)
     pop_total = sum(c.population for c in cities) or 1.0
     for city in cities:
         for key in config.STRATA_ORDER:
@@ -666,6 +890,12 @@ def run_country(world: World, country: Country) -> dict:
             grant = public_spend * share
             st.cash += grant
             st.income += grant
+
+    # --- Фаза 5а: налоги с населения --------------------------------------
+    # Собираются ПОСЛЕ того, как люди получили доход, и ДО того, как они пошли
+    # за покупками: сборщик приходит раньше лавочника. Иначе подать снималась
+    # бы с пустого кошелька и не приносила бы казне ничего.
+    collect_head_taxes(world, country, cities)
 
     # --- Фаза 6: потребление ----------------------------------------------
     consumer_demand: dict[int, dict[str, float]] = {c.id: defaultdict(float)
@@ -704,7 +934,8 @@ def run_country(world: World, country: Country) -> dict:
     society.update_army_equip(world, country)
 
     for city in cities:
-        country.treasury += markets[city.id].tax_collected
+        country.collect("sales_tax", markets[city.id].tax_collected)
+        country.collect("excise", markets[city.id].excise_collected)
 
     # --- Фаза 7: выручка и налоги -----------------------------------------
     for city in cities:
@@ -726,24 +957,21 @@ def run_country(world: World, country: Country) -> dict:
                 high.cash += rent
                 high.income += rent
                 rev -= rent
+            # ОБРОК. Деревня зарплаты не получает и подоходного не платит —
+            # значит, взять с неё можно только долю того, что она выручила на
+            # рынке. Берётся с крестьян и кустарей, после земельной ренты (та
+            # уходит помещику, а не казне), и в неурожай уменьшается сам собой
+            # вместе с выручкой.
+            if country.tithe > 0 and key in ("peasants", "artisans"):
+                due = rev * max(0.0, min(1.0, country.tithe))
+                country.collect("tithe", due)
+                rev -= due
             st.cash += rev
             st.income += rev
 
-    profit_by_owner: dict[int, float] = defaultdict(float)
-    for b, *_ in plans:
-        ind = inds[b.industry_key]
-        b.last_revenue = (b.last_output * price0[b.city_id][ind.output_good]
-                          if ind.output_good else 0.0)
-        b.last_profit = b.last_revenue - b.last_costs
-        b.loss_streak = b.loss_streak + 1 if b.last_profit < 0 else 0
-        profit_by_owner[b.owner_id] += b.last_profit
-
-    for owner_id, profit in profit_by_owner.items():
-        p = world.players.get(owner_id)
-        if p and not p.is_state and profit > EPS:
-            tax = profit * country.corporate_tax
-            p.cash -= tax
-            country.treasury += tax
+    # Выручка и прибыль предприятий здесь НЕ считаются: вывезенный обозом и
+    # биржей товар — такая же продажа, а торговля идёт после экономик всех
+    # стран. Итоги подводит settle_profits в конце пейдея.
 
     # --- Фаза 9 (часть 1): общество ---------------------------------------
     # Пока идёт мобилизация, страна недовольна вся: у одних забрали сыновей,
@@ -775,13 +1003,9 @@ def run_country(world: World, country: Country) -> dict:
 
     for city in cities:
         markets[city.id].flush()
-    bankruptcies = update_bankruptcy(world, country)
 
-    # Госпредприятия отдают излишек кассы в казну государства.
-    state = world.state_player(country.id)
-    if state is not None and state.cash > EPS:
-        country.treasury += state.cash
-        state.cash = 0.0
+    # Излишек казённой кассы и банкротства — тоже в settle_profits: и то и
+    # другое зависит от денег, которые придут с биржи.
 
     # --- Локальные макропоказатели ----------------------------------------
     total_workers = sum(c.s("workers").people for c in cities)
@@ -810,23 +1034,91 @@ def run_country(world: World, country: Country) -> dict:
         "value_added": value_added,
         "army_cost": country.last_army_cost,
         "mobilized": mobilized,
-        "bankruptcies": bankruptcies,
         "living_standard": society.country_living_standard(world, country),
     }
 
 
 def _update_local_prices(world: World, country: Country, res: dict) -> None:
-    """Фаза 9 (часть 2): пересчёт цен — в каждой области своих."""
+    """Фаза 9 (часть 2): пересчёт цен — в каждой области своих.
+
+    Проходов два, и разделены они не зря. Сперва по каждой области считается
+    СЕБЕСТОИМОСТЬ, потом она сливается между областями по мере их доступности,
+    и только затем из неё выводятся якорь и цена.
+
+    Без слияния единый рынок не получался в принципе. Обозы могут развозить
+    товар сколь угодно бойко, но цена в каждой области тянется к своему якорю,
+    а якорь — к своей себестоимости: в столице она считалась по работающему
+    заводу, в провинции — по рецепту от здешних цен. Два разных якоря — две
+    разных цены, сколько ни вози. Теперь чем плотнее области срослись, тем
+    ближе их себестоимость к общестрановой, и на полной доступности рынки
+    действительно становятся одним.
+    """
     wage_ref = society.reference_wage(world, country)
-    for city in world.country_regions(country.id):
-        market = res["markets"].get(city.id)
-        if market is None:
+    regions = [c for c in world.country_regions(country.id)
+               if res["markets"].get(c.id) is not None]
+    demands: dict[int, dict[str, float]] = {}
+
+    for city in regions:
+        demands[city.id] = _region_unit_costs(
+            world, city, wage_ref,
+            res["production"].get(city.id, {}), res["prod_cost"].get(city.id, {}),
+            res["input_demand"].get(city.id, {}),
+            res["consumer_demand"].get(city.id, {}))
+
+    _merge_unit_costs(world, regions, res)
+
+    balance = {city.id: _region_balance(world, city, res["markets"][city.id],
+                                        demands[city.id])
+               for city in regions}
+    _merge_balance(world, regions, balance)
+
+    for city in regions:
+        _region_prices(world, city, balance[city.id])
+
+
+def _merge_unit_costs(world: World, regions: list, res: dict) -> None:
+    """Слить себестоимость областей по мере их включённости в общий рынок.
+
+    Доля слияния растёт от базовой доступности (своя область — свой счёт) до
+    полной (страна считает по одному счёту). Общестрановая себестоимость —
+    средневзвешенная по ВЫПУСКУ: цену задаёт тот, кто товар действительно
+    делает, а не тот, кто его только потребляет. Если товар в стране не
+    производит никто, вес берётся по населению — считать всё равно от чего-то
+    надо.
+    """
+    if len(regions) < 2:
+        return
+    access = region_access(world)
+    base = config.TRADE_ACCESS_BASE
+    span = max(1e-9, config.TRADE_ACCESS_MAX - base)
+
+    for key in world.goods:
+        num = den = 0.0
+        for city in regions:
+            local = city.goods.get(key)
+            if local is None:
+                continue
+            w = res["markets"][city.id].produced.get(key, 0.0)
+            num += local.unit_cost * w
+            den += w
+        if den <= EPS:                      # никто не делает — считаем по людям
+            num = den = 0.0
+            for city in regions:
+                local = city.goods.get(key)
+                if local is None:
+                    continue
+                w = max(city.population, 1.0)
+                num += local.unit_cost * w
+                den += w
+        if den <= EPS:
             continue
-        _update_region_prices(world, city, market, wage_ref,
-                              res["production"].get(city.id, {}),
-                              res["prod_cost"].get(city.id, {}),
-                              res["input_demand"].get(city.id, {}),
-                              res["consumer_demand"].get(city.id, {}))
+        common = num / den
+        for city in regions:
+            local = city.goods.get(key)
+            if local is None:
+                continue
+            merge = min(1.0, max(0.0, (access.get(city.id, base) - base) / span))
+            local.unit_cost = local.unit_cost * (1.0 - merge) + common * merge
 
 
 def _sane_unit_cost(actual: float, previous: float, notional: float | None) -> float:
@@ -844,86 +1136,399 @@ def _sane_unit_cost(actual: float, previous: float, notional: float | None) -> f
     return min(actual, notional * config.UNIT_COST_SANITY)
 
 
-def _update_region_prices(world: World, city, market, wage_ref: float,
-                          production: dict, prod_cost: dict,
-                          input_demand: dict, consumer_demand: dict) -> None:
+def _region_unit_costs(world: World, city, wage_ref: float,
+                       production: dict, prod_cost: dict,
+                       input_demand: dict, consumer_demand: dict) -> dict:
+    """Проход первый: себестоимость каждого товара в этой области.
+
+    Возвращает спрос по товарам — он понадобится второму проходу, а считать
+    его дважды незачем.
+    """
     total_demand: dict[str, float] = defaultdict(float)
     for src in (input_demand, consumer_demand):
         for g, q in src.items():
             total_demand[g] += q
 
     for key, good in world.goods.items():
+        if not good.storable:
+            continue                    # услуги считаются отдельно, по корзине
         local = society.lg(city, key)
         notional = society.notional_unit_cost(world, city, key, wage_ref)
-        if not good.storable:
-            supply = market.produced.get(key, 0.0)
-        else:
-            # предложение = выпуск этого пейдея + остаток на складе
-            out_amount = production.get(key, 0.0)
-            supply = out_amount + market.available(key)
-            if out_amount > EPS:
-                local.unit_cost = _sane_unit_cost(prod_cost[key] / out_amount,
-                                                  local.unit_cost, notional)
-            elif notional is not None:
-                local.unit_cost = local.unit_cost * 0.7 + notional * 0.3
+        plant = production.get(key, 0.0)
+        if plant > EPS:
+            local.unit_cost = _sane_unit_cost(prod_cost[key] / plant,
+                                              local.unit_cost, notional)
+        elif notional is not None:
+            local.unit_cost = local.unit_cost * 0.7 + notional * 0.3
+    return total_demand
 
-        local.anchor = update_anchor(local.anchor, local.unit_cost)
+
+def _region_balance(world: World, city, market, total_demand: dict) -> dict:
+    """Проход второй: спрос, предложение и полка по каждому товару области.
+
+    **Выпуск пейдея считается ровно один раз.** К этому моменту `flush` уже
+    влил приход в лоты, поэтому `local.stock` — это полка ВМЕСТЕ со свежим
+    выпуском. Прежняя формула складывала одно с другим (`made + shelf`), и
+    произведённое за пейдей попадало в предложение дважды: и как поток, и как
+    лежащий на полке товар.
+
+    Видно это было прямо на витрине рынка. У ткани в Аркаде вся полка — это и
+    есть выпуск ткацкой фабрики (тайлор выбирает её подчистую каждый пейдей),
+    и рынок показывал «предложение 264 тыс. при спросе 143 тыс., дефицита
+    нет» — при том, что цена упорно ползла вверх, потому что настоящего товара
+    было ровно вдвое меньше показанного. Тот же двойной счёт занижал цену
+    всякого товара, у которого вообще есть запас.
+    """
+    out: dict[str, list] = {}
+    for key, good in world.goods.items():
+        local = society.lg(city, key)
         demand = total_demand.get(key, 0.0)
-        local.price = next_price(local.price, local.anchor, demand, supply,
-                                 market.total(key) if good.storable else supply)
+        # Выпуск за пейдей — ВЕСЬ, включая деревню и кустарей: они кормят рынок
+        # наравне с заводами.
+        made = market.produced.get(key, 0.0)
+        if not good.storable:
+            supply = shelf = made
+        else:
+            # Полку берём из local.stock, а не из market.available(): рынок
+            # области закрылся до обозов и биржи, а вот склад они уже поправили.
+            # Иначе цена не замечала бы торговли вовсе — привезённый товар не
+            # сбивал бы цену там, где его ждали, а вывезенный не поднимал бы её
+            # там, откуда увезли, и торговля не сходилась бы никогда.
+            shelf = max(0.0, local.stock)
+            # ПЕРЕХОДЯЩИЙ запас — то, что осталось с прошлых пейдеев: полка за
+            # вычетом сегодняшнего выпуска.
+            carry = max(0.0, shelf - made)
+            # Предложение = выпуск пейдея плюс ЛИШНИЙ переходящий запас.
+            # Нормальный запас (PRICE_STOCK_BUFFER пейдеев спроса) на цену не
+            # давит: полка, заполненная на один пейдей вперёд, — это не
+            # затоваривание, а обычная работа лавки.
+            supply = made + max(0.0, carry - demand * config.PRICE_STOCK_BUFFER)
+        # [спрос, предложение для цены, полка — она же то, что могли продать]
+        out[key] = [demand, supply, shelf]
+    return out
+
+
+def _merge_balance(world: World, regions: list, balance: dict) -> None:
+    """Слить баланс спроса и предложения по мере включённости в общий рынок.
+
+    Себестоимость слить мало: цена смотрит ещё и на то, сколько товара рядом.
+    Завод стоит в столице — там выпуск, там и низкая цена, а в провинции по
+    тем же складам числится один остаток, и цена там высокая, сколько обозов
+    ни гоняй. На едином рынке так быть не должно: важно, сколько товара в
+    СТРАНЕ, а не в какой её точке он вышел из ворот.
+
+    Величины остаются в масштабе области — сливается соотношение, а не сумма:
+    предложение и полка подтягиваются к общестрановой доле от спроса.
+    """
+    if len(regions) < 2:
+        return
+    access = region_access(world)
+    base = config.TRADE_ACCESS_BASE
+    span = max(1e-9, config.TRADE_ACCESS_MAX - base)
+
+    for key in world.goods:
+        d_all = s_all = k_all = 0.0
+        for city in regions:
+            row = balance[city.id].get(key)
+            if row is None:
+                continue
+            d_all += row[0]
+            s_all += row[1]
+            k_all += row[2]
+        if d_all <= EPS:
+            continue
+        s_rate, k_rate = s_all / d_all, k_all / d_all
+        for city in regions:
+            row = balance[city.id].get(key)
+            if row is None:
+                continue
+            merge = min(1.0, max(0.0, (access.get(city.id, base) - base) / span))
+            if merge <= EPS:
+                continue
+            row[1] = row[1] * (1.0 - merge) + row[0] * s_rate * merge
+            row[2] = row[2] * (1.0 - merge) + row[0] * k_rate * merge
+
+
+def _region_prices(world: World, city, balance: dict) -> None:
+    """Проход третий: якорь и цена — по слитым себестоимости и балансу."""
+    for key in world.goods:
+        local = society.lg(city, key)
+        demand, supply, shelf = balance[key]
+        local.anchor = update_anchor(local.anchor, local.unit_cost)
+        local.price = next_price(local.price, local.anchor, demand, supply, shelf)
+        # В отчёт идёт ПОЛКА — весь товар, лежащий на рынке, включая выпуск
+        # этого пейдея, — а не урезанная на нормальный запас величина:
+        # последняя нужна только цене, а «дефицит» в интерфейсе должен
+        # считаться честно и совпадать с тем, что видно в столбце «склад».
         local.last_demand = demand
-        local.last_supply = supply
-        local.last_sold = min(demand, supply)
+        local.last_supply = shelf
+        local.last_sold = min(demand, shelf)
         local.last_shortage = 0.0 if demand <= EPS else max(
-            0.0, 1.0 - min(1.0, supply / demand))
+            0.0, 1.0 - min(1.0, shelf / demand))
+
+
+# ---------------------------------------------------------------------------
+# Итоги предприятий: выручка по факту продаж
+# ---------------------------------------------------------------------------
+def settle_profits(world: World, country_results: dict,
+                   exports: dict) -> list[str]:
+    """Подвести итоги пейдея по каждому предприятию — и по деньгам, а не по
+    выпуску.
+
+    **Главное правило: выпустить не значит продать.** Товар лежит на прилавке,
+    пока его не купят, и деньги приходят в момент покупки. Раньше выручка цеха
+    считалась как «весь выпуск × цена», и на затоваренном рынке предприятие
+    показывало бодрую прибыль, пока касса хозяина уходила в минус: продать он
+    ничего не мог, а зарплаты и налоги платил. Теперь выручка — это ровно те
+    деньги, что за его товар заплатили.
+
+    Кому приписать продажу, если у хозяина в области два цеха одного товара?
+    Пропорционально выпуску этого пейдея — тогда «выпустил 100, продал 60»
+    читается прямо. Если цех стоит, а склад распродаётся, делим по уровням:
+    выручка от старых запасов всё равно чья-то.
+
+    Считается это ПОСЛЕ обозов и биржи: вывоз — такая же продажа, и завод,
+    работающий на экспорт, не должен числиться убыточным. Отсюда же и налог на
+    прибыль: он берётся с денег, а не с намерений.
+    """
+    money: dict[tuple[int, int, str], float] = defaultdict(float)
+    units: dict[tuple[int, int, str], float] = defaultdict(float)
+
+    for res in country_results.values():
+        for city_id, market in res["markets"].items():
+            for owner_id, per_good in market.sales.items():
+                if owner_id < 0:
+                    continue            # сословие, а не предприятие
+                for good, value in per_good.items():
+                    money[(city_id, owner_id, good)] += value
+            for owner_id, per_good in market.sold_units.items():
+                if owner_id < 0:
+                    continue
+                for good, qty in per_good.items():
+                    units[(city_id, owner_id, good)] += qty
+    for key, (value, qty) in exports.items():
+        money[key] += value
+        units[key] += qty
+
+    # --- разложить выручку по цехам ---------------------------------------
+    groups: dict[tuple[int, int, str], list] = defaultdict(list)
+    for b in world.buildings.values():
+        ind = world.industries.get(b.industry_key)
+        if ind is None or not ind.output_good:
+            continue
+        groups[(b.city_id, b.owner_id, ind.output_good)].append(b)
+
+    for key, blds in groups.items():
+        city_id, owner_id, good = key
+        weights = [b.last_output for b in blds]
+        if sum(weights) <= EPS:
+            weights = [float(b.effective_level) for b in blds]
+        if sum(weights) <= EPS:
+            weights = [1.0] * len(blds)
+        total = sum(weights)
+        owner = world.players.get(owner_id)
+        stock = (owner.warehouses.get(city_id, {}).get(good, 0.0)
+                 if owner is not None else 0.0)
+        for b, weight in zip(blds, weights):
+            share = weight / total
+            b.last_revenue = money.get(key, 0.0) * share
+            b.last_sold = units.get(key, 0.0) * share
+            b.last_stock = stock * share
+            # Отрицательного «непроданного» не бывает: продать больше, чем
+            # выпустил, можно — это распродажа склада, а не долг.
+            b.last_unsold = max(0.0, b.last_output - b.last_sold)
+
+    # --- прибыль и налог ---------------------------------------------------
+    profit_by_owner: dict[tuple[int, int], float] = defaultdict(float)
+    for b in world.buildings.values():
+        b.last_profit = b.last_revenue - b.last_costs
+        if b.last_costs > EPS or b.last_output > EPS:
+            b.last_active_profit = b.last_profit
+        b.loss_streak = b.loss_streak + 1 if b.last_profit < 0 else 0
+        city = world.cities.get(b.city_id)
+        if city is not None:
+            # Налог на прибыль платится стране, где стоит завод, — даже если
+            # хозяин иностранец.
+            profit_by_owner[(city.country_id, b.owner_id)] += b.last_profit
+
+    for (country_id, owner_id), profit in profit_by_owner.items():
+        country = world.countries.get(country_id)
+        p = world.players.get(owner_id)
+        if country is None or p is None or p.is_state or profit <= EPS:
+            continue
+        tax = profit * country.corporate_tax
+        p.cash -= tax
+        country.collect("corporate_tax", tax)
+
+    # --- казна и банкротства ----------------------------------------------
+    news: list[str] = []
+    for country in world.countries.values():
+        if not country.alive:
+            continue
+        # Госпредприятия отдают излишек кассы в казну государства.
+        state = world.state_player(country.id)
+        if state is not None and state.cash > EPS:
+            country.collect("state_business", state.cash)
+            state.cash = 0.0
+        news += update_bankruptcy(world, country)
+    return news
 
 
 # ---------------------------------------------------------------------------
 # Мировой рынок: арбитраж между государствами
 # ---------------------------------------------------------------------------
-def region_trade_capacity(world: World) -> dict[int, float]:
-    """Какую долю своих запасов ОБЛАСТЬ способна вывезти за пейдей.
+def chamber_levels(world: World, city_id: int) -> int:
+    """Сколько уровней «Торговой палаты» стоит в области."""
+    return sum(b.effective_level for b in world.buildings.values()
+               if b.industry_key == "trade_chamber" and b.city_id == city_id)
 
-    Обозы ходили и до всякой биржи, поэтому у каждой области есть базовая
-    пропускная способность: торговля работает всегда, просто вяло. «Торговые
-    площади» её увеличивают — в этом и весь их смысл, а не в том, чтобы
-    открыть границу с нуля.
+
+def region_access(world: World) -> dict[int, float]:
+    """ДОСТУПНОСТЬ РЫНКА каждой области — насколько она включена в общий.
+
+    Одно число на оба конца торговли, и в этом весь смысл:
+
+    * **внутри страны** — доля разрыва между своим прилавком и общестрановой
+      нормой, которую область закрывает за пейдей. На 100% область
+      выравнивается за один пейдей, и рынки страны практически сливаются в
+      один; на базовых 10% обозы ползут, и в соседней области хлеб может
+      стоить вдвое дороже;
+    * **с заграницей** — просто объём: сколько товара область физически
+      пропустит через границу за пейдей.
+
+    Поднимает её единственная постройка — казённая «Торговая палата»:
+    десять процентов за уровень поверх базовых десяти, девятый уровень выводит
+    на сотню.
     """
-    levels: dict[int, int] = defaultdict(int)
-    for b in world.buildings.values():
-        if b.industry_key == "market":
-            levels[b.city_id] += b.effective_level
-    caps: dict[int, float] = {}
+    out: dict[int, float] = {}
     for city in world.cities.values():
-        caps[city.id] = min(
-            config.TRADE_SHARE_CAP,
-            config.TRADE_SHARE_BASE
-            + levels[city.id] * config.WORLD_MARKET_SHARE_PER_LEVEL)
-    return caps
+        out[city.id] = min(
+            config.TRADE_ACCESS_MAX,
+            config.TRADE_ACCESS_BASE
+            + chamber_levels(world, city.id) * config.TRADE_ACCESS_PER_LEVEL)
+    return out
 
 
-def trade_capacity(world: World) -> dict[int, float]:
-    """Пропускная способность государства — лучшая из его областей."""
-    caps = region_trade_capacity(world)
+def country_access(world: World) -> dict[int, float]:
+    """Доступность рынка государства — средняя по его областям, по населению.
+
+    Именно средняя, а не лучшая: единый рынок — это когда включены ВСЕ области,
+    а не одна столица с палатой девятого уровня при глухой провинции.
+    """
+    access = region_access(world)
     out: dict[int, float] = {}
     for country in world.countries.values():
         regions = world.country_regions(country.id)
-        out[country.id] = max((caps.get(c.id, 0.0) for c in regions), default=0.0)
+        pop = sum(c.population for c in regions)
+        if pop <= EPS:
+            out[country.id] = (sum(access.get(c.id, 0.0) for c in regions)
+                               / len(regions) if regions else 0.0)
+        else:
+            out[country.id] = sum(access.get(c.id, 0.0) * c.population
+                                  for c in regions) / pop
     return out
 
 
 # ---------------------------------------------------------------------------
 # Обмен между областями одной страны
 # ---------------------------------------------------------------------------
-def domestic_trade_step(world: World) -> None:
-    """Развезти товар внутри страны из дешёвых областей в дорогие.
+def _gap_for(gap, city_id: int) -> float:
+    """Порог разницы цен: общий для всех или свой у каждой страны (пошлины)."""
+    return gap.get(city_id, 0.0) if isinstance(gap, dict) else gap
 
-    Это и есть работа торговых площадей: рынок каждой области сам по себе, но
-    обозы выравнивают цены между ними. Казна выкупает излишек там, где дёшево,
-    и выкладывает его на прилавок там, где дорого, — а разницу оставляет себе
-    как выручку купца. Товар и деньги при этом сходятся в ноль.
+
+def _trade_sides(regions: list, key: str, caps: dict[int, float],
+                 ref_price: float, sell_gap, buy_gap) -> tuple[list, list]:
+    """Кто в этом наборе областей отдаёт товар, а кто его ждёт.
+
+    У каждой области есть НОРМА ЗАПАСА — сколько товара ей положено держать на
+    прилавке. Норма считается не от абсолютной цифры, а от ОБЕСПЕЧЕННОСТИ всего
+    набора: сколько пейдеев спроса покрывает весь имеющийся товар, столько же
+    пейдеев положено и каждой области. Больше нормы — излишек, за ним приезжает
+    обоз; меньше — нехватка, ради неё обоз и едет. Потолок нормы —
+    TRADE_KEEP_TICKS: запасаться сверх этого никто не станет.
+
+    Это и есть работа внутренней торговли: не «вывезти лишнее», а РАЗВЕЗТИ ПО
+    СТРАНЕ то, что есть. Завод стоит в столице — обозы разносят его товар по
+    провинциям, и нехватка делится на всех поровну, вместо того чтобы столица
+    забирала весь выпуск, а провинция сидела с пустым прилавком. Цены при этом
+    ни при чём: товар везут туда, где его ждут, даже если стоит он там ровно
+    столько же. Именно этого и не хватало прежней механике — она трогалась с
+    места только на разнице цен, а между областями одной страны её почти не
+    бывает.
+
+    Цена лишь ДВИГАЕТ норму: там, где дешевле опорной (`ref_price` — средняя по
+    стране или мировая), купец готов забрать часть и того, что область
+    придержала бы для себя; там, где дороже, — область запасается впрок. Сдвиг
+    ограничен: обобрать бедную область досуха арбитраж не может.
+
+    `sell_gap` и `buy_gap` — насколько цена должна разойтись с опорной, чтобы
+    двигать норму. Числом задаётся общий порог, словарём {id области: порог} —
+    свой у каждой страны: там сидят вывозная и ввозная пошлины.
+
+    Возвращает списки (область, рынок, сколько единиц) для продавцов и
+    покупателей. И то и другое умножено на ДОСТУПНОСТЬ РЫНКА области — вот ради
+    чего и строятся «Торговые палаты».
     """
-    caps = region_trade_capacity(world)
+    rows, stock_all, demand_all = [], 0.0, 0.0
+    for city in regions:
+        local = city.goods.get(key)
+        cap = caps.get(city.id, 0.0)
+        if local is None or cap <= EPS:
+            continue
+        rows.append((city, local, cap))
+        stock_all += max(0.0, local.stock)
+        demand_all += max(0.0, local.last_demand)
+    if len(rows) < 2:
+        return [], []
+
+    # На сколько пейдеев спроса хватает всего товара — столько и положено
+    # каждой области. Товара вдоволь — норма упирается в потолок.
+    ceiling = config.TRADE_KEEP_TICKS
+    cover = stock_all / demand_all if demand_all > EPS else ceiling
+    cover = min(ceiling, cover)
+
+    sellers, buyers = [], []
+    for city, local, cap in rows:
+        keep = max(0.0, local.last_demand) * cover
+        if ref_price > EPS and keep > EPS:
+            edge = local.price / ref_price - 1.0
+            bias = (min(0.0, edge + _gap_for(sell_gap, city.id)) if edge < 0
+                    else max(0.0, edge - _gap_for(buy_gap, city.id)))
+            bias = max(-config.TRADE_PRICE_SWING, min(config.TRADE_PRICE_SWING, bias))
+            keep *= max(config.TRADE_KEEP_MIN, 1.0 + bias * config.TRADE_PRICE_PULL)
+        spare = max(0.0, local.stock - keep)
+        short = max(0.0, keep - local.stock)
+        if spare > EPS:
+            sellers.append((city, local, spare * cap))
+        if short > EPS:
+            buyers.append((city, local, short * cap))
+    return sellers, buyers
+
+
+def domestic_trade_step(world: World, exports: dict | None = None) -> None:
+    """Развезти товар внутри страны: из областей с излишком туда, где нехватка.
+
+    Это и есть ИНТЕГРАЦИЯ ХОЗЯЙСТВЕННОГО ПРОСТРАНСТВА, которую даёт «Торговая
+    палата». Рынок каждой области сам по себе, но обозы связывают их: где
+    товара больше нормы — забирают, где меньше — привозят. Доступность рынка
+    области и есть доля разрыва, которую она закрывает за пейдей: на базовых
+    10% область подтягивается к общестрановой норме десятками пейдеев, на 100%
+    — за один, и цены по стране становятся практически одинаковыми.
+
+    Казна выступает купцом: выкупает излишек по здешней цене за вычетом
+    провозной платы (DOMESTIC_TRADE_FEE — её заработок) и выкладывает товар на
+    прилавок там, где его ждут. Товар и деньги при этом сходятся в ноль.
+
+    Раньше обоз трогался только на разнице цен больше 8% — а её между соседними
+    областями одной страны почти никогда нет, потому внутренняя торговля и не
+    работала. Теперь разница цен лишь ДОБАВЛЯЕТ поводов везти: главный повод —
+    что в соседней области товара не хватает.
+
+    `exports` — копилка продаж для settle_profits: увезённое обозом тоже
+    продано, и завод обязан увидеть за это деньги.
+    """
+    caps = region_access(world)
     for country in world.countries.values():
         if not country.alive:
             continue
@@ -937,56 +1542,53 @@ def domestic_trade_step(world: World) -> None:
         for key, good in world.goods.items():
             if not good.storable:
                 continue                # услуги не возят
-            quotes = [(c, c.goods.get(key)) for c in regions]
-            quotes = [(c, g) for c, g in quotes if g is not None]
+            quotes = [c.goods[key] for c in regions if key in c.goods]
             if len(quotes) < 2:
                 continue
-            mean = sum(g.price for _, g in quotes) / len(quotes)
-            if mean <= EPS:
-                continue
-
-            sellers = [(c, g) for c, g in quotes
-                       if g.price < mean * (1.0 - config.DOMESTIC_TRADE_GAP)
-                       and g.stock > EPS]
-            buyers = [(c, g) for c, g in quotes
-                      if g.price > mean * (1.0 + config.DOMESTIC_TRADE_GAP)]
+            mean = sum(g.price for g in quotes) / len(quotes)
+            gap = config.DOMESTIC_TRADE_GAP
+            sellers, buyers = _trade_sides(regions, key, caps, mean, gap, gap)
             if not sellers or not buyers:
                 continue
 
-            offered = sum(g.stock * caps.get(c.id, 0.0) for c, g in sellers)
-            wanted = sum(max(0.0, g.last_demand - g.stock) * caps.get(c.id, 0.0)
-                         for c, g in buyers)
+            offered = sum(x[2] for x in sellers)
+            wanted = sum(x[2] for x in buyers)
             traded = min(offered, wanted)
             if traded <= EPS:
                 continue
+            # Казна не закупает в долг: обоз идёт ровно на те деньги, что есть.
+            budget = max(0.0, country.treasury)
+            price_hi = max(g.price for _, g, _ in sellers)
+            if price_hi * traded > budget:
+                traded = budget / price_hi if price_hi > EPS else 0.0
+            if traded <= EPS:
+                continue
 
-            # выкупаем у дешёвых областей
+            # выкупаем там, где излишек
+            fee = 1.0 - config.DOMESTIC_TRADE_FEE
             bought = 0.0
-            paid = 0.0
-            for c, g in sellers:
-                share = g.stock * caps.get(c.id, 0.0) / offered
-                qty = traded * share
-                got = _ship_out(world, c, key, qty, g.price)
+            for city, local, offer in sellers:
+                qty = traded * offer / offered
+                got = _ship_out(world, city, key, qty, local.price * fee, exports)
+                if got <= EPS:
+                    continue
                 bought += got
-                paid += got * g.price
-                g.stock = max(0.0, g.stock - got)
+                country.spend("domestic_trade", got * local.price * fee)
+                local.stock = max(0.0, local.stock - got)
             if bought <= EPS:
                 continue
-            country.treasury -= paid
 
-            # и выкладываем в дорогих
-            for c, g in buyers:
-                want = max(0.0, g.last_demand - g.stock) * caps.get(c.id, 0.0)
-                share = want / wanted if wanted > EPS else 0.0
-                qty = bought * share
+            # и выкладываем там, где ждут
+            for city, local, want in buyers:
+                qty = bought * want / wanted
                 if qty <= EPS:
                     continue
-                store = state.store(c.id)
+                store = state.store(city.id)
                 store[key] = store.get(key, 0.0) + qty
-                g.stock += qty
+                local.stock += qty
 
 
-def world_market_step(world: World) -> None:
+def world_market_step(world: World, exports: dict | None = None) -> None:
     """Мировой рынок как клиринг между ОБЛАСТЯМИ разных стран.
 
     Сорок областей и составляют весь мир, поэтому вывезенный товар обязан быть
@@ -997,49 +1599,68 @@ def world_market_step(world: World) -> None:
 
     Торгуют именно области, а не страны: у каждой свои цены, и вывозить
     выгодно оттуда, где дёшево, — даже если в соседней области той же страны
-    дорого. Пропускная способность есть у всех и без торговых площадей, те
-    лишь увеличивают её.
+    дорого. Здесь доступность рынка означает не выравнивание цен, а просто
+    ОБЪЁМ: сколько товара область физически пропустит через границу за пейдей.
+
+    Повод к сделке тот же, что и у обозов внутри страны: излишек ищет, куда
+    его деть, нехватка ищет, где взять, а разница цен добавляет к этому
+    спекулятивный вывоз и закупку впрок.
+
+    **Своя страна и заграница на равных.** Никакой форы у обозов нет: та же
+    доступность, та же норма запаса. Разницу делают только пошлины, и их
+    задаёт лидер:
+
+    * **вывозная** — продавец получает мировую цену за её вычетом, разница
+      оседает в казне. Высокая ставка кормит казну, но отбивает охоту вывозить;
+    * **ввозная** — защита своих производителей. Ввозить есть смысл, только
+      если дома дороже мировой цены С УЧЁТОМ пошлины. Задерёшь ставку —
+      дешёвый чужой товар просто не дойдёт до прилавка, и свой завод сможет
+      продавать дорого.
     """
-    caps = region_trade_capacity(world)
+    caps = region_access(world)
     world.last_trades = {}
-    tariff = config.WORLD_TRADE_TARIFF
+    live = [c for c in world.cities.values()
+            if (world.countries.get(c.country_id) is not None
+                and world.countries[c.country_id].alive)]
+    # Пошлины у каждой страны свои, поэтому и пороги разницы цен — по областям.
+    duty = {c.id: max(0.0, world.countries[c.country_id].tariff) for c in live}
+    duty_in = {c.id: max(0.0, world.countries[c.country_id].import_tariff)
+               for c in live}
 
     for key, good in world.goods.items():
         if not good.storable:
             continue                    # услуги через границу не возят
         wp = world.world_prices.get(key, good.anchor)
-        seller_gets = wp * (1.0 - tariff)
+
+        # Вывозить есть смысл, пока за вычетом вывозной пошлины дают больше
+        # здешней цены; ввозить — пока мировая с ввозной пошлиной ниже здешней.
+        raw_sellers, raw_buyers = _trade_sides(live, key, caps, wp, duty, duty_in)
 
         # --- кто и сколько готов вывезти -------------------------------
         sellers: list[tuple] = []
-        for city in world.cities.values():
-            country = world.countries.get(city.country_id)
-            local = city.goods.get(key)
-            cap = caps.get(city.id, 0.0)
-            if country is None or not country.alive or local is None:
-                continue
-            if cap <= EPS or local.stock <= EPS:
-                continue
-            if seller_gets > local.price:          # дома дешевле — вывозим
-                sellers.append((city, country, local, local.stock * cap))
+        for city, local, offer in raw_sellers:
+            country = world.countries[city.country_id]
+            if local.stock > EPS:
+                sellers.append((city, country, local, min(offer, local.stock)))
         supply = sum(s[3] for s in sellers)
         if supply <= EPS:
             world.world_prices[key] = _blend_world_price(world, key, wp)
             continue
 
         # --- кто и сколько готов ввезти --------------------------------
+        # Ввозная пошлина работает барьером: чужой товар обходится казне в
+        # мировую цену плюс пошлину, и пока дома дешевле этой цифры, ввозить
+        # незачем — свой производитель защищён. Ввоз оплачивает казна, поэтому
+        # с пустой казной на биржу тоже не выйти.
         buyers: list[tuple] = []
-        for city in world.cities.values():
-            country = world.countries.get(city.country_id)
-            local = city.goods.get(key)
-            cap = caps.get(city.id, 0.0)
-            if country is None or not country.alive or local is None or cap <= EPS:
-                continue
-            if local.price > wp * (1.0 + 0.02):    # дома дороже — выгодно ввезти
-                gap = max(0.0, local.last_demand - local.stock)
-                want = min(gap, max(local.last_demand, local.stock) * cap)
-                if want > EPS and country.treasury > want * wp:
-                    buyers.append((city, country, local, want))
+        for city, local, want in raw_buyers:
+            country = world.countries[city.country_id]
+            landed = wp * (1.0 + duty_in[city.id])
+            if local.price <= landed:
+                continue                # свой товар дешевле привозного
+            want = min(want, max(0.0, country.treasury) / max(landed, EPS))
+            if want > EPS:
+                buyers.append((city, country, local, want))
         demand = sum(b[3] for b in buyers)
         traded = min(supply, demand)
         if traded <= EPS:
@@ -1047,32 +1668,37 @@ def world_market_step(world: World) -> None:
             continue
 
         # --- сделка: товар в одну сторону, деньги в другую --------------
-        exports, imports = [], []
+        sold_rows, bought_rows = [], []
         for city, country, local, offer in sellers:
             qty = traded * offer / supply
-            shipped = _ship_out(world, city, key, qty, seller_gets)
+            rate = duty[city.id]
+            shipped = _ship_out(world, city, key, qty, wp * (1.0 - rate), exports)
             if shipped > EPS:
-                country.treasury += shipped * wp * tariff   # вывозная пошлина
+                country.collect("export_duty", shipped * wp * rate)
                 local.stock = max(0.0, local.stock - shipped)
-                exports.append({"country_id": country.id, "name": country.name,
-                                "region_id": city.id, "region": city.name,
-                                "qty": round(shipped, 1),
-                                "local_price": round(local.price, 2),
-                                "duty": round(shipped * wp * tariff, 2)})
+                sold_rows.append({"country_id": country.id, "name": country.name,
+                                  "region_id": city.id, "region": city.name,
+                                  "qty": round(shipped, 1),
+                                  "local_price": round(local.price, 2),
+                                  "tariff": round(rate, 3),
+                                  "duty": round(shipped * wp * rate, 2)})
 
         for city, country, local, want in buyers:
             qty = traded * want / demand
+            # Казна платит за товар мировую цену, а ввозную пошлину берёт сама
+            # с себя же — на кассе это не сказывается, зато порог ввоза выше.
             cost = qty * wp
             if qty <= EPS or country.treasury < cost:
                 continue
-            country.treasury -= cost
+            country.spend("imports", cost)
             _ship_in(world, country, city, key, qty)
             local.stock += qty
-            imports.append({"country_id": country.id, "name": country.name,
-                            "region_id": city.id, "region": city.name,
-                            "qty": round(qty, 1),
-                            "local_price": round(local.price, 2),
-                            "paid": round(cost, 2)})
+            bought_rows.append({"country_id": country.id, "name": country.name,
+                                "region_id": city.id, "region": city.name,
+                                "qty": round(qty, 1),
+                                "local_price": round(local.price, 2),
+                                "tariff": round(duty_in[city.id], 3),
+                                "paid": round(cost, 2)})
 
         # Мировая цена идёт за дисбалансом: избыток предложения её опускает,
         # избыток спроса поднимает.
@@ -1085,8 +1711,8 @@ def world_market_step(world: World) -> None:
             "world_price": round(world.world_prices[key], 2),
             "offered": round(supply, 1),
             "wanted": round(demand, 1),
-            "exports": exports,
-            "imports": imports,
+            "exports": sold_rows,
+            "imports": bought_rows,
         }
 
 
@@ -1132,7 +1758,7 @@ def _stock_holders(world: World, city, key: str) -> list:
 
 
 def _ship_out(world: World, city, key: str, qty: float,
-              unit_revenue: float) -> float:
+              unit_revenue: float, exports: dict | None = None) -> float:
     """Вывезти товар из области: снять со складов владельцев и заплатить им.
 
     Именно со складов, а не с агрегата city.goods[key].stock. Агрегат —
@@ -1140,6 +1766,9 @@ def _ship_out(world: World, city, key: str, qty: float,
     поэтому «списанный» из него товар возвращался бы на место, а деньги за
     него оставались бы у продавца. Так из воздуха печатались бы деньги при
     каждой сделке.
+
+    Продажу игрока записываем в `exports`: для завода вывоз — такая же
+    выручка, как продажа с прилавка, и settle_profits обязан её увидеть.
     """
     holders = _stock_holders(world, city, key)
     total = sum(h[2] for h in holders)
@@ -1158,6 +1787,10 @@ def _ship_out(world: World, city, key: str, qty: float,
         owner.cash += payout
         if hasattr(owner, "income"):        # сословие — доход учитывается
             owner.income += payout
+        elif exports is not None:           # игрок или казна — выручка цеха
+            rec = exports.setdefault((city.id, owner.id, key), [0.0, 0.0])
+            rec[0] += payout
+            rec[1] += part
     return shipped
 
 
@@ -1176,10 +1809,15 @@ def _ship_in(world: World, country: Country, city, key: str, qty: float) -> None
 # ---------------------------------------------------------------------------
 # Война
 # ---------------------------------------------------------------------------
-def declare_war(world: World, attacker_id: int, defender_id: int) -> War:
-    """Объявить войну соседу. Союзники обеих сторон втягиваются немедленно."""
+def declare_war(world: World, attacker_id: int, defender_id: int,
+                kind: str = "war") -> War:
+    """Объявить войну соседу. Союзники обеих сторон втягиваются немедленно.
+
+    `kind="revolt"` — не война государств, а восстание отколовшейся области.
+    Мира в такой войне не бывает: её либо подавляют, либо проигрывают.
+    """
     war = War(id=world.next_war_id, attackers=[attacker_id],
-              defenders=[defender_id], started_tick=world.tick)
+              defenders=[defender_id], started_tick=world.tick, kind=kind)
     world.next_war_id += 1
 
     # Союзники идут за своим — но только те, кто не связан с обеими сторонами
@@ -1375,7 +2013,7 @@ def _ravage(world: World, city, intensity: float, r) -> dict:
     country = world.countries.get(city.country_id)
     if country is not None:
         damage = max(0.0, country.treasury) * config.WAR_TREASURY_DAMAGE * intensity
-        country.treasury -= damage
+        country.spend("losses", damage)
         out["treasury"] = damage
     return out
 
@@ -1462,8 +2100,8 @@ def _transfer_region(world: World, city, loser: Country, winner: Country) -> Non
 def _dissolve_country(world: World, loser: Country, winner: Country) -> None:
     """Государство без областей исчезает: всё его имущество отходит победителю."""
     loser.alive = False
-    winner.treasury += max(0.0, loser.treasury)
-    loser.treasury = 0.0
+    winner.collect("spoils", max(0.0, loser.treasury))
+    loser.spend("losses", loser.treasury)
     loser.election.phase = "none"
     loser.election.votes = {}
     if loser.leader_id is not None:
@@ -1607,7 +2245,9 @@ def step_diplomacy(world: World) -> list[str]:
 
         if offer.kind == "peace":
             war = world.wars.get(offer.war_id or -1)
-            if war is None or war.ended:
+            if war is None or war.ended or war.kind == "revolt":
+                # С мятежниками не договариваются: восстание либо подавляют,
+                # либо проигрывают. Предложение просто снимается со стола.
                 world.offers.pop(offer.id, None)
                 continue
             # проигрывает ли AI: копится ли у противника оккупация его областей
@@ -1763,9 +2403,16 @@ def run_tick(world: World) -> dict:
             continue        # государство исчезло с карты — экономики у него нет
         country_results[country.id] = run_country(world, country)
 
-    # обозы развозят товар внутри страны, потом мировой рынок связывает страны
-    domestic_trade_step(world)
-    world_market_step(world)
+    # обозы развозят товар внутри страны, потом мировой рынок связывает страны.
+    # Что ушло на сторону — записываем: для завода это тоже продажа.
+    exports: dict[tuple[int, int, str], list[float]] = {}
+    domestic_trade_step(world, exports)
+    world_market_step(world, exports)
+
+    # Итоги предприятий — только теперь, когда известны ВСЕ продажи пейдея:
+    # и с прилавка, и обозом, и через биржу. Здесь же налог на прибыль и
+    # объявление банкротств.
+    settled = settle_profits(world, country_results, exports)
 
     # пересчёт локальных цен (после мирового рынка — он меняет склады)
     for country in world.countries.values():
@@ -1774,13 +2421,16 @@ def run_tick(world: World) -> dict:
 
     # войны и дипломатия
     news = (step_wars(world) + step_diplomacy(world)
-            + step_annexations(world) + step_unrest(world))
-    for r in country_results.values():
-        news += r.get("bankruptcies", [])
+            + step_annexations(world) + step_unrest(world) + settled)
 
     # вотум недоверия может назначить внеочередные выборы — до обычных
     news += step_confidence(world)
     step_elections(world)
+
+    # Роспись казны замирает: всё, что случилось за пейдей и между пейдеями,
+    # уходит в отчёт, и начинается новая копилка.
+    for country in world.countries.values():
+        country.close_budget()
 
     # --- агрегированные макропоказатели всего мира ------------------------
     pop = world.population()
