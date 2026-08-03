@@ -13,9 +13,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
-SCHEMA_VERSION = 4   # 1 = одно государство, 2 = множество государств,
+SCHEMA_VERSION = 5   # 1 = одно государство, 2 = множество государств,
 #                      3 = склады по странам, армия, война и дипломатия,
-#                      4 = рынок у каждой области, карта по областям
+#                      4 = рынок у каждой области, карта по областям,
+#                      5 = мир крупнее: население умножено на START_POP_MULT
 
 
 #: Рынок страны из снимка версии 3, отложенный до миграции в области.
@@ -224,6 +225,15 @@ class Player:
     # Все предприятия стоят, пока владелец не выберется или не получит субсидию.
     bankrupt: bool = False
     bankrupt_since: int = 0          # с какого пейдея
+    # ---- администрирование ----
+    # Доступ в админку. Первого администратора выдаёт не игра, а запуск сервера
+    # (config.ADMIN_USERS), дальше права раздаёт сам администратор.
+    is_admin: bool = False
+    # Немота в чате. Два поля, а не одно, потому что это два разных наказания:
+    # временное истекает само, вечное снимает только администратор.
+    mute_until: float = 0.0          # unix-время, до которого молчит
+    mute_forever: bool = False
+    mute_reason: str = ""
     # Склады игрока по ОБЛАСТЯМ: {city_id: {good_key: qty}}.
     #
     # Раздельно по областям — потому что рынок живёт в области. Завод выпускает
@@ -253,6 +263,10 @@ class Player:
             for k, q in store.items():
                 total[k] = total.get(k, 0.0) + q
         return total
+
+    def muted(self, now: float) -> bool:
+        """Молчит ли игрок в чате прямо сейчас."""
+        return self.mute_forever or now < self.mute_until
 
 
 @dataclass
@@ -478,6 +492,9 @@ class World:
     tick: int = 0
     last_tick_at: float = 0.0     # unix-время последнего пейдея
     tick_seconds: int = 900
+    # Идут ли пейдеи сами. Хранится в мире, а не только в настройках сервера:
+    # администратор останавливает и запускает время прямо из игры.
+    auto_tick: bool = True
     next_building_id: int = 1
     next_player_id: int = 1
     next_city_id: int = 1
@@ -535,6 +552,7 @@ class World:
             "tick": self.tick,
             "last_tick_at": self.last_tick_at,
             "tick_seconds": self.tick_seconds,
+            "auto_tick": self.auto_tick,
             "next_building_id": self.next_building_id,
             "next_player_id": self.next_player_id,
             "next_city_id": self.next_city_id,
@@ -607,6 +625,7 @@ class World:
             tick=d.get("tick", 0),
             last_tick_at=d.get("last_tick_at", 0.0),
             tick_seconds=d.get("tick_seconds", 900),
+            auto_tick=bool(d.get("auto_tick", True)),
             next_building_id=d.get("next_building_id", 1),
             next_player_id=d.get("next_player_id", 1),
             next_city_id=d.get("next_city_id", 1),

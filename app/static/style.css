@@ -332,6 +332,83 @@ tr.clickable { cursor: pointer; }
 .regions .rg.on.riot { background: #f85149; color: #fff; }
 
 /* ====================================================================
+   ЧАТ
+   ==================================================================== */
+/* Свёрнутый чат — кружок в углу, развёрнутый — окно над ним. Оба состояния
+   живут в одном контейнере: так окно и кнопка не разъезжаются при смене
+   ширины экрана, а на телефоне окно просто растягивается на всю полосу. */
+#chat {
+    position: fixed; right: 18px; bottom: 18px; z-index: 60;
+    display: flex; justify-content: flex-end;
+    /* На телефоне контейнер растянут во всю полосу, и его пустая часть
+       перехватывала бы нажатия по странице под собой. Ловят их только сам
+       кружок и окно. */
+    pointer-events: none;
+}
+#chatFab, #chat .panel { pointer-events: auto; }
+#chatFab {
+    position: relative; width: 52px; height: 52px; padding: 0;
+    border-radius: 50%; font-size: 22px; line-height: 1;
+    background: var(--accent); border-color: var(--accent);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .45);
+}
+#chatFab:hover:not(:disabled) { background: #6aaeff; border-color: #6aaeff; }
+#chat.hidden .panel { display: none; }
+#chat:not(.hidden) #chatFab { display: none; }
+
+#chat .panel {
+    width: 340px; height: 470px; max-height: calc(100vh - 40px);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: 0 10px 34px rgba(0, 0, 0, .55);
+}
+.chead {
+    display: flex; align-items: center; gap: 4px;
+    padding: 6px 6px 6px 8px; border-bottom: 1px solid var(--line);
+}
+.ctabs { display: flex; gap: 2px; flex: 1; min-width: 0; }
+.ctabs button {
+    border: none; background: none; border-radius: 6px;
+    color: var(--muted); padding: 6px 8px; font-size: 12px;
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.ctabs button.on { color: var(--text); background: var(--panel-2); }
+.chead .x { border: none; background: none; color: var(--dim); padding: 4px 8px; }
+
+/* Счётчик непрочитанного: и на кружке, и на каждой вкладке */
+#chat .badge {
+    font-style: normal; font-size: 10px; font-variant-numeric: tabular-nums;
+    background: var(--bad); color: #fff; border-radius: 10px;
+    min-width: 16px; height: 16px; line-height: 16px; padding: 0 4px;
+    text-align: center;
+}
+#chatFab .badge { position: absolute; top: -3px; right: -3px; }
+
+.cpeer { padding: 8px; border-bottom: 1px solid var(--line); }
+.cpeer select { font-size: 12px; padding: 5px 8px; }
+
+.clog {
+    flex: 1; overflow-y: auto; padding: 10px;
+    display: flex; flex-direction: column; gap: 9px;
+}
+.msg { font-size: 13px; }
+.msg .who { display: flex; align-items: baseline; gap: 6px; font-size: 11px; }
+.msg .who b { color: var(--accent); font-weight: 600; }
+.msg.mine .who b { color: var(--good); }
+.msg .who .t { color: var(--dim); font-size: 10px; margin-left: auto; }
+.msg .who .del { border: none; background: none; color: var(--dim);
+    font-size: 11px; padding: 0 2px; }
+.msg .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg .to { color: var(--gold); }
+
+.csay { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
+.csay input { font-size: 13px; padding: 7px 9px; }
+.csay button { padding: 6px 13px; flex: 0 0 auto; }
+.cnote { font-size: 11px; color: var(--dim); padding: 0 10px 8px; }
+.cnote.bad { color: var(--bad); }
+
+/* ====================================================================
    ПЛАНШЕТ
    ==================================================================== */
 @media (max-width: 900px) {
@@ -473,4 +550,19 @@ tr.clickable { cursor: pointer; }
     #tTop th:nth-child(6), #tTop td:nth-child(6),
     #tTop th:nth-child(7), #tTop td:nth-child(7),
     #tTop th:nth-child(8), #tTop td:nth-child(8) { display: none; }
+
+    /* Админка, игроки: имя, состояние, чат, кнопки */
+    #tAdmPlayers th:nth-child(2), #tAdmPlayers td:nth-child(2),
+    #tAdmPlayers th:nth-child(3), #tAdmPlayers td:nth-child(3),
+    #tAdmPlayers th:nth-child(4), #tAdmPlayers td:nth-child(4),
+    #tAdmPlayers th:nth-child(5), #tAdmPlayers td:nth-child(5) { display: none; }
+
+    /* Админка, государства: страна, казна, лидер, кнопки */
+    #tAdmCountries th:nth-child(2), #tAdmCountries td:nth-child(2),
+    #tAdmCountries th:nth-child(3), #tAdmCountries td:nth-child(3),
+    #tAdmCountries th:nth-child(5), #tAdmCountries td:nth-child(5) { display: none; }
+
+    /* Чат занимает всю полосу и садится над нижним меню */
+    #chat { right: 10px; left: 10px; bottom: calc(var(--nav-h) + 10px); }
+    #chat .panel { width: auto; flex: 1; height: 62vh; }
 }

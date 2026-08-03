@@ -57,7 +57,6 @@
             </svg>
             <div class="lbl" id="ringLbl">—</div>
         </div>
-        <button class="sm" onclick="forceTick()" title="Провести пейдей немедленно">Пейдей</button>
         <button class="sm" onclick="logout()">Выйти</button>
     </div>
 </header>
@@ -75,6 +74,8 @@
     <button data-page="war">Война</button>
     <button data-page="map">Карта</button>
     <button data-page="top">Рейтинг</button>
+    <!-- Появляется только у администратора: app.js снимает hidden по /api/me -->
+    <button data-page="admin" id="navAdmin" hidden>Админка</button>
     <button id="navMore" class="more" onclick="toggleNavSheet()">Ещё</button>
 </nav>
 </div>
@@ -752,7 +753,130 @@
             </table></div>
         </details>
     </section>
+
+    <!-- ---------- админка ---------- -->
+    <section class="page" id="page-admin">
+        <details class="card" data-sec="adm-time" data-main>
+            <summary>Ход времени</summary>
+            <details class="help">
+                <summary>кто двигает пейдеи</summary>
+                <p class="muted">
+                    Пейдей идёт сам, пока включён <b>автопейдей</b>. Здесь его можно
+                    остановить, ускорить или прокрутить вручную — сразу несколько
+                    пейдеев подряд. История для графиков пишется по каждому, поэтому
+                    после прокрутки графики не рвутся.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Пейдей</span><span class="v num" id="admTick">—</span></div>
+                <div class="stat"><span class="k">Автопейдей</span><span class="v" id="admAuto">—</span></div>
+                <div class="stat"><span class="k">Длина пейдея</span><span class="v num" id="admLen">—</span></div>
+                <div class="stat"><span class="k">До следующего</span><span class="v num" id="admLeft">—</span></div>
+            </div>
+            <div class="grid fields">
+                <div><label class="muted" style="font-size:12px">Длина пейдея, сек</label>
+                     <input id="admSeconds" type="number" min="1" step="1"></div>
+                <div><label class="muted" style="font-size:12px">Прокрутить пейдеев (1–50)</label>
+                     <input id="admCount" type="number" min="1" max="50" step="1" value="1"></div>
+            </div>
+            <div class="acts" style="margin-top:16px">
+                <button class="primary" onclick="admRunTicks()">Провести пейдеи</button>
+                <button onclick="admSaveTime()">Сохранить длину пейдея</button>
+                <button id="admAutoBtn" onclick="admToggleAuto()">Автопейдей</button>
+            </div>
+        </details>
+
+        <details class="card" data-sec="adm-players">
+            <summary>Игроки</summary>
+            <details class="help">
+                <summary>что здесь можно</summary>
+                <p class="muted">
+                    <b>Немота</b> закрывает игроку все три канала чата: на срок или
+                    навсегда. Временная истекает сама, вечную снимаете только вы.
+                    Деньги выдаются и списываются той же кнопкой — отрицательная сумма
+                    списывает. <b>Банкротство</b> снимается вместе с замками на цехах:
+                    предприятия открываются и запускаются заново.
+                </p>
+            </details>
+            <div class="acts" style="margin-bottom:14px">
+                <label class="wagefield"><span>Немота, мин</span>
+                    <input type="number" id="admMuteMin" min="1" step="5" value="15"></label>
+                <label class="wagefield" style="flex:1;min-width:220px"><span>Причина</span>
+                    <input type="text" id="admMuteReason" placeholder="за что"></label>
+                <label class="wagefield"><span>Сумма, ₡</span>
+                    <input type="number" id="admAmount" step="100000" value="1000000"></label>
+            </div>
+            <div class="tw"><table id="tAdmPlayers">
+                <thead><tr><th>Игрок</th><th>Государство</th><th class="right">Касса</th>
+                    <th class="right">Капитал</th><th class="right">Предпр.</th>
+                    <th>Состояние</th><th>Чат</th><th></th></tr></thead>
+                <tbody id="admPlayerRows"></tbody>
+            </table></div>
+        </details>
+
+        <details class="card" data-sec="adm-countries">
+            <summary>Государства</summary>
+            <details class="help">
+                <summary>казна и власть</summary>
+                <p class="muted">
+                    Казна меняется через роспись бюджета: прибавка идёт статьёй
+                    «военная добыча», убыль — «потери», поэтому отчёт лидера
+                    по-прежнему сходится до червонца. Лидера можно поставить любого
+                    гражданина этой страны или вернуть её под управление AI.
+                </p>
+            </details>
+            <div class="acts" style="margin-bottom:14px">
+                <label class="wagefield"><span>Сумма в казну, ₡</span>
+                    <input type="number" id="admTreasuryAmount" step="1000000" value="10000000"></label>
+                <span class="muted" style="font-size:12px">Отрицательная сумма изымает.</span>
+            </div>
+            <div class="tw"><table id="tAdmCountries">
+                <thead><tr><th>Государство</th><th class="right">Население</th>
+                    <th class="right">Обл.</th><th class="right">Казна</th>
+                    <th class="right">ВВП</th><th>Лидер</th><th></th></tr></thead>
+                <tbody id="admCountryRows"></tbody>
+            </table></div>
+        </details>
+
+        <details class="card" data-sec="adm-chat">
+            <summary>Чат</summary>
+            <p class="muted" style="font-size:13px;margin-bottom:14px">
+                Очистка стирает канал целиком и безвозвратно. Отдельные сообщения
+                удаляются крестиком прямо в окне чата.</p>
+            <div class="acts">
+                <button class="danger" onclick="admClearChat('world')">Очистить мировой чат</button>
+                <button class="danger" onclick="admClearChat('country')">Очистить чат моего государства</button>
+                <button class="danger" onclick="admClearChat('private')">Стереть все личные сообщения</button>
+            </div>
+        </details>
+    </section>
 </main>
+
+<!-- ---------- чат: свёрнут в кружок, разворачивается по нажатию ---------- -->
+<div id="chat" class="hidden">
+    <button id="chatFab" onclick="toggleChat()" title="Чат">
+        <span>💬</span><i class="badge" id="chatBadge" hidden></i>
+    </button>
+    <div class="panel">
+        <div class="chead">
+            <div class="ctabs">
+                <button class="on" data-ch="world" onclick="pickChat('world')">Мир<i class="badge" data-badge="world" hidden></i></button>
+                <button data-ch="country" onclick="pickChat('country')">Государство<i class="badge" data-badge="country" hidden></i></button>
+                <button data-ch="private" onclick="pickChat('private')">Личные<i class="badge" data-badge="private" hidden></i></button>
+            </div>
+            <button class="x" onclick="toggleChat()" title="Свернуть">✕</button>
+        </div>
+        <div class="cpeer" id="chatPeerBox" hidden>
+            <select id="chatPeer" onchange="pickPeer(this.value)"></select>
+        </div>
+        <div class="clog" id="chatLog"></div>
+        <div class="csay">
+            <input id="chatInput" maxlength="500" placeholder="Написать…" autocomplete="off">
+            <button class="primary" onclick="sendChat()" title="Отправить">▶</button>
+        </div>
+        <div class="cnote" id="chatNote"></div>
+    </div>
+</div>
 </div>
 
 <div id="toast"></div>

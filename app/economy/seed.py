@@ -233,6 +233,7 @@ def build_world() -> World:
     random.seed(1337)   # детерминированный старт для воспроизводимости тестов
     w = World()
     w.tick_seconds = config.TICK_SECONDS
+    w.auto_tick = config.AUTO_TICK
 
     # --- глобальные чертежи товаров ---
     for key, name, cat, tier, anchor, storable, perish in GOODS:
@@ -244,15 +245,20 @@ def build_world() -> World:
     # --- 20 государств, в каждом по две области ---
     crafts = _artisan_crafts(w)
     country_regions: dict[int, list[int]] = {}
-    for idx, (cname, capital_name, pop, x, y, neighbors, color) in enumerate(STATES):
+    for idx, (cname, capital_name, base_pop, x, y, neighbors, color) in enumerate(STATES):
         cid = w.next_country_id
         w.next_country_id += 1
+        # Таблица STATES задаёт относительный размер государств, общий масштаб
+        # мира — config.START_POP_MULT. Крупность страны («большая» или «малая»)
+        # при этом меряется по исходному числу: иначе после умножения все
+        # двадцать разом стали бы большими и потеряли разницу в укладе.
+        pop = base_pop * config.START_POP_MULT
 
         region_ids = []
         for r, (pop_share, dx, dy) in enumerate(REGION_OFFSETS):
             name = capital_name if r == 0 else PROVINCES[idx]
             city = City(id=w.next_city_id, name=name, country_id=cid,
-                        workforce_share=0.58 if pop < 1_000_000 else 0.54)
+                        workforce_share=0.58 if base_pop < 1_000_000 else 0.54)
             w.next_city_id += 1
 
             for key, share in START_SHARES.items():
@@ -559,10 +565,50 @@ def migrate_world(world: World) -> list[str]:
             if st.living_standard <= 0.0:
                 st.living_standard = 1.0
 
+    # --- версия 4 -> 5: мир стал крупнее -----------------------------------
+    # Стартовое население выросло в START_POP_MULT раз. Уже идущую партию
+    # оставлять с прежним числом душ нельзя: она так и осталась бы вдвое-втрое
+    # мельче нового мира, и весь баланс спроса считался бы не для неё.
+    #
+    # Растёт всё, что меряется людьми, — сами люди, их сбережения, их товар на
+    # прилавке и содержание армии. Иначе на вдвое большую страну пришлись бы
+    # прежние деньги и прежний хлеб: сословия обеднели бы вдвое за один пейдей,
+    # а недоплаченная армия разбежалась бы по домам.
+    if models._LOADED_VERSION[0] < 5 and config.START_POP_MULT != 1.0:
+        _scale_world(world, config.START_POP_MULT)
+        added.append(f"население мира увеличено в {config.START_POP_MULT:g} раза")
+
     for gkey, good in world.goods.items():
         world.world_prices.setdefault(gkey, good.anchor)
 
     return added
+
+
+def _scale_world(world: World, mult: float) -> None:
+    """Увеличить мир в mult раз по всему, что меряется числом жителей.
+
+    Казна государств и кассы игроков НЕ трогаются: это заработанное, а не
+    производная от числа душ. Налоги вырастут вместе с населением сами.
+    """
+    for city in world.cities.values():
+        for st in city.strata.values():
+            st.people *= mult
+            st.cash *= mult
+            st.income *= mult
+            st.spent *= mult
+            for key in list(st.warehouse):
+                st.warehouse[key] *= mult
+            for key in list(st.consumed):
+                st.consumed[key] *= mult
+        for lg in city.goods.values():
+            lg.stock *= mult
+            lg.last_demand *= mult
+            lg.last_supply *= mult
+            lg.last_sold *= mult
+    for country in world.countries.values():
+        country.army_budget *= mult
+        country.army_shells *= mult
+        country.army_weapons *= mult
 
 
 def _artisan_crafts(world: World) -> dict[str, dict]:

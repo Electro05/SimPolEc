@@ -27,6 +27,13 @@ const S = {
     page: 'market',
     lastTick: -1,
     secondsLeft: 0,
+    // чат: канал, собеседник и последние прочитанные id по каждому каналу
+    chat: null,
+    chatOpen: false,
+    chatCh: 'world',
+    chatPeer: 0,
+    chatSeen: {},
+    admin: null,
 };
 
 /* ------------------------------ утилиты ------------------------------ */
@@ -138,6 +145,7 @@ async function start() {
     $('auth').style.display = 'none';
     $('game').style.display = '';
     await refresh(true);
+    await loadChat();
 }
 
 /* ------------------------------ загрузка ------------------------------ */
@@ -149,6 +157,8 @@ async function refresh(full) {
             api('/api/buildings'),
         ]);
         S.world = world; S.me = me;
+        // Админка появляется в меню только у того, кому она положена.
+        $('navAdmin').hidden = !me.is_admin;
         S.market = market.goods; S.buildings = buildings.buildings;
         S.marketCountryId = market.country_id;
         S.region = market.region_id;          // сервер мог поправить выбор
@@ -189,6 +199,7 @@ async function refresh(full) {
             renderMap(); renderExchange(); renderWar(); renderAnnexations();
         }
         renderHeader(); renderMarket(); renderBiz();
+        if (S.page === 'admin') loadAdmin();
     } catch (e) {
         console.error(e);
     }
@@ -246,6 +257,12 @@ function pickRegion(id) {
 
 function tickClock() {
     if (!S.world) return;
+    // Время остановлено администратором — обратный отсчёт врал бы.
+    if (S.world.auto_tick === false) {
+        $('ringArc').setAttribute('stroke-dashoffset', '0');
+        $('ringLbl').textContent = 'стоп';
+        return;
+    }
     S.secondsLeft = Math.max(0, S.secondsLeft - 1);
     const total = S.world.tick_seconds || 900;
     const frac = 1 - S.secondsLeft / total;
@@ -1623,7 +1640,371 @@ function renderTop() {
     }).catch(() => {});
 }
 
-const forceTick = () => act(async () => { await api('/api/tick', {}); });
+/* ==========================================================================
+   ЧАТ
+   Три канала в одном окне: мир, своё государство и личная переписка. Окно
+   свёрнуто в кружок и живёт поверх всех разделов — переписка не должна
+   заставлять уходить с рынка или из строительства.
+   ========================================================================== */
+const CHAT_SEEN_KEY = 'simpolec.chatseen';
+
+function loadSeen() {
+    try { return JSON.parse(localStorage.getItem(CHAT_SEEN_KEY)) || {}; }
+    catch (e) { return {}; }
+}
+function saveSeen() {
+    try { localStorage.setItem(CHAT_SEEN_KEY, JSON.stringify(S.chatSeen)); }
+    catch (e) {}
+}
+
+const chatTime = ts => new Date(ts * 1000)
+    .toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+/** Ключ «до какого сообщения дочитано». У личных он свой на каждого
+ *  собеседника: непрочитанное от одного не должно гаситься чтением другого. */
+const seenKey = (ch, peer) => ch === 'private' ? 'p' + (peer || 0) : ch;
+
+/** Сообщения открытой вкладки. Личные приходят одним списком — переписку с
+ *  выбранным собеседником выбираем здесь, чтобы не дёргать сервер на каждое
+ *  переключение. */
+function chatMessages() {
+    const c = S.chat;
+    if (!c) return [];
+    if (S.chatCh !== 'private') return c[S.chatCh] || [];
+    if (!S.chatPeer) return [];
+    return (c.private || []).filter(
+        m => m.from_id === S.chatPeer || m.to_id === S.chatPeer);
+}
+
+/** Сколько нового в каждом канале и от каждого собеседника.
+ *  Своё же сообщение непрочитанным не считается. */
+function chatUnread() {
+    const c = S.chat;
+    const out = { world: 0, country: 0, private: 0, peers: {} };
+    if (!c) return out;
+    const fresh = (list, key) => (list || []).filter(
+        m => m.id > (S.chatSeen[key] || 0) && m.from_id !== c.me).length;
+    out.world = fresh(c.world, 'world');
+    out.country = fresh(c.country, 'country');
+    (c.private || []).forEach(m => {
+        if (m.from_id === c.me) return;
+        if (m.id <= (S.chatSeen[seenKey('private', m.from_id)] || 0)) return;
+        out.peers[m.from_id] = (out.peers[m.from_id] || 0) + 1;
+        out.private++;
+    });
+    return out;
+}
+
+/** То, что игрок сейчас видит, считается прочитанным. */
+function markSeen() {
+    if (!S.chatOpen || !S.chat) return;
+    const list = chatMessages();
+    if (!list.length) return;
+    const key = seenKey(S.chatCh, S.chatPeer);
+    const last = list[list.length - 1].id;
+    if (last > (S.chatSeen[key] || 0)) { S.chatSeen[key] = last; saveSeen(); }
+}
+
+function badge(el, n) {
+    if (!el) return;
+    el.hidden = !n;
+    el.textContent = n > 99 ? '99+' : n;
+}
+
+function renderChat() {
+    const c = S.chat;
+    const box = $('chat');
+    if (!c) { box.classList.add('hidden'); return; }
+    box.classList.toggle('hidden', !S.chatOpen);
+
+    // Отмечаем прочитанным ДО подсчёта значков: иначе на открытой вкладке
+    // счётчик мигал бы на каждом опросе.
+    markSeen();
+    const u = chatUnread();
+    badge($('chatBadge'), u.world + u.country + u.private);
+    ['world', 'country', 'private'].forEach(ch => {
+        badge(document.querySelector(`#chat .badge[data-badge="${ch}"]`), u[ch]);
+        const tab = document.querySelector(`#chat .ctabs button[data-ch="${ch}"]`);
+        if (tab) tab.classList.toggle('on', ch === S.chatCh);
+    });
+    if (!S.chatOpen) return;
+
+    // --- список собеседников: видно, от кого пришло новое ---
+    const peerBox = $('chatPeerBox');
+    peerBox.hidden = S.chatCh !== 'private';
+    if (S.chatCh === 'private') {
+        const sel = $('chatPeer');
+        const opts = ['<option value="0">— выберите собеседника —</option>'].concat(
+            (c.contacts || []).map(p => {
+                const n = u.peers[p.id] || 0;
+                return `<option value="${p.id}">${esc(p.username)} — ${esc(p.country)}`
+                    + (p.is_leader ? ' (лидер)' : '') + (n ? ` • ${n}` : '') + '</option>';
+            }));
+        const html = opts.join('');
+        if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
+        sel.value = String(S.chatPeer || 0);
+    }
+
+    // --- лента ---
+    const list = chatMessages();
+    const log = $('chatLog');
+    // Если игрок отмотал ленту вверх, читая старое, — не дёргать его вниз.
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.innerHTML = list.length ? list.map(m => {
+        const mine = m.from_id === c.me;
+        const to = (S.chatCh === 'private' && mine && m.to)
+            ? `<span class="to">→ ${esc(m.to)}</span>` : '';
+        const del = c.is_admin
+            ? `<button class="del" title="Удалить сообщение" onclick="admDeleteMsg(${m.id})">✕</button>` : '';
+        return `<div class="msg${mine ? ' mine' : ''}">
+            <div class="who"><b>${esc(m.from)}</b>${to}${del}<span class="t">${chatTime(m.ts)}</span></div>
+            <div class="body">${esc(m.text)}</div></div>`;
+    }).join('') : `<div class="empty">${S.chatCh === 'private' && !S.chatPeer
+        ? 'Выберите, кому написать' : 'Пока тихо'}</div>`;
+    if (atBottom || S.chatJump) { log.scrollTop = log.scrollHeight; S.chatJump = false; }
+
+    // --- подпись под полем ввода ---
+    const note = $('chatNote'), input = $('chatInput');
+    let text = '', bad = false;
+    if (c.muted) {
+        bad = true;
+        text = c.mute_forever ? 'Вам закрыт доступ к чату'
+            : 'Вы лишены слова до ' + chatTime(c.mute_until);
+        if (c.mute_reason) text += ' — ' + c.mute_reason;
+    } else if (S.chatCh === 'world') {
+        text = 'Слышит весь мир';
+    } else if (S.chatCh === 'country') {
+        text = 'Слышат только граждане: ' + c.country_name;
+    } else {
+        const peer = (c.contacts || []).find(p => p.id === S.chatPeer);
+        text = peer ? 'Личное сообщение: ' + peer.username : 'Собеседник не выбран';
+    }
+    note.textContent = text;
+    note.className = 'cnote' + (bad ? ' bad' : '');
+    input.disabled = c.muted || (S.chatCh === 'private' && !S.chatPeer);
+}
+
+async function loadChat() {
+    if (!S.token) return;
+    try {
+        S.chat = await api('/api/chat');
+        renderChat();
+    } catch (e) {
+        // Чат — дело десятое: молчащий сервер не должен ронять игру.
+        console.error(e);
+    }
+}
+
+function toggleChat() {
+    S.chatOpen = !S.chatOpen;
+    S.chatJump = true;
+    // Первый опрос мог не дойти — иначе кружок нажимался бы вхолостую.
+    if (S.chatOpen && !S.chat) { loadChat(); return; }
+    renderChat();
+    if (S.chatOpen) $('chatInput').focus();
+}
+
+function pickChat(ch) {
+    S.chatCh = ch;
+    S.chatJump = true;
+    renderChat();
+}
+
+function pickPeer(id) {
+    S.chatPeer = Number(id) || 0;
+    S.chatJump = true;
+    renderChat();
+}
+
+async function sendChat() {
+    const el = $('chatInput');
+    const text = el.value.trim();
+    if (!text) return;
+    if (S.chatCh === 'private' && !S.chatPeer) {
+        toast('Выберите собеседника', true);
+        return;
+    }
+    el.value = '';
+    try {
+        await api('/api/chat/send',
+                  { channel: S.chatCh, text, to_id: S.chatPeer });
+        S.chatJump = true;
+        await loadChat();
+    } catch (e) {
+        el.value = text;      // написанное не теряем
+        toast(e.message, true);
+    }
+}
+
+/* ==========================================================================
+   АДМИНКА
+   ========================================================================== */
+async function loadAdmin() {
+    if (!S.me || !S.me.is_admin) return;
+    try {
+        S.admin = await api('/api/admin/state');
+        renderAdmin();
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+/** Общая обёртка админских действий: подтянуть админку и обновить всю игру —
+ *  правки админа меняют мир, а не только эту страницу. */
+async function admAct(fn) {
+    try {
+        await fn();
+        await loadAdmin();
+        await refresh(true);
+    } catch (e) {
+        toast(e.message, true);
+    }
+}
+
+const admNum = (id, fallback) => {
+    const v = Number($(id).value);
+    return isFinite(v) ? v : fallback;
+};
+
+function muteLabel(p, now) {
+    if (p.mute_forever) return '<span class="bad">навсегда</span>';
+    if (p.mute_until > now) {
+        return `<span class="warn">до ${chatTime(p.mute_until)}</span>`;
+    }
+    return '<span class="dim">говорит</span>';
+}
+
+function renderAdmin() {
+    const a = S.admin;
+    if (!a) return;
+    $('admTick').textContent = '#' + a.tick;
+    $('admAuto').textContent = a.auto_tick ? 'идёт' : 'остановлен';
+    $('admAuto').className = 'v ' + (a.auto_tick ? 'good' : 'warn');
+    $('admLen').textContent = a.tick_seconds + ' с';
+    $('admLeft').textContent = a.auto_tick ? a.seconds_left + ' с' : '—';
+    $('admAutoBtn').textContent = a.auto_tick ? 'Остановить время' : 'Запустить время';
+    if (document.activeElement !== $('admSeconds')) $('admSeconds').value = a.tick_seconds;
+
+    // --- игроки ---
+    const humans = a.players.filter(p => !p.is_state);
+    $('admPlayerRows').innerHTML = humans.length ? humans.map(p => {
+        const tags = (p.is_admin ? ' <span class="tag">админ</span>' : '')
+                   + (p.is_leader ? ' <span class="tag">лидер</span>' : '');
+        return `<tr>
+            <td>${esc(p.username)}${tags}</td>
+            <td>${esc(p.country)}</td>
+            <td class="right">${money(p.cash)} ₡</td>
+            <td class="right">${money(p.net_worth)} ₡</td>
+            <td class="right">${p.buildings}</td>
+            <td>${p.bankrupt ? '<span class="bad">банкрот</span>'
+                             : '<span class="good">в деле</span>'}</td>
+            <td>${muteLabel(p, a.now)}</td>
+            <td><div class="acts">
+                <button class="sm" onclick="admMute(${p.id},false)">Немота</button>
+                <button class="sm danger" onclick="admMute(${p.id},true)">Навсегда</button>
+                <button class="sm" onclick="admUnmute(${p.id})">Снять</button>
+                <button class="sm" onclick="admCash(${p.id})">Деньги</button>
+                <button class="sm" onclick="admBankrupt(${p.id},${!p.bankrupt})">${
+                    p.bankrupt ? 'Вернуть в дело' : 'В банкроты'}</button>
+                <button class="sm" onclick="admGrant(${p.id},${!p.admin_flag})">${
+                    p.admin_flag ? 'Снять админа' : 'В админы'}</button>
+            </div></td></tr>`;
+    }).join('') : '<tr><td colspan="8" class="empty">Живых игроков ещё нет</td></tr>';
+
+    // --- государства ---
+    $('admCountryRows').innerHTML = a.countries.map(c => {
+        const citizens = humans.filter(p => p.country_id === c.id);
+        const opts = ['<option value="0">AI (без лидера)</option>'].concat(
+            citizens.map(p => `<option value="${p.id}"${
+                p.id === c.leader_id ? ' selected' : ''}>${esc(p.username)}</option>`));
+        return `<tr${c.alive ? '' : ' class="dim"'}>
+            <td><i class="dot-c" style="background:${esc(c.color)}"></i>${esc(c.name)}${
+                c.at_war ? ' <span class="tag military">война</span>' : ''}</td>
+            <td class="right">${qty(c.population)}</td>
+            <td class="right">${c.regions}</td>
+            <td class="right">${money(c.treasury)} ₡</td>
+            <td class="right">${money(c.gdp)} ₡</td>
+            <td><select onchange="admLeader(${c.id},this.value)">${opts.join('')}</select></td>
+            <td><div class="acts">
+                <button class="sm" onclick="admTreasury(${c.id})">Внести в казну</button>
+            </div></td></tr>`;
+    }).join('');
+}
+
+const admRunTicks = () => admAct(async () => {
+    const count = Math.max(1, Math.min(50, Math.round(admNum('admCount', 1))));
+    const r = await api('/api/admin/tick', { count });
+    toast('Проведено пейдеев: ' + r.ticks + ' (сейчас #' + r.tick + ')');
+});
+
+const admSaveTime = () => admAct(async () => {
+    await api('/api/admin/time', { tick_seconds: Math.round(admNum('admSeconds', 900)) });
+    toast('Длина пейдея изменена');
+});
+
+const admToggleAuto = () => admAct(async () => {
+    const r = await api('/api/admin/time', { auto_tick: !S.admin.auto_tick });
+    toast(r.auto_tick ? 'Время идёт' : 'Время остановлено');
+});
+
+const admMute = (id, forever) => admAct(async () => {
+    await api('/api/admin/mute', {
+        player_id: id, forever,
+        minutes: Math.max(1, admNum('admMuteMin', 15)),
+        reason: $('admMuteReason').value,
+    });
+    toast(forever ? 'Игрок лишён слова навсегда' : 'Игрок лишён слова');
+});
+
+const admUnmute = id => admAct(async () => {
+    await api('/api/admin/unmute', { player_id: id });
+    toast('Слово возвращено');
+});
+
+const admCash = id => admAct(async () => {
+    const amount = admNum('admAmount', 0);
+    if (!amount) throw new Error('Укажите сумму');
+    const r = await api('/api/admin/cash', { player_id: id, amount });
+    toast('Касса игрока: ' + money(r.cash) + ' ₡');
+});
+
+const admTreasury = id => admAct(async () => {
+    const amount = admNum('admTreasuryAmount', 0);
+    if (!amount) throw new Error('Укажите сумму');
+    const r = await api('/api/admin/treasury', { country_id: id, amount });
+    toast('Казна: ' + money(r.treasury) + ' ₡');
+});
+
+const admBankrupt = (id, value) => admAct(async () => {
+    await api('/api/admin/bankrupt', { player_id: id, value });
+    toast(value ? 'Дело объявлено банкротом' : 'Дело возвращено в строй');
+});
+
+const admGrant = (id, value) => admAct(async () => {
+    await api('/api/admin/grant', { player_id: id, value });
+    toast(value ? 'Права выданы' : 'Права сняты');
+});
+
+const admLeader = (countryId, playerId) => admAct(async () => {
+    const r = await api('/api/admin/leader',
+                        { country_id: countryId, player_id: Number(playerId) || 0 });
+    toast(r.leader ? 'Новый лидер: ' + r.leader : 'Страна возвращена под AI');
+});
+
+const admDeleteMsg = id => admAct(async () => {
+    await api('/api/admin/chat/delete', { id });
+    await loadChat();
+});
+
+const admClearChat = channel => admAct(async () => {
+    const what = { world: 'мировой чат', country: 'чат вашего государства',
+                   private: 'все личные сообщения' }[channel];
+    if (!confirm('Стереть ' + what + '? Это необратимо.')) return;
+    const r = await api('/api/admin/chat/clear',
+                        { channel, country_id: S.me.country_id });
+    toast('Удалено сообщений: ' + r.removed);
+    await loadChat();
+});
 
 /* ------------------------------ навигация ------------------------------ */
 /** Узкий экран. Один порог на весь клиент — тот же, что в style.css. */
@@ -1653,6 +2034,7 @@ function goPage(page) {
     if (page === 'gov') renderGov();
     if (page === 'exchange') renderExchange();
     if (page === 'war') { renderWar(); renderAnnexations(); }
+    if (page === 'admin') loadAdmin();
     // Страница только что показалась — до этого её svg были нулевой ширины.
     redrawCharts();
 }
@@ -1667,7 +2049,7 @@ function toggleNavSheet() {
     if (sheet.classList.contains('open')) return closeNavSheet();
     // Лист собираем из самого меню, чтобы список разделов жил в одном месте.
     $('navSheetBody').innerHTML = [...document.querySelectorAll('nav button[data-page]')]
-        .filter(b => !b.dataset.pin)
+        .filter(b => !b.dataset.pin && !b.hidden)
         .map(b => `<button class="${b.dataset.page === S.page ? 'on' : ''}"
             onclick="goPage('${b.dataset.page}')">${esc(b.textContent.trim())}</button>`)
         .join('');
@@ -1734,19 +2116,31 @@ window.addEventListener('resize', () => {
 
 // Обработчики висят в разметке на onclick, поэтому кладём их в window явно.
 Object.assign(window, {
-    doAuth, logout, showAuth, pickGood, forceTick, savePolicy, pickMapNode, pickRegion,
+    doAuth, logout, showAuth, pickGood, savePolicy, pickMapNode, pickRegion,
     voteFor, setWage, setWageAll, upgrade, toggleBiz, demolish, buildBiz, repairBiz,
     pickXGood, saveArmy, mobilize, demobilize, declareWar, offerPeace,
     offerAlliance, acceptOffer, declineOffer, breakAlliance,
     voteConfidence, giveSubsidy, decideAnnex, endBankruptcy,
     pickSector, renderBuild,
     goPage, toggleNavSheet, closeNavSheet,
+    toggleChat, pickChat, pickPeer, sendChat,
+    admRunTicks, admSaveTime, admToggleAuto, admMute, admUnmute, admCash,
+    admTreasury, admBankrupt, admGrant, admLeader, admDeleteMsg, admClearChat,
 });
 
 applySections();
+S.chatSeen = loadSeen();
+
+// Enter отправляет реплику — в чате это привычнее кнопки.
+$('chatInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
 
 setInterval(tickClock, 1000);
 setInterval(() => { if (S.token) refresh(false); }, 5000);
+// Чат опрашивается отдельно от игры: он должен обновляться живо, а тянуть
+// ради этого все двенадцать витрин мира незачем.
+setInterval(() => { if (S.token) loadChat(); }, 5000);
 // Список государств готовим всегда, ещё до проверки токена: если токен
 // окажется негодным, форма входа появится уже с заполненным списком.
 loadCountriesForRegister();

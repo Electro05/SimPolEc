@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import config, db
-from .api import ROUTES, ApiError, Ctx, force_tick
+from .api import ROUTES, ApiError, Ctx, persist_tick
 from .economy.engine import run_tick
 from .economy.seed import build_world, migrate_world
 
@@ -33,7 +33,14 @@ def bootstrap() -> None:
         db.save_world(world)
     else:
         with db.world_lock() as world:
-            world.tick_seconds = config.TICK_SECONDS
+            # Длину пейдея и автопейдей теперь крутит и админка, поэтому снимок
+            # мира — источник истины. Переменные окружения перебивают его только
+            # тогда, когда заданы явно: иначе каждый перезапуск сервера отменял
+            # бы то, что администратор выставил в игре.
+            if config.TICK_SECONDS_SET or world.tick_seconds <= 0:
+                world.tick_seconds = config.TICK_SECONDS
+            if config.AUTO_TICK_SET:
+                world.auto_tick = config.AUTO_TICK
             # Старый снимок мира не знает про товары и отрасли, добавленные
             # после его сохранения: чертежи хранятся внутри самого мира.
             added = migrate_world(world)
@@ -47,6 +54,8 @@ def ticker(stop: threading.Event) -> None:
     while not stop.wait(1.0):
         try:
             with db.world_lock() as world:
+                if not world.auto_tick:
+                    continue
                 if time.time() - world.last_tick_at < world.tick_seconds:
                     continue
                 res = run_tick(world)
@@ -59,40 +68,6 @@ def ticker(stop: threading.Event) -> None:
                      res["population"], res["unemployment"] * 100)
         except Exception:
             log.exception("Ошибка в пейдее")
-
-
-def persist_tick(world, res: dict) -> None:
-    """Записать историю тика для графиков — по каждому государству отдельно.
-
-    Цены и склады живут не в чертеже товара, а в Country.goods: у двадцати
-    областей они свои. Раньше здесь читался несуществующий Good.price, тик
-    падал с ошибкой прямо внутри блока сохранения мира — и мир не сохранялся
-    вовсе, то есть игра просто не шла.
-    """
-    tick = world.tick
-    prices, macro = [], []
-    # Военные новости пейдея — в ту же хронику, что и стройки с выборами.
-    for line in res.get("news", []):
-        db.add_event(tick, None, "war", line)
-    for cid, country in world.countries.items():
-        if not country.alive:
-            continue
-        # цены пишем по каждой области: рынок живёт в ней
-        for city in world.country_regions(cid):
-            for key, lg in city.goods.items():
-                prices.append((tick, city.id, key, lg.price, lg.anchor, lg.stock,
-                               lg.last_demand, lg.last_supply))
-        m = res.get("countries", {}).get(cid)
-        if m:
-            macro.append((tick, cid, m["gdp"], m["population"], m["unemployment"],
-                          m["satisfaction"], m["avg_wage"], m["treasury"],
-                          m["cpi"], m["money_supply"], m["living_standard"]))
-    db.write_price_history(prices)
-    if macro:
-        db.write_macro(macro)
-    if world.world_prices:
-        db.write_world_prices(tick, world.world_prices)
-    db.prune_history(tick)
 
 
 # ---------------------------------------------------------------------------
@@ -172,14 +147,6 @@ class Handler(BaseHTTPRequestHandler):
                     pid = world.sessions.get(token)
                     ctx.player = world.players.get(pid) if pid else None
                 result = handler(ctx)
-                if handler is force_tick:
-                    # История — дело второстепенное: если запись графиков
-                    # сорвётся, мир всё равно должен сохраниться, иначе игра
-                    # молча перестанет идти.
-                    try:
-                        persist_tick(world, result)
-                    except Exception:
-                        log.exception("Не удалось записать историю пейдея")
             self.send_json(result)
 
         except ApiError as exc:
@@ -197,15 +164,19 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
                         format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
     bootstrap()
 
+    # Поток заводим всегда: автопейдей теперь включается и выключается из
+    # админки на ходу, а не только ключом при запуске.
     stop = threading.Event()
-    if config.AUTO_TICK:
-        threading.Thread(target=ticker, args=(stop,), daemon=True).start()
+    threading.Thread(target=ticker, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer((host, port), Handler)
-    mins = config.TICK_SECONDS / 60
+    with db.world_read() as world:
+        secs, auto = world.tick_seconds, world.auto_tick
     log.info("SimPolEc запущен: http://%s:%s", host, port)
-    log.info("Пейдей каждые %s сек (%.1f мин). Ctrl+C — остановить.",
-             config.TICK_SECONDS, mins)
+    log.info("Пейдей каждые %s сек (%.1f мин), автопейдей %s. Ctrl+C — остановить.",
+             secs, secs / 60, "включён" if auto else "выключен")
+    if config.ADMIN_USERS:
+        log.info("Администраторы: %s", ", ".join(sorted(config.ADMIN_USERS)))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

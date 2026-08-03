@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -33,12 +34,27 @@ from .economy.pricing import price_bounds
 from .economy import society
 from .models import Building, Player, World
 
+log = logging.getLogger("simpolec")
+
 
 class ApiError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def is_admin(player: Player | None) -> bool:
+    """Допущен ли игрок в админку.
+
+    Право берётся из двух мест: флаг в самом мире (его раздаёт администратор) и
+    список имён при запуске сервера. Второй нужен, чтобы первого администратора
+    вообще было откуда взять — внутри игры выдать его самому себе нельзя.
+    """
+    if player is None or player.is_state:
+        return False
+    return bool(player.is_admin
+                or player.username.strip().lower() in config.ADMIN_USERS)
 
 
 @dataclass
@@ -66,6 +82,12 @@ class Ctx:
         if c is None or c.leader_id != p.id:
             raise ApiError(403, "Нужны полномочия лидера государства")
         return p, c
+
+    def require_admin(self) -> Player:
+        p = self.require_player()
+        if not is_admin(p):
+            raise ApiError(403, "Нужны права администратора")
+        return p
 
     def need(self, key: str) -> Any:
         if key not in self.body:
@@ -172,6 +194,11 @@ def me(ctx: Ctx) -> dict:
                        if c else 0.0,
         "halted": sum(1 for b in w.player_buildings(p.id) if b.halted),
         "warehouse": warehouse,
+        "is_admin": is_admin(p),
+        "muted": p.muted(time.time()),
+        "mute_until": p.mute_until,
+        "mute_forever": p.mute_forever,
+        "mute_reason": p.mute_reason,
     }
 
 
@@ -285,6 +312,8 @@ def world_state(ctx: Ctx) -> dict:
         "tick": w.tick,
         "tick_seconds": w.tick_seconds,
         "seconds_left": max(0.0, w.tick_seconds - elapsed),
+        "auto_tick": w.auto_tick,
+        "is_admin": is_admin(ctx.player),
         "country": _country_brief(w, c) if c else None,
         # цифры шапки — по своей стране
         "home": home,
@@ -2038,9 +2067,390 @@ def alliance_break(ctx: Ctx) -> dict:
     return {"ok": True}
 
 
+def persist_tick(world: World, res: dict) -> None:
+    """Записать историю пейдея для графиков — по каждой области отдельно.
+
+    Цены и склады живут не в чертеже товара, а в City.goods: у сорока областей
+    они свои. Живёт здесь, а не в main, потому что пейдей крутит не только
+    планировщик: его же проводит админка, и история обязана писаться одинаково.
+    """
+    tick = world.tick
+    prices, macro = [], []
+    # Военные новости пейдея — в ту же хронику, что и стройки с выборами.
+    for line in res.get("news", []):
+        db.add_event(tick, None, "war", line)
+    for cid, country in world.countries.items():
+        if not country.alive:
+            continue
+        for city in world.country_regions(cid):
+            for key, lg in city.goods.items():
+                prices.append((tick, city.id, key, lg.price, lg.anchor, lg.stock,
+                               lg.last_demand, lg.last_supply))
+        m = res.get("countries", {}).get(cid)
+        if m:
+            macro.append((tick, cid, m["gdp"], m["population"], m["unemployment"],
+                          m["satisfaction"], m["avg_wage"], m["treasury"],
+                          m["cpi"], m["money_supply"], m["living_standard"]))
+    db.write_price_history(prices)
+    if macro:
+        db.write_macro(macro)
+    if world.world_prices:
+        db.write_world_prices(tick, world.world_prices)
+    db.prune_history(tick)
+
+
+def _tick_once(world: World) -> dict:
+    """Провести пейдей и записать историю.
+
+    История — дело второстепенное: если запись графиков сорвётся, мир всё равно
+    обязан сохраниться, иначе игра молча перестанет идти.
+    """
+    res = run_tick(world)
+    try:
+        persist_tick(world, res)
+    except Exception:
+        log.exception("Не удалось записать историю пейдея")
+    return res
+
+
 def force_tick(ctx: Ctx) -> dict:
-    """Ручной пейдей — для отладки и одиночной игры."""
-    return run_tick(ctx.world)
+    """Ручной пейдей — теперь только из админки."""
+    ctx.require_admin()
+    return _tick_once(ctx.world)
+
+
+# ---------------------------------------------------------------------------
+# Чат: мировой, государственный и личный
+# ---------------------------------------------------------------------------
+CHAT_CHANNELS = ("world", "country", "private")
+
+
+def _chat_contacts(w: World, me: Player) -> list[dict]:
+    """С кем можно переписываться лично: все живые игроки, кроме казны и себя.
+
+    Свои земляки идут первыми — с ними разговор заходит чаще, чем с
+    промышленником с другого конца карты.
+    """
+    rows = []
+    for p in w.players.values():
+        if p.is_state or p.id == me.id:
+            continue
+        country = w.countries.get(p.country_id)
+        rows.append({
+            "id": p.id, "username": p.username,
+            "country_id": p.country_id,
+            "country": country.name if country else "—",
+            "color": country.color if country else "#6b7a8f",
+            "same_country": p.country_id == me.country_id,
+            "is_leader": bool(country and country.leader_id == p.id),
+        })
+    rows.sort(key=lambda r: (not r["same_country"], r["username"].lower()))
+    return rows
+
+
+def chat_view(ctx: Ctx) -> dict:
+    """Все три канала разом: мир, своё государство и личная переписка.
+
+    Одним запросом, а не тремя, нарочно: клиент опрашивает чат по таймеру, и
+    три ветки в одном ответе избавляют от трёх кругов сети на каждый опрос.
+    """
+    p = ctx.require_player()
+    w = ctx.world
+    limit = max(1, min(200, int(ctx.query.get("limit") or config.CHAT_HISTORY)))
+    country = w.countries.get(p.country_id)
+    now = time.time()
+    return {
+        "world": db.chat_channel("world", None, limit),
+        "country": db.chat_channel("country", p.country_id, limit),
+        # Личное отдаётся общим списком, а клиент сам раскладывает его по
+        # собеседникам: переписок мало, а лишний параметр «с кем» заставлял бы
+        # перезапрашивать чат при каждом переключении вкладки.
+        "private": db.chat_private(p.id, limit * 3),
+        "contacts": _chat_contacts(w, p),
+        "me": p.id,
+        "country_name": country.name if country else "—",
+        "muted": p.muted(now),
+        "mute_until": p.mute_until,
+        "mute_forever": p.mute_forever,
+        "mute_reason": p.mute_reason,
+        "is_admin": is_admin(p),
+    }
+
+
+def chat_send(ctx: Ctx) -> dict:
+    p = ctx.require_player()
+    w = ctx.world
+    now = time.time()
+
+    if p.muted(now):
+        if p.mute_forever:
+            when = "Вам навсегда закрыт доступ к чату"
+        else:
+            left = max(1, int((p.mute_until - now) / 60))
+            when = f"Вы лишены слова ещё на {left} мин."
+        raise ApiError(403, when + (f": {p.mute_reason}" if p.mute_reason else ""))
+
+    channel = str(ctx.body.get("channel") or "world")
+    if channel not in CHAT_CHANNELS:
+        raise ApiError(400, "Неизвестный канал")
+    text = " ".join(str(ctx.need("text")).split())
+    if not text:
+        raise ApiError(400, "Пустое сообщение")
+    if len(text) > config.CHAT_MAX_LEN:
+        text = text[:config.CHAT_MAX_LEN]
+
+    to_id = to_name = country_id = None
+    if channel == "private":
+        to_id = int(ctx.body.get("to_id") or 0)
+        target = w.players.get(to_id)
+        if target is None or target.is_state or target.id == p.id:
+            raise ApiError(400, "Такого собеседника нет")
+        to_name = target.username
+    elif channel == "country":
+        if p.country_id not in w.countries:
+            raise ApiError(400, "У вас нет государства")
+        country_id = p.country_id
+
+    # Защита от потока сообщений — последней, после всех проверок: иначе
+    # неверный запрос получал бы «не так быстро» вместо своей ошибки.
+    if now - db.chat_last_ts(p.id) < config.CHAT_MIN_INTERVAL:
+        raise ApiError(429, "Не так быстро")
+
+    msg = db.chat_add(w.tick, channel, country_id, p.id, p.username,
+                      to_id, to_name, text, now)
+    return {"message": msg}
+
+
+# ---------------------------------------------------------------------------
+# Админка
+# ---------------------------------------------------------------------------
+def _admin_player_dto(w: World, p: Player, now: float) -> dict:
+    country = w.countries.get(p.country_id)
+    blds = w.player_buildings(p.id)
+    return {
+        "id": p.id, "username": p.username,
+        "is_state": p.is_state, "is_admin": is_admin(p),
+        "admin_flag": p.is_admin,     # выданное в игре, без списка при запуске
+        "country_id": p.country_id,
+        "country": country.name if country else "—",
+        "is_leader": bool(country and country.leader_id == p.id),
+        "cash": round(p.cash, 2),
+        "net_worth": round(w.net_worth(p), 2),
+        "buildings": len(blds),
+        "bankrupt": p.bankrupt,
+        "muted": p.muted(now),
+        "mute_until": p.mute_until,
+        "mute_forever": p.mute_forever,
+        "mute_reason": p.mute_reason,
+    }
+
+
+def admin_state(ctx: Ctx) -> dict:
+    """Всё, чем админка управляет: игроки, государства и ход времени."""
+    ctx.require_admin()
+    w = ctx.world
+    now = time.time()
+    countries = []
+    for cid, c in sorted(w.countries.items()):
+        leader = w.players.get(c.leader_id) if c.leader_id else None
+        countries.append({
+            "id": cid, "name": c.name, "color": c.color, "alive": c.alive,
+            "treasury": round(c.treasury, 2),
+            "gdp": round(c.gdp, 2),
+            "population": round(sum(x.population for x in w.country_regions(cid))),
+            "regions": len(w.country_regions(cid)),
+            "leader_id": c.leader_id,
+            "leader": leader.username if leader else "AI (без лидера)",
+            "army_budget": round(c.army_budget, 2),
+            "at_war": bool(w.wars_of(cid)),
+        })
+    return {
+        "players": [_admin_player_dto(w, p, now) for p in
+                    sorted(w.players.values(), key=lambda x: (x.is_state, x.id))],
+        "countries": countries,
+        "tick": w.tick,
+        "tick_seconds": w.tick_seconds,
+        "auto_tick": w.auto_tick,
+        "seconds_left": max(0, round(w.tick_seconds - (now - w.last_tick_at))),
+        "now": now,
+        "env_admins": sorted(config.ADMIN_USERS),
+        "chat_channels": list(CHAT_CHANNELS),
+    }
+
+
+def _admin_target(ctx: Ctx) -> Player:
+    """Игрок, над которым совершается админское действие."""
+    p = ctx.world.players.get(int(ctx.need("player_id")))
+    if p is None:
+        raise ApiError(404, "Такого игрока нет")
+    return p
+
+
+def admin_tick(ctx: Ctx) -> dict:
+    """Прокрутить несколько пейдеев подряд.
+
+    История пишется по каждому, а не только по последнему: иначе на графиках
+    оставались бы дыры ровно там, где администратор двигал время.
+    """
+    ctx.require_admin()
+    count = max(1, min(50, int(ctx.body.get("count") or 1)))
+    res = {}
+    for _ in range(count):
+        res = _tick_once(ctx.world)
+    return {"ok": True, "ticks": count, "tick": res.get("tick", ctx.world.tick)}
+
+
+def admin_time(ctx: Ctx) -> dict:
+    """Ход времени: автопейдей и длина пейдея."""
+    ctx.require_admin()
+    w = ctx.world
+    if "auto_tick" in ctx.body:
+        w.auto_tick = bool(ctx.body["auto_tick"])
+    if "tick_seconds" in ctx.body:
+        w.tick_seconds = max(1, min(86_400, int(ctx.body["tick_seconds"])))
+    return {"ok": True, "auto_tick": w.auto_tick, "tick_seconds": w.tick_seconds}
+
+
+def admin_mute(ctx: Ctx) -> dict:
+    """Лишить игрока слова — на срок или навсегда."""
+    ctx.require_admin()
+    target = _admin_target(ctx)
+    if target.is_state:
+        raise ApiError(400, "Казна и так молчит")
+    # Ни чужого администратора, ни себя самого: сперва снимите права.
+    if is_admin(target):
+        raise ApiError(403, "Сначала снимите с него права администратора")
+    forever = bool(ctx.body.get("forever"))
+    minutes = max(0.0, float(ctx.body.get("minutes") or 0))
+    reason = " ".join(str(ctx.body.get("reason") or "").split())[:200]
+    if not forever and minutes <= 0:
+        raise ApiError(400, "Укажите срок или ставьте немоту навсегда")
+
+    target.mute_forever = forever
+    target.mute_until = 0.0 if forever else time.time() + minutes * 60
+    target.mute_reason = reason
+    db.add_event(ctx.world.tick, target.id, "admin",
+                 f"{target.username} лишён слова в чате "
+                 + ("навсегда" if forever else f"на {minutes:g} мин.")
+                 + (f" — {reason}" if reason else ""))
+    return {"ok": True, "player": _admin_player_dto(ctx.world, target, time.time())}
+
+
+def admin_unmute(ctx: Ctx) -> dict:
+    ctx.require_admin()
+    target = _admin_target(ctx)
+    target.mute_forever = False
+    target.mute_until = 0.0
+    target.mute_reason = ""
+    return {"ok": True, "player": _admin_player_dto(ctx.world, target, time.time())}
+
+
+def admin_grant(ctx: Ctx) -> dict:
+    """Выдать или отобрать права администратора.
+
+    Отобрать право, выданное списком при запуске сервера, отсюда нельзя — оно
+    живёт снаружи игры и снимается там же.
+    """
+    admin = ctx.require_admin()
+    target = _admin_target(ctx)
+    if target.is_state:
+        raise ApiError(400, "Казна не может быть администратором")
+    if target.id == admin.id and not ctx.body.get("value"):
+        raise ApiError(400, "Снять права с самого себя нельзя")
+    target.is_admin = bool(ctx.body.get("value"))
+    return {"ok": True, "player": _admin_player_dto(ctx.world, target, time.time())}
+
+
+def admin_cash(ctx: Ctx) -> dict:
+    """Выдать игроку денег или списать их (отрицательная сумма)."""
+    ctx.require_admin()
+    target = _admin_target(ctx)
+    amount = float(ctx.need("amount"))
+    target.cash += amount
+    db.add_event(ctx.world.tick, target.id, "admin",
+                 f"{target.username}: касса изменена на {amount:+,.0f} ₡ "
+                 f"решением администратора")
+    return {"ok": True, "cash": round(target.cash, 2)}
+
+
+def admin_treasury(ctx: Ctx) -> dict:
+    """Пополнить или обчистить казну государства."""
+    ctx.require_admin()
+    country = ctx.world.countries.get(int(ctx.need("country_id")))
+    if country is None:
+        raise ApiError(404, "Такого государства нет")
+    amount = float(ctx.need("amount"))
+    # Через bookkeeping, а не прямым присвоением: роспись казны обязана
+    # сходиться с остатком до червонца, это проверяется тестом.
+    if amount >= 0:
+        country.collect("spoils", amount)
+    else:
+        country.spend("losses", -amount)
+    return {"ok": True, "treasury": round(country.treasury, 2)}
+
+
+def admin_bankrupt(ctx: Ctx) -> dict:
+    """Объявить банкротом или, наоборот, вернуть в дело."""
+    ctx.require_admin()
+    target = _admin_target(ctx)
+    value = bool(ctx.body.get("value"))
+    target.bankrupt = value
+    target.bankrupt_since = ctx.world.tick if value else 0
+    if not value:
+        # Выпускать дело из банкротства без снятия замков бессмысленно: цеха
+        # так и останутся стоять, а хозяин не сможет их запустить.
+        for b in ctx.world.player_buildings(target.id):
+            if b.halted:
+                b.halted = False
+                b.active = True
+    return {"ok": True, "bankrupt": target.bankrupt}
+
+
+def admin_leader(ctx: Ctx) -> dict:
+    """Посадить игрока во главе государства или вернуть страну под AI."""
+    ctx.require_admin()
+    w = ctx.world
+    country = w.countries.get(int(ctx.need("country_id")))
+    if country is None:
+        raise ApiError(404, "Такого государства нет")
+    raw = ctx.body.get("player_id")
+    if raw in (None, "", 0, "0"):
+        old = w.players.get(country.leader_id) if country.leader_id else None
+        if old is not None:
+            old.governor_of = None
+        country.leader_id = None
+        return {"ok": True, "leader": None}
+
+    target = w.players.get(int(raw))
+    if target is None or target.is_state:
+        raise ApiError(404, "Такого игрока нет")
+    if target.country_id != country.id:
+        raise ApiError(400, "Лидером может быть только гражданин страны")
+    old = w.players.get(country.leader_id) if country.leader_id else None
+    if old is not None and old.id != target.id:
+        old.governor_of = None
+    country.leader_id = target.id
+    target.governor_of = country.id
+    db.add_event(w.tick, target.id, "admin",
+                 f"{target.username} поставлен во главе государства {country.name}")
+    return {"ok": True, "leader": target.username}
+
+
+def admin_chat_delete(ctx: Ctx) -> dict:
+    ctx.require_admin()
+    if not db.chat_delete(int(ctx.need("id"))):
+        raise ApiError(404, "Сообщение уже удалено")
+    return {"ok": True}
+
+
+def admin_chat_clear(ctx: Ctx) -> dict:
+    ctx.require_admin()
+    channel = str(ctx.body.get("channel") or "world")
+    if channel not in CHAT_CHANNELS:
+        raise ApiError(400, "Неизвестный канал")
+    country_id = ctx.body.get("country_id")
+    removed = db.chat_clear(channel, int(country_id) if country_id else None)
+    return {"ok": True, "removed": removed}
 
 
 # ---------------------------------------------------------------------------
@@ -2099,6 +2509,24 @@ ROUTES: dict[tuple[str, str], Route] = {
     ("POST", "/api/alliance/offer"): (alliance_offer, True),
     ("POST", "/api/alliance/accept"): (alliance_accept, True),
     ("POST", "/api/alliance/break"): (alliance_break, True),
+
+    # Чат живёт в своей таблице, а не в снимке мира, — переписывать мир ради
+    # реплики незачем, поэтому оба маршрута идут под read-замком.
+    ("GET", "/api/chat"): (chat_view, False),
+    ("POST", "/api/chat/send"): (chat_send, False),
+
+    ("GET", "/api/admin/state"): (admin_state, False),
+    ("POST", "/api/admin/tick"): (admin_tick, True),
+    ("POST", "/api/admin/time"): (admin_time, True),
+    ("POST", "/api/admin/mute"): (admin_mute, True),
+    ("POST", "/api/admin/unmute"): (admin_unmute, True),
+    ("POST", "/api/admin/grant"): (admin_grant, True),
+    ("POST", "/api/admin/cash"): (admin_cash, True),
+    ("POST", "/api/admin/treasury"): (admin_treasury, True),
+    ("POST", "/api/admin/bankrupt"): (admin_bankrupt, True),
+    ("POST", "/api/admin/leader"): (admin_leader, True),
+    ("POST", "/api/admin/chat/delete"): (admin_chat_delete, False),
+    ("POST", "/api/admin/chat/clear"): (admin_chat_clear, False),
 
     ("POST", "/api/tick"): (force_tick, True),
 }
