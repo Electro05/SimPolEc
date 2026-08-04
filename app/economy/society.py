@@ -117,10 +117,40 @@ def glut_scale(local: LocalGood) -> float:
     return max(config.GLUT_MIN_OUTPUT, 1.0 - excess)
 
 
-def produce_peasants(world: World, country: Country, city: City, market) -> float:
-    """Урожай, собственное потребление и излишек на рынок.
+def peasant_alternative(city: City) -> float:
+    """Что даёт крестьянину СВОЙ надел за пейдей, в червонцах.
 
-    Возвращает, сколько еды крестьяне съели из своего урожая.
+    Мерка для найма на чужое поле. Крестьянин не безработный, которому некуда
+    деваться: своя земля кормит его и без хозяина, поэтому на ферму он выходит,
+    только если там платят не меньше. Считается по текущим ценам области —
+    подешевело зерно, и своё поле стало давать меньше, а работа по найму
+    привлекательнее.
+    """
+    return sum(per_head * lg(city, key).price
+               for key, per_head in config.PEASANT_YIELD.items())
+
+
+def farm_hired(world: World, city: City) -> float:
+    """Сколько крестьян области занято на чужих полях в этот пейдей."""
+    total = 0.0
+    for b in world.city_buildings(city.id):
+        ind = world.industries.get(b.industry_key)
+        if ind is not None and ind.labour == "peasants":
+            total += b.employed
+    return total
+
+
+def produce_peasants(world: World, country: Country, city: City, market) -> float:
+    """Урожай со своих наделов, собственное потребление и излишек на рынок.
+
+    Возвращает, сколько зерна крестьяне съели из своего урожая.
+
+    **Занятый на ферме своё поле не пашет.** Иначе один и тот же человек
+    снимал бы урожай дважды — и с хозяйской земли за зарплату, и со своей за
+    хлеб, — а страна получала бы зерно из ниоткуда. От надела ему остаётся
+    огород при избе (config.FARM_OWN_PLOT_LEFT), всё прочее он теперь покупает
+    на рынке за деньги. В этом и весь смысл перемены: деревня перестаёт быть
+    натуральной и становится покупателем.
     """
     st = city.s("peasants")
     if st.people <= EPS:
@@ -131,19 +161,25 @@ def produce_peasants(world: World, country: Country, city: City, market) -> floa
     harvest = 1.0 + r.uniform(-config.HARVEST_SWING, config.HARVEST_SWING)
     city.harvest = harvest
 
+    hired = min(farm_hired(world, city), st.people)
+    # свободные пашут полностью, нанятые — только огород при избе
+    hands = (st.people - hired) + hired * config.FARM_OWN_PLOT_LEFT
+
     owner = stratum_owner_id(city.id, "peasants")
-    own_food = 0.0
+    own_grain = 0.0
     for good_key, per_head in config.PEASANT_YIELD.items():
-        qty = st.people * per_head * harvest
-        if good_key == "food":
-            # сначала едят сами, на рынок идёт только излишек
-            need = (st.people * config.CONSUMPTION_BASKET["food"]["qty"]
+        qty = hands * per_head * harvest
+        if good_key == "grain":
+            # сначала едят сами, на рынок идёт только излишек. Едят при этом
+            # ВСЕ крестьяне, включая нанятых, — просто нанятым своего хлеба уже
+            # не хватает, и недостачу они докупают за зарплату.
+            need = (st.people * config.CONSUMPTION_BASKET["grain"]["qty"]
                     * config.STRATA["peasants"]["level"])
-            own_food = min(qty, need)
-            qty = max(0.0, qty - own_food)
+            own_grain = min(qty, need)
+            qty = max(0.0, qty - own_grain)
         if qty > EPS:
             market.deposit(good_key, owner, qty * glut_scale(lg(city, good_key)))
-    return own_food
+    return own_grain
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +366,73 @@ def artisan_mix(world: World, country: Country, city: City,
     return {c: v / norm for c, v in mix.items()}
 
 
+def craft_ruin(peasants, artisans) -> float:
+    """Насколько у ремесла ЗАБРАЛИ ЗАРАБОТОК, от 0 до 1.
+
+    Мера денежная, и это принципиально. Пока ремесло живо, живых червонцев у
+    кустаря заметно больше, чем у крестьянина: тот значительную часть хлеба
+    съедает, а не продаёт. Так что превышение — норма, а вот провал денежного
+    дохода НИЖЕ крестьянского означает ровно одно: сбыт ушёл. Ушёл он к тому,
+    кто делает то же самое дешевле, — к заводу. Отсюда и глубина: заработок
+    упал в ноль — ремесло разорено полностью.
+
+    Мерить разорение сытостью нельзя, как бы ни просилось. Крестьянин ест со
+    своего поля и живёт сытнее кустаря ПОЧТИ ВСЕГДА, безо всяких заводов, — по
+    этой мерке мастерские пустели бы сами собой по всему миру, и страны без
+    единого завода первыми остались бы без одежды, мебели и инструмента.
+    Проверено прогоном: сословие уходило в деревню целиком, хлеб дешевел от
+    лишних рук, а уровень жизни в мире падал с 0.41 до 0.25. У голода поэтому
+    своя, вдевятеро меньшая доля — см. CRAFT_FLEE_HUNGER и drift_and_switch.
+
+    Мера растёт КВАДРАТИЧНО, и это не украшение. Доход сословия скачет от
+    пейдея к пейдею — урожай, цены, случай, — и мелкий провал ниже деревни
+    случается сам собой, безо всяких заводов. При линейной мере такой провал на
+    треть уже гнал из мастерских десятую часть людей за пейдей, и сословие
+    выкашивало себя в первые же десять пейдеев мира, когда никаких заводов ещё
+    нет вовсе. Квадрат оставляет мелкую рябь почти без последствий, а полный
+    провал дохода в ноль — с полной силой.
+
+    Считается по ДВУМ пейдеям — идущему и прошлому, — и берётся меньшая беда.
+    Один пейдей ничего не доказывает: неурожай, случайная просадка цены, и
+    деревня разом «богаче» мастерских. Разорение — это когда заработка нет и
+    сегодня, и вчера.
+    """
+    if artisans.people <= EPS or peasants.people <= EPS:
+        return 0.0
+    edge = config.CRAFT_SWITCH_EDGE
+    gap = 1.0
+    for pi, ai in ((peasants.income_per_capita, artisans.income_per_capita),
+                   (peasants.usual_income_per_capita,
+                    artisans.usual_income_per_capita)):
+        if pi <= EPS:
+            return 0.0
+        gap = min(gap, max(0.0, min(1.0, (pi - ai * edge) / pi)))
+    return gap * gap
+
+
+def craft_potential(world: World, city: City) -> float:
+    """Сколько бы заработал кустарь при нынешних ценах — на человека за пейдей.
+
+    Нужно там, где сравнивать не с чем: ремесла в области не осталось, доход
+    его равен нулю, и по доходу деревню обратно к верстаку уже не позвать.
+    Берётся лучшее из исполнимых ремёсел — то, за которое и взялись бы, — а
+    исполнимость считается по той горстке людей, что придёт за один пейдей: на
+    целое сословие сырья на прилавке, конечно, не хватит.
+    """
+    crafts = artisan_crafts(world)
+    if not crafts:
+        return 0.0
+    newcomers = max(city.s("peasants").people * config.CRAFT_SWITCH_SHARE, 1.0)
+    best = 0.0
+    for craft in crafts:
+        margin = craft_margin(city, craft, crafts)
+        if margin <= best:
+            continue
+        if craft_feasibility(city, craft, crafts, newcomers) >= 1.0:
+            best = margin
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Потребление
 # ---------------------------------------------------------------------------
@@ -392,14 +495,20 @@ def luxury_share(expectation: float, unlock: float) -> float:
     return min(1.0, (expectation - unlock) / config.LUXURY_RAMP)
 
 
-def consume(world: World, country: Country, city: City, market, own_food: float) -> dict[str, dict]:
+def consume(world: World, country: Country, city: City, market,
+            own_grain: float) -> dict[str, dict]:
     """Каждое сословие тратит свои деньги по приоритету потребностей.
 
-    Порядок трат — по ступеням: сперва еда, потом обиход, потом дорогие вещи и
-    только в самом конце роскошь. Разбогатевшее сословие поднимает ожидания:
-    берёт больше обычного (той же еды) и постепенно добавляет мясо, вино,
+    Порядок трат — по ступеням: сперва хлеб, потом обиход, потом дорогие вещи и
+    только в самом конце роскошь. Сама еда при этом тоже лестница: зерно (ступень
+    1) даёт сытость за гроши, продукты (2) и продовольствие (3) — то же брюхо,
+    но заметно лучшую жизнь, мясо — уже роскошь. Разбогатевшее сословие
+    поднимает ожидания: берёт больше обычного и постепенно добавляет мясо, вино,
     хорошее платье, обстановку и оперу. Сколько корзин оно в итоге потребило —
     и есть его уровень жизни.
+
+    `own_grain` — хлеб, который крестьяне сняли со своих наделов и съели, минуя
+    рынок. Он такая же еда, как купленная, и в уровень жизни входит наравне.
     """
     result: dict[str, dict] = {}
 
@@ -419,12 +528,12 @@ def consume(world: World, country: Country, city: City, market, own_food: float)
         base_needs = {g: st.people * spec["qty"] * level
                       for g, spec in basket.items()}
 
-        # крестьяне уже поели со своего поля — покупать им столько не придётся
-        covered_food = (min(own_food, base_needs.get("food", 0.0))
-                        if key == "peasants" else 0.0)
+        # крестьяне уже поели своего хлеба — покупать им столько не придётся
+        covered_grain = (min(own_grain, base_needs.get("grain", 0.0))
+                         if key == "peasants" else 0.0)
         purchase_value = sum(
             base_needs[g] * lg(city, g).anchor for g in base_needs
-            if g in city.goods) - covered_food * lg(city, "food").anchor
+            if g in city.goods) - covered_grain * lg(city, "grain").anchor
 
         # --- ожидания: медленно ползут за достатком -----------------------
         target = target_expectation(st, max(purchase_value, EPS) / st.people)
@@ -450,9 +559,9 @@ def consume(world: World, country: Country, city: City, market, own_food: float)
             elasticity[g] = spec["elasticity"]
             top_share = max(top_share, share)
 
-        # своё съеденное покупать не надо (covered_food посчитан выше)
+        # своё съеденное покупать не надо (covered_grain посчитан выше)
         market_needs = dict(needs)
-        market_needs["food"] = max(0.0, needs.get("food", 0.0) - covered_food)
+        market_needs["grain"] = max(0.0, needs.get("grain", 0.0) - covered_grain)
 
         wanted = {}
         for g, qty in market_needs.items():
@@ -491,18 +600,18 @@ def consume(world: World, country: Country, city: City, market, own_food: float)
 
         fill: dict[str, float] = {}
         for g, base_qty in base_needs.items():
-            got = covered_food if g == "food" else 0.0
+            got = covered_grain if g == "grain" else 0.0
             fill[g] = min(1.0, got / base_qty) if base_qty > EPS else 1.0
 
         paid = 0.0
         # Ценность потреблённого меряем в ценах ЯКОРЯ, а не рынка: иначе
         # уровень жизни прыгал бы от одной только инфляции, хотя человек ест
         # ровно то же самое.
-        consumed_value = covered_food * lg(city, "food").anchor
+        consumed_value = covered_grain * lg(city, "grain").anchor
         # Расшифровка уровня жизни: что и сколько сословие взяло за этот пейдей.
         taken: dict[str, float] = {}
-        if covered_food > EPS:
-            taken["food"] = covered_food        # своё, с поля, а не с рынка
+        if covered_grain > EPS:
+            taken["grain"] = covered_grain      # своё, с поля, а не с рынка
         for g, want in plan.items():
             price = lg(city, g).price
             # Акциз ложится только на роскошь: мясо, вино, дорогое платье,
@@ -516,7 +625,7 @@ def consume(world: World, country: Country, city: City, market, own_food: float)
             if bought > EPS:
                 taken[g] = taken.get(g, 0.0) + bought
             base_qty = base_needs.get(g, 0.0)
-            got = bought + (covered_food if g == "food" else 0.0)
+            got = bought + (covered_grain if g == "grain" else 0.0)
             fill[g] = min(1.0, got / base_qty) if base_qty > EPS else 1.0
         st.consumed = taken
 
@@ -597,9 +706,16 @@ def move_people(src, dst, count: float) -> float:
 
 
 def recruit_workers(world: World, country: Country, city: City) -> float:
-    """Заводы переманивают людей зарплатой. Возвращает, сколько пришло."""
+    """Заводы переманивают людей зарплатой. Возвращает, сколько пришло.
+
+    Считаются только предприятия с ЗАВОДСКИМИ местами. Ферма мест для рабочих
+    не создаёт: на ней трудятся крестьяне, не меняя сословия (Industry.labour).
+    Если её сюда пустить, ферма своими двадцатью тысячами мест выдёргивала бы
+    деревню в рабочие, а сама оставалась бы без рук.
+    """
     buildings = [b for b in world.city_buildings(city.id)
-                 if b.active and b.effective_level > 0 and b.throttle > EPS]
+                 if b.active and b.effective_level > 0 and b.throttle > EPS
+                 and world.industries[b.industry_key].labour == "workers"]
     if not buildings:
         return 0.0
 
@@ -654,18 +770,79 @@ def drift_and_switch(world: World, city: City, employed: float) -> None:
     # перестаёт кормить, уходят обратно к земле, сколько бы оно ни платило.
     # Две мерки дают равновесие: опустеют мастерские — вырастет маржа
     # оставшихся, и деревня потянется обратно.
+    #
+    # Мерки обязаны остаться РАЗНЫМИ, как бы ни хотелось свести их к одной.
+    # Свести к уровню жизни нельзя: крестьянин ест со своего поля и потому живёт
+    # сытнее кустаря почти всегда — по этой мерке мастерские опустели бы
+    # начисто, и страна осталась бы без одежды, мебели и инструмента. Свести к
+    # деньгам тоже нельзя: у кустаря их почти всегда больше, и деревня набилась
+    # бы в мастерские до голода. Каждая мерка тянет в свою сторону, и держит
+    # равновесие именно их пара.
+    #
+    # У денежной мерки при этом есть предохранитель, без которого пара мерок
+    # вырождается в ловушку. Денежный доход кустаря выше крестьянского почти
+    # всегда — по самому устройству хозяйства, а не потому, что ремесло удалось.
+    # Значит, стоит уровню жизни кустаря провалиться, и получается дурная петля:
+    # деревня продолжает идти на червонцы в мастерские, где уже голодают, и
+    # кустари копятся до четверти страны при нулевом довольстве. Никто не идёт в
+    # ремесло, люди которого на глазах бедствуют, — CRAFT_MISERY_STOP и есть эта
+    # граница.
     peasants, artisans = city.s("peasants"), city.s("artisans")
     pi, ai = peasants.income_per_capita, artisans.income_per_capita
     ps, as_ = peasants.living_standard, artisans.living_standard
-    if ai > pi * 1.12 and peasants.people > EPS:
-        move_people(peasants, artisans, peasants.people * config.CRAFT_SWITCH_SHARE)
-    elif ps > as_ * 1.12 and artisans.people > EPS:
-        # Ремесло, которое не кормит, пустеет тем быстрее, чем хуже кустарю
-        # живётся и чем сытнее на земле. Уходят к земле: там он хотя бы сыт.
-        pull = min(1.0, (ps - as_) / max(ps, EPS))
-        share = (config.CRAFT_SWITCH_SHARE
-                 + config.CRAFT_FLEE_SHARE * pull * misery(as_))
-        move_people(artisans, peasants, artisans.people * share)
+    edge = config.CRAFT_SWITCH_EDGE
+    ruin = craft_ruin(peasants, artisans)
+
+    # Бегут из ремесла по двум причинам, и берётся худшая. Доли у них разные на
+    # порядок, и это главное в механике:
+    #   * ЗАБРАЛИ СБЫТ — денежный доход провалился ниже крестьянского. Так
+    #     действует завод: цену он перебивает, и кустарю остаётся верстак без
+    #     заказов (craft_ruin). Здесь уходят быстро — заменить их выпуском есть
+    #     кому, тот самый завод и заменит;
+    #   * НЕ КОРМИТ — сословие живёт хуже деревни и при этом бедствует (голод
+    #     без разницы в достатке гонит некуда, разница без голода терпима,
+    #     поэтому меры перемножены). Здесь уходят вдевятеро медленнее: голодное
+    #     ремесло — обычное состояние доиндустриальной страны, и вычерпать его
+    #     до дна значит оставить мир без одежды. См. CRAFT_FLEE_HUNGER.
+    need = misery(as_)
+    pull = min(1.0, max(0.0, (ps - as_) / max(ps, EPS)))
+    flee = max(config.CRAFT_FLEE_SHARE * ruin,
+               config.CRAFT_FLEE_HUNGER * pull * need)
+
+    # Тянет к верстаку заработок, гонит от него голод и разорение — и обе силы
+    # действуют ОДНОВРЕМЕННО, поэтому считаются оба потока, а движется разница.
+    # Ветвлением «или туда, или сюда» тут не обойтись, и это не придирка к
+    # стилю: голод у кустаря почти никогда не равен нулю, и ветка бегства,
+    # стоящая первой, навсегда запирала бы приток — сословие таяло бы до нуля в
+    # любой стране, даже там, где ремесло прекрасно кормит. Разница же сама
+    # находит равновесие: опустеют мастерские — вырастет цена их изделий,
+    # приток перевесит отток, и деревня потянется обратно.
+    attract = ai > pi * edge and misery(as_) < config.CRAFT_MISERY_STOP
+    if not attract and artisans.people <= peasants.people * config.CRAFT_EXTINCT_FLOOR:
+        # Ремесло в области пропало или почти пропало. Доходов у него нет,
+        # значит и сравнивать не с чем — деревню зовут обратно к верстаку сами
+        # цены: раз ремесло снова стоит заметно дороже надела, кто-то за него
+        # возьмётся. Без этой ветки первый же завод убивал бы ремесло в стране
+        # навсегда — вместе с одеждой, мебелью и инструментом, которые до
+        # второго завода делать больше некому.
+        attract = craft_potential(world, city) > max(pi, EPS) * config.CRAFT_REVIVAL_EDGE
+
+    inflow = peasants.people * config.CRAFT_SWITCH_SHARE if attract else 0.0
+    outflow = 0.0
+    if artisans.people > EPS and flee > EPS:
+        outflow = artisans.people * min(1.0, config.CRAFT_SWITCH_SHARE + flee)
+        # ПРОПАСТЬ СОВСЕМ ремесло может только от разорения, не от бедности:
+        # обезлюдевший и потерявший сбыт остаток расходится по деревне целиком.
+        # По голоду так нельзя — голодают кустари и там, где заводов нет вовсе,
+        # и страна осталась бы без одежды на ровном месте.
+        if (ruin >= config.CRAFT_RUIN_AT
+                and artisans.people <= peasants.people * config.CRAFT_EXTINCT_FLOOR):
+            outflow, inflow = artisans.people, 0.0
+
+    if outflow > inflow:
+        move_people(artisans, peasants, outflow - inflow)
+    elif inflow > outflow and peasants.people > EPS:
+        move_people(peasants, artisans, inflow - outflow)
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +879,33 @@ def country_living_standard(world: World, country: Country) -> float:
     return num / den if den > EPS else 1.0
 
 
+def country_population(world: World, country: Country) -> float:
+    return sum(c.population for c in country_cities(world, country))
+
+
+def size_title(population: float) -> str:
+    """Во что складывается число душ: крошечная страна, маленькая, ... крупная.
+
+    Одно слово говорит о стране больше, чем восьмизначное число: сразу видно,
+    губерния перед тобой или держава. Ступени заданы в config.COUNTRY_SIZES и
+    идут по возрастанию, поэтому подходит последняя, чей порог пройден.
+    """
+    title = config.COUNTRY_SIZES[0][1]
+    for threshold, name in config.COUNTRY_SIZES:
+        if population >= threshold:
+            title = name
+    return title
+
+
+def size_rank(population: float) -> int:
+    """Номер ступени размера, 0 — крошечная. Нужен витринам для раскраски."""
+    rank = 0
+    for i, (threshold, _name) in enumerate(config.COUNTRY_SIZES):
+        if population >= threshold:
+            rank = i
+    return rank
+
+
 def army_cap_share(world: World, country: Country) -> float:
     """Какую долю населения страна вообще способна поставить под ружьё.
 
@@ -712,34 +916,150 @@ def army_cap_share(world: World, country: Country) -> float:
     return config.ARMY_TARGET_MAX * (1.0 + bonus)
 
 
+def officer_size(world: World, country: Country) -> float:
+    return sum(c.s("officers").people for c in country_cities(world, country))
+
+
+def officer_pay(country: Country) -> float:
+    """Жалованье офицера за пейдей — отдельный рычаг лидера.
+
+    Ноль в Country.officer_pay значит «как заведено»: кратное солдатскому
+    (config.OFFICER_PAY_MULT). Ставка ниже солдатской не имеет смысла — на
+    таких условиях патента не возьмёт никто, — поэтому снизу она подпирается
+    жалованьем солдата.
+    """
+    default = country.soldier_pay * config.OFFICER_PAY_MULT
+    if country.officer_pay <= EPS:
+        return default
+    return max(country.soldier_pay * config.OFFICER_PAY_MIN_MULT,
+               min(country.officer_pay,
+                   country.soldier_pay * config.OFFICER_PAY_MAX_MULT))
+
+
+def officer_target_share(country: Country) -> float:
+    """Штат: сколько офицеров на солдата лидер хочет содержать.
+
+    Ноль значит «по уставу» — config.OFFICER_TARGET_SHARE, ровно столько,
+    сколько нужно для полного качества командования. Держать сверх штата стоит
+    на войне: офицеры гибнут быстрее солдат, и лишние идут им на смену раньше,
+    чем успеет доучиться новый набор.
+    """
+    if country.officer_target <= EPS:
+        return config.OFFICER_TARGET_SHARE
+    return min(config.OFFICER_TARGET_MAX, country.officer_target)
+
+
+def officer_candidates(world: World, country: Country) -> float:
+    """Сколько людей в стране вообще пойдёт в офицеры за нынешнее жалованье.
+
+    Это и есть предел найма, не считая денег: патент берут в высшем обществе, а
+    оно невелико и служить задаром не станет. Витрине число нужно, чтобы лидер
+    видел причину недобора — казна пуста или нанимать больше некого.
+    """
+    pay = officer_pay(country)
+    total = 0.0
+    for city in country_cities(world, country):
+        for key in config.OFFICER_POOL:
+            st = city.s(key)
+            if st.people <= EPS:
+                continue
+            if pay >= _officer_wage_bar(country, st):
+                total += st.people
+    return total
+
+
+def officer_pay_bar(world: World, country: Country) -> float:
+    """Какое жалованье нужно, чтобы в офицеры пошло ВЫСШЕЕ ОБЩЕСТВО.
+
+    Первое сословие в config.OFFICER_POOL и есть то, ради которого механика
+    затевалась: пока ставка ниже этой черты, патент берут только средние
+    городские слои, а высший класс на службу не идёт. Витрине число нужно
+    прямым ответом на вопрос «сколько платить».
+    """
+    key = config.OFFICER_POOL[0] if config.OFFICER_POOL else "town_high"
+    people = 0.0
+    weighted = 0.0
+    for city in country_cities(world, country):
+        st = city.s(key)
+        if st.people <= EPS:
+            continue
+        people += st.people
+        weighted += _officer_wage_bar(country, st) * st.people
+    if people <= EPS:
+        return 0.0
+    return weighted / people
+
+
+def _officer_wage_bar(country: Country, st) -> float:
+    """Ниже какого жалованья это сословие в офицеры не пойдёт.
+
+    Мера — привычный доход сословия за ПРОШЛЫЙ пейдей: свой доход за идущий
+    человек ещё не получил, а к началу пейдея счётчик уже обнулён (см.
+    Stratum.usual_income_per_capita). Высший класс живёт лучше всех в стране, и
+    перебить его достаток стоит дорого. Планка при этом чуть ниже единицы
+    (config.OFFICER_PAY_EDGE): служба даёт положение, чин и мундир, поэтому за
+    патентом идут и с некоторой потерей в деньгах — но не даром.
+    """
+    alternative = max(st.usual_income_per_capita, country.min_wage * 0.5)
+    return alternative * config.OFFICER_PAY_EDGE
+
+
+def soldier_slot_cost(country: Country) -> float:
+    """Во что обходится казне один солдат ВМЕСТЕ с положенной ему долей офицера.
+
+    Считать иначе нельзя. Офицеры содержатся из того же военного бюджета, что и
+    солдаты, и если набирать армию по одной солдатской ставке, а потом ставить
+    офицеров сверх неё, бюджет неминуемо не сойдётся: жалованья не хватит, и
+    армия начнёт разбегаться ровно тогда, когда её доукомплектовали командирами.
+    Поэтому «место в армии» стоит жалованье солдата плюс положенную ему долю
+    офицерского — и численность выводится уже из этой цены. Обе величины
+    берутся по РЫЧАГАМ ЛИДЕРА: поднял офицерское жалованье или штат — место в
+    строю подорожало, и армия при том же бюджете стала меньше.
+    """
+    return (country.soldier_pay
+            + officer_target_share(country) * officer_pay(country))
+
+
 def affordable_army(world: World, country: Country) -> float:
     """Сколько солдат страна может содержать на свой военный бюджет.
 
-    Численность армии определяется не желанием лидера, а арифметикой:
-    твёрдая сумма бюджета, делённая на ставку жалованья. Сверху — потолок по
-    доле населения, который растёт вместе с уровнем жизни.
+    Численность армии определяется не желанием лидера, а арифметикой: твёрдая
+    сумма бюджета, делённая на цену одного места в строю (солдат плюс его доля
+    офицера). Сверху — потолок по доле населения, который растёт вместе с
+    уровнем жизни.
     """
-    if country.soldier_pay <= EPS or country.army_budget <= EPS:
+    slot = soldier_slot_cost(country)
+    if slot <= EPS or country.army_budget <= EPS:
         return 0.0
     pop = sum(c.population for c in country_cities(world, country))
-    return min(country.army_budget / country.soldier_pay,
+    return min(country.army_budget / slot,
                pop * army_cap_share(world, country))
 
 
-def pay_army(world: World, country: Country) -> float:
-    """Жалованье солдатам — отдельная статья казны, до всех прочих расходов.
+def affordable_officers(world: World, country: Country) -> float:
+    """Сколько офицеров положено армии по штату, назначенному лидером."""
+    return affordable_army(world, country) * officer_target_share(country)
 
-    Платят не больше военного бюджета: лишние солдаты остаются без жалованья и
-    разбегаются по домам. Так армия сама сходится к тому размеру, который
-    страна тянет, и казна не уходит в минус.
+
+def pay_army(world: World, country: Country) -> float:
+    """Жалованье армии — отдельная статья казны, до всех прочих расходов.
+
+    Платят и солдатам, и офицерам, из одного военного бюджета и по одному
+    правилу: не больше того, что в нём есть. Кому не хватило — тот уходит
+    домой, и так армия сама сходится к размеру, который страна тянет.
+
+    Долг перед офицером считается по его ставке (кратной солдатской), поэтому
+    недоплата бьёт по обоим сословиям в одинаковой доле: казна не выбирает,
+    кого обидеть.
     """
     cities = country_cities(world, country)
     soldiers = sum(c.s("soldiers").people for c in cities)
-    if soldiers <= EPS or country.soldier_pay <= EPS:
+    officers = sum(c.s("officers").people for c in cities)
+    if (soldiers + officers) <= EPS or country.soldier_pay <= EPS:
         country.last_army_cost = 0.0
         return 0.0
 
-    obligation = soldiers * country.soldier_pay
+    obligation = soldiers * country.soldier_pay + officers * officer_pay(country)
     want = min(obligation, max(0.0, country.army_budget))
     paid = min(want, max(0.0, country.treasury))
     country.spend("army_pay", paid)
@@ -749,20 +1069,27 @@ def pay_army(world: World, country: Country) -> float:
     # солдат, и он уходит домой.
     ratio = paid / obligation if obligation > EPS else 1.0
 
-    for city in cities:
-        st = city.s("soldiers")
-        if st.people <= EPS:
+    for key, rate in (("soldiers", country.soldier_pay),
+                      ("officers", officer_pay(country))):
+        total = soldiers if key == "soldiers" else officers
+        if total <= EPS:
             continue
-        share = st.people / soldiers
-        st.cash += paid * share
-        st.income += paid * share
+        due = total * rate * ratio
+        for city in cities:
+            st = city.s(key)
+            if st.people <= EPS:
+                continue
+            share = st.people / total
+            st.cash += due * share
+            st.income += due * share
 
     if ratio < 0.999:
         unpaid = 1.0 - ratio
         for city in cities:
-            st = city.s("soldiers")
-            move_people(st, city.s("town_low"),
-                        st.people * unpaid * config.ARMY_DESERTION_SHARE)
+            for key in ("soldiers", "officers"):
+                st = city.s(key)
+                move_people(st, city.s("town_low"),
+                            st.people * unpaid * config.ARMY_DESERTION_SHARE)
     return paid
 
 
@@ -794,7 +1121,11 @@ def conscript(world: World, country: Country) -> float:
                 st = city.s(key)
                 if st.people <= EPS:
                     continue
-                alternative = max(st.income_per_capita, country.min_wage * 0.5)
+                # Сравнивается с привычным доходом за ПРОШЛЫЙ пейдей: свой за
+                # идущий человек ещё не получил, а счётчик к началу пейдея уже
+                # обнулён. По текущему income выходил бы ноль, и на службу шли
+                # бы за любые деньги — то есть правила не было бы вовсе.
+                alternative = max(st.usual_income_per_capita, country.min_wage * 0.5)
                 if country.soldier_pay < alternative * config.ARMY_PAY_EDGE:
                     continue
                 limit = st.people * config.ARMY_RECRUIT_SHARE
@@ -814,6 +1145,235 @@ def conscript(world: World, country: Country) -> float:
                                 min(excess, st.people * config.ARMY_DISCHARGE_SHARE))
         return -gone
     return 0.0
+
+
+def commission_officers(world: World, country: Country) -> float:
+    """НАЙМ ОФИЦЕРОВ ИЗ ВЫСШЕГО ОБЩЕСТВА — и роспуск лишних.
+
+    Устроен ровно как призыв солдат (см. conscript), с тремя отличиями, и в них
+    вся разница между рядовым и командиром:
+
+      ОТКУДА. Не из деревни и не из бедноты, а из высшего общества и, если его
+          не хватило, из среднего класса (config.OFFICER_POOL). Командовать
+          учат, и патент достаётся тому, у кого есть образование и положение;
+      ПОЧЁМ. Высший класс живёт лучше всех в стране, и перебить его привычный
+          доход стоит дорого — отсюда и кратное жалованье офицера. Скупому
+          лидеру высшее общество откажет, и корпус придётся набирать из
+          среднего класса: его больше, но и приходит он с более низких доходов,
+          а значит и служит охотнее лишь до тех пор, пока платят;
+      СКОЛЬКО. Не больше штата (officer_target_share) и не больше того, что
+          тянет военный бюджет: офицер содержится из той же суммы, что и
+          солдаты, — каждый патент это несколько несодержанных рядовых.
+
+    Сословие отдаёт за пейдей не больше OFFICER_RECRUIT_SHARE своих людей:
+    офицерский корпус нельзя восполнить одним приказом, и после большой войны
+    армия ходит обезглавленной ещё долго.
+
+    Возвращает изменение численности (плюс — набрали, минус — распустили).
+    """
+    cities = country_cities(world, country)
+    pop = sum(c.population for c in cities)
+    country.last_officers_hired = 0.0
+    if pop <= EPS:
+        return 0.0
+    officers = sum(c.s("officers").people for c in cities)
+    gap = affordable_officers(world, country) - officers
+    pay = officer_pay(country)
+
+    if gap > EPS:
+        came = 0.0
+        for city in cities:
+            need = gap * (city.population / pop)
+            for key in config.OFFICER_POOL:
+                if need <= EPS:
+                    break
+                st = city.s(key)
+                if st.people <= EPS:
+                    continue
+                if pay < _officer_wage_bar(country, st):
+                    continue
+                limit = st.people * config.OFFICER_RECRUIT_SHARE
+                moved = move_people(st, city.s("officers"), min(limit, need))
+                need -= moved
+                came += moved
+        country.last_officers_hired = came
+        return came
+
+    if gap < -EPS:
+        gone = 0.0
+        for city in cities:
+            st = city.s("officers")
+            if st.people <= EPS:
+                continue
+            excess = -gap * (city.population / pop)
+            # Отставной офицер уходит в средний класс, а не обратно в высшее
+            # общество: чин остался, состояние — нет. Поэтому долгие качели
+            # «набрали — распустили» медленно размывают верхушку общества, и
+            # держать штат ровным лидеру выгоднее, чем дёргать его туда-сюда.
+            gone += move_people(st, city.s("town_mid"),
+                                min(excess, st.people * config.OFFICER_DISCHARGE_SHARE))
+        return -gone
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Фронты
+# ---------------------------------------------------------------------------
+def front_key(country_id: int) -> str:
+    """Ключ фронта в снимке мира. Строка — потому что снимок это JSON."""
+    return str(int(country_id))
+
+
+def fronts_of(world: World, country: Country) -> list[int]:
+    """С кем у страны вообще может быть фронт — со всеми соседями по карте."""
+    return world.neighbor_countries(country.id)
+
+
+def front_soldiers(country: Country, enemy_id: int) -> float:
+    return max(0.0, country.fronts.get(front_key(enemy_id), 0.0))
+
+
+def front_officers(country: Country, enemy_id: int) -> float:
+    return max(0.0, country.front_officers.get(front_key(enemy_id), 0.0))
+
+
+def normalize_fronts(world: World, country: Country) -> None:
+    """Привести расстановку в соответствие с тем, что у страны реально есть.
+
+    Расстановка живёт своей жизнью и легко расходится с действительностью:
+    солдаты гибнут в бою, разбегаются от недоплаты, распускаются по сокращению
+    бюджета, а сосед, против которого стоял фронт, может вовсе исчезнуть с
+    карты. Поэтому перед каждым пейдеем расстановка приводится к трём правилам:
+    фронты только против нынешних соседей, на фронте не больше людей, чем есть
+    в армии, и при нехватке все фронты ужимаются в одинаковой доле — оголять
+    одно направление ради другого должен лидер, а не арифметика.
+    """
+    live = {front_key(x) for x in fronts_of(world, country)}
+    for holder in (country.fronts, country.front_officers):
+        for key in [k for k in holder if k not in live]:
+            holder.pop(key, None)
+
+    for holder, total in ((country.fronts, army_size(world, country)),
+                          (country.front_officers, officer_size(world, country))):
+        for key in list(holder):
+            holder[key] = max(0.0, holder[key])
+            if holder[key] <= EPS:
+                holder.pop(key, None)
+        placed = sum(holder.values())
+        if placed > total + EPS and placed > EPS:
+            scale = total / placed
+            for key in list(holder):
+                holder[key] *= scale
+
+
+def free_soldiers(world: World, country: Country) -> float:
+    """Резерв: люди, не поставленные ни на один фронт."""
+    return max(0.0, army_size(world, country) - sum(country.fronts.values()))
+
+
+def free_officers(world: World, country: Country) -> float:
+    return max(0.0, officer_size(world, country)
+               - sum(country.front_officers.values()))
+
+
+def deploy_reserve(world: World, country: Country, enemy_id: int) -> float:
+    """Выдвинуть весь свободный резерв на указанный фронт.
+
+    Вызывается при объявлении войны — и для обеих сторон сразу. Без этого
+    страна, которой война объявлена, встречала бы врага пустой границей просто
+    потому, что лидер не успел ничего нажать (а у AI-государств нажимать
+    некому). Войска с ДРУГИХ фронтов при этом не трогаются: снимать их —
+    отдельное решение лидера, и оно должно чего-то стоить.
+    """
+    key = front_key(enemy_id)
+    moved = free_soldiers(world, country)
+    if moved > EPS:
+        country.fronts[key] = country.fronts.get(key, 0.0) + moved
+    officers = free_officers(world, country)
+    if officers > EPS:
+        country.front_officers[key] = country.front_officers.get(key, 0.0) + officers
+    return moved
+
+
+def set_front(world: World, country: Country, enemy_id: int,
+              soldiers: float | None = None,
+              officers: float | None = None) -> dict:
+    """Приказ лидера: столько-то людей на фронт против такого-то соседа.
+
+    Взять их можно из резерва и с других фронтов, но не мгновенно: за пейдей с
+    каждого направления снимается не больше config.FRONT_MOVE_SHARE стоящих
+    там людей. Резерв идёт первым — он ни от кого не прикрывает, — и только
+    когда его не хватило, начинают оголять соседние фронты, начиная с самых
+    многолюдных.
+
+    Ограничение на переброску и есть суть механики. Будь она мгновенной, фронты
+    превратились бы в одну кнопку «весь кулак сюда», нажимаемую в последний
+    момент, и никакого выбора направления не осталось бы.
+    """
+    normalize_fronts(world, country)
+    key = front_key(enemy_id)
+    if enemy_id not in fronts_of(world, country):
+        return {"soldiers": front_soldiers(country, enemy_id),
+                "officers": front_officers(country, enemy_id),
+                "moved": 0.0, "short": 0.0,
+                "error": "С этим государством нет общей границы"}
+
+    result = {"moved": 0.0, "short": 0.0}
+    for holder, want, total_free in (
+            (country.fronts, soldiers, free_soldiers(world, country)),
+            (country.front_officers, officers, free_officers(world, country))):
+        if want is None:
+            continue
+        want = max(0.0, float(want))
+        have = max(0.0, holder.get(key, 0.0))
+        if want <= have:
+            # Отвод назад в резерв тоже не мгновенен: тем же темпом.
+            back = min(have - want, have * config.FRONT_MOVE_SHARE)
+            holder[key] = have - back
+            result["moved"] += back
+            continue
+
+        need = want - have
+        take = min(need, total_free)          # сперва резерв
+        need -= take
+        if need > EPS:
+            # затем — с других фронтов, начиная с самых многолюдных
+            donors = sorted((k for k in holder if k != key),
+                            key=lambda k: -holder[k])
+            for other in donors:
+                if need <= EPS:
+                    break
+                can = holder[other] * config.FRONT_MOVE_SHARE
+                give = min(can, need)
+                holder[other] -= give
+                take += give
+                need -= give
+        holder[key] = have + take
+        result["moved"] += take
+        result["short"] += max(0.0, need)
+
+    normalize_fronts(world, country)
+    result["soldiers"] = front_soldiers(country, enemy_id)
+    result["officers"] = front_officers(country, enemy_id)
+    return result
+
+
+def command_quality(officers: float, soldiers: float) -> float:
+    """КАЧЕСТВО КОМАНДОВАНИЯ на фронте — от COMMAND_MIN до COMMAND_MAX.
+
+    Меряется одним: хватает ли на стоящих здесь солдат положенных им по штату
+    офицеров (config.OFFICER_TARGET_SHARE). Хватает — потолок; нет ни одного —
+    единица процента, то есть почти ничего.
+
+    Считается именно ПО ФРОНТУ, а не по стране, и это главное в механике:
+    офицеры, оставленные в тылу или расставленные по спокойным границам, не
+    командуют никем. Держать их надо там, где будет бой.
+    """
+    if soldiers <= EPS:
+        return 0.0
+    target = max(config.OFFICER_TARGET_SHARE, 1e-9)
+    filled = min(1.0, (officers / soldiers) / target)
+    return config.COMMAND_MIN + (config.COMMAND_MAX - config.COMMAND_MIN) * filled
 
 
 def mobilize(world: World, country: Country) -> float:
@@ -864,13 +1424,30 @@ def mobilize(world: World, country: Country) -> float:
     return taken
 
 
+def army_supply_purse(country: Country) -> float:
+    """Сколько казна вправе потратить на закупку оружия и снарядов за пейдей.
+
+    Предохранитель к мгновенному пополнению: недостача закрывается за один
+    пейдей, но не ценой всей казны. Без него страна, спешно вооружающая армию,
+    выгребала бы остаток до нуля — и та же армия следующим пейдеем разошлась бы
+    по домам, не получив жалованья (оно платится первой статьёй, из того же
+    остатка).
+    """
+    return max(0.0, country.treasury) * config.ARMY_SUPPLY_TREASURY_SHARE
+
+
 def restock_shells(world: World, country: Country, city: City, market,
                    share: float = 1.0) -> float:
     """Казна закупает снаряды в армейский резерв на рынке одной области.
 
     Именно здесь у снарядного завода появляется покупатель: армия сама на
-    рынок не ходит, за неё платит государство. Заказ делится между областями
-    страны пропорционально их населению — армия снабжается отовсюду.
+    рынок не ходит, за неё платит государство.
+
+    Пополнение мгновенное: за пейдей закрывается вся недостача, сколько её
+    закроют прилавок и казна. Области при этом обходятся подряд, а не по
+    разнарядке от населения: если снаряды лежат в одной области, а половина
+    народу живёт в другой, разнарядка оставляла бы армию полупустой при полных
+    складах.
     """
     gap = shells_gap(world, country)
     if gap <= EPS or share <= EPS:
@@ -879,7 +1456,7 @@ def restock_shells(world: World, country: Country, city: City, market,
     want = gap * config.SHELLS_RESTOCK_SHARE * share
     price = lg(city, "shells").price
     if price > EPS:
-        want = min(want, max(0.0, country.treasury) / price)
+        want = min(want, army_supply_purse(country) / price)
     if want <= EPS:
         return 0.0
 
@@ -945,6 +1522,9 @@ def restock_weapons(world: World, country: Country, city: City, market,
     Здесь у оружейного завода и появляется покупатель с настоящими деньгами.
     Раньше им был карман солдата, которому одной винтовки стоило дороже двух
     жалований, — потому завод и не окупался.
+
+    Как и со снарядами, недостача закрывается за один пейдей целиком: мера —
+    запас на прилавках и деньги в казне, а не квота.
     """
     want = weapons_wanted(world, country) * share
     if want <= EPS:
@@ -952,7 +1532,7 @@ def restock_weapons(world: World, country: Country, city: City, market,
 
     price = lg(city, "weapons").price
     if price > EPS:
-        want = min(want, max(0.0, country.treasury) / price)
+        want = min(want, army_supply_purse(country) / price)
     if want <= EPS:
         return 0.0
 
@@ -984,24 +1564,135 @@ def update_army_equip(world: World, country: Country) -> None:
                           else max(0.0, min(1.0, country.army_weapons / target)))
 
 
-def army_strength(world: World, country: Country) -> float:
-    """Боевая сила армии: люди × вооружение × снабжение × дух.
-
-    Толпа без оружия и снарядов почти ничего не стоит — отсюда и смысл всей
-    оружейной промышленности.
-    """
+def army_morale(world: World, country: Country) -> float:
+    """Средний дух армии, взвешенный по числу солдат."""
     cities = country_cities(world, country)
     soldiers = sum(c.s("soldiers").people for c in cities)
     if soldiers <= EPS:
         return 0.0
-    morale = (sum(c.s("soldiers").satisfaction * c.s("soldiers").people
-                  for c in cities) / soldiers) if soldiers > EPS else 0.0
+    return sum(c.s("soldiers").satisfaction * c.s("soldiers").people
+               for c in cities) / soldiers
+
+
+def combat_strength(world: World, country: Country, soldiers: float,
+                    officers: float) -> float:
+    """Чего стоит в бою отряд из стольких-то солдат при стольких-то офицерах.
+
+    Общая формула для всего: и для армии страны целиком, и для отдельного
+    фронта. Множители по порядку — люди, вооружённость, снабжение снарядами,
+    дух и КАЧЕСТВО КОМАНДОВАНИЯ. Толпа без оружия и снарядов почти ничего не
+    стоит, а без офицеров она вдобавок и не умеет ничего: полностью
+    укомплектованный командирами отряд стоит двух с половиной безофицерских.
+
+    Вооружённость и снабжение — общестрановые: арсенал и снарядные склады у
+    страны одни, и делить их по фронтам было бы честно, но добавило бы игроку
+    ещё одну расстановку поверх той, что уже есть. Здесь достаточно того, что
+    голодная по снарядам армия слаба на всех фронтах разом.
+    """
+    if soldiers <= EPS:
+        return 0.0
     equip = config.EQUIP_STRENGTH_MIN + (1.0 - config.EQUIP_STRENGTH_MIN) * \
         max(0.0, min(1.0, country.army_equip))
-    need = soldiers * config.SHELLS_PER_SOLDIER_BATTLE
+    need = army_size(world, country) * config.SHELLS_PER_SOLDIER_BATTLE
     supply = 1.0 if need <= EPS else min(1.0, country.army_shells / need)
     supply = config.SUPPLY_STRENGTH_MIN + (1.0 - config.SUPPLY_STRENGTH_MIN) * supply
-    return soldiers * equip * supply * (0.6 + 0.6 * morale)
+    morale = army_morale(world, country)
+    command = 1.0 + command_quality(officers, soldiers)
+    return soldiers * equip * supply * (0.6 + 0.6 * morale) * command
+
+
+def army_strength(world: World, country: Country) -> float:
+    """Чего стоила бы вся армия страны, собранная в один кулак.
+
+    Величина справочная — для витрин и для оценки соседа. В бою участвует не
+    она, а сила КОНКРЕТНОГО ФРОНТА (front_strength): войска, оставленные на
+    других границах и в резерве, в сражении не помогают ничем.
+    """
+    return combat_strength(world, country, army_size(world, country),
+                           officer_size(world, country))
+
+
+def front_strength(world: World, country: Country, enemy_id: int) -> float:
+    """Чего стоит фронт против конкретного государства.
+
+    Это и есть та сила, которая дерётся. Пустой фронт — пустая граница: ни
+    резерв, ни полки, стоящие против другого соседа, за него не вступятся.
+    """
+    return combat_strength(world, country,
+                           front_soldiers(country, enemy_id),
+                           front_officers(country, enemy_id))
+
+
+# ---------------------------------------------------------------------------
+# Приток населения за новых игроков
+# ---------------------------------------------------------------------------
+def queue_settlers(country: Country, rng: random.Random) -> dict[str, float]:
+    """Записать в очередь приток людей за одного нового промышленника.
+
+    Рынок сбыта — это люди, и пока население зависело от одной рождаемости,
+    каждый новый игрок приходил делить УЖЕ ИМЕЮЩИЙСЯ спрос: второй швейной
+    фабрике в стране продавать было некому, и вся выгода доставалась тому, кто
+    успел построиться раньше. Теперь вместе с промышленником в страну приходит
+    и его рынок.
+
+    Приходят люди ПО ВСЕМ СОСЛОВИЯМ сразу, а не одними рабочими: заводу нужны
+    не только руки, но и покупатели, а покупает вся страна. Сколько именно
+    приведёт за собой конкретный игрок — величина случайная, и своя по каждому
+    сословию: одному достанется деревня, другому городская беднота.
+    """
+    swing = config.JOIN_GROWTH_SWING
+    batch: dict[str, float] = {}
+    for key, base in config.POPULATION_PER_PLAYER.items():
+        n = base * rng.uniform(1.0 - swing, 1.0 + swing)
+        if n <= EPS:
+            continue
+        batch[key] = n
+        country.settlers[key] = country.settlers.get(key, 0.0) + n
+    # Отсчёт начинается заново: подошедший позже игрок растягивает и остаток
+    # прежнего притока, а не догоняет его отдельной очередью.
+    country.settlers_left = config.JOIN_GROWTH_TICKS
+    return batch
+
+
+def settle_newcomers(world: World, country: Country) -> float:
+    """Впустить очередную долю притока. Один вызов — один пейдей.
+
+    Приток размазан по JOIN_GROWTH_TICKS пейдеям нарочно: свались он разом,
+    рынок получил бы ступеньку спроса, цены прыгнули бы, а половина новичков
+    осталась бы без хлеба в тот же пейдей. Люди приезжают НЕ ГОЛЫМИ — с теми же
+    сбережениями на душу, что у их сословия на месте: иначе приток размывал бы
+    кассу сословия и делал страну беднее ровно тогда, когда она растёт.
+    """
+    if country.settlers_left <= 0 or not country.settlers:
+        return 0.0
+    cities = country_cities(world, country)
+    if not cities:
+        country.settlers, country.settlers_left = {}, 0
+        return 0.0
+
+    pop = sum(c.population for c in cities)
+    share = 1.0 / country.settlers_left
+    arrived = 0.0
+    for key in list(country.settlers):
+        batch = country.settlers[key] * share
+        if batch <= EPS:
+            country.settlers.pop(key, None)
+            continue
+        country.settlers[key] -= batch
+        arrived += batch
+        for city in cities:
+            part = batch * (city.population / pop if pop > EPS
+                            else 1.0 / len(cities))
+            st = city.s(key)
+            per_head = (st.cash / st.people if st.people > 1.0
+                        else config.STRATA[key]["level"] * 0.6)
+            st.people += part
+            st.cash += part * per_head
+
+    country.settlers_left -= 1
+    if country.settlers_left <= 0:
+        country.settlers, country.settlers_left = {}, 0
+    return arrived
 
 
 def demography(world: World, city: City) -> None:

@@ -19,6 +19,7 @@
     <input id="p" type="password" autocomplete="current-password" placeholder="••••••">
     <label for="regCountry">Государство (для регистрации)</label>
     <select id="regCountry"></select>
+    <div class="sub" id="joinNote" style="margin:10px 0 0;font-size:12.5px"></div>
     <div class="row">
         <button class="primary" onclick="doAuth('register')">Начать дело</button>
         <button onclick="doAuth('login')">Войти</button>
@@ -120,6 +121,7 @@
                 </tr></thead>
                 <tbody id="marketRows"></tbody>
             </table></div>
+            <p class="muted legend-note" id="marginLegend"></p>
         </details>
         <div class="grid two">
             <details class="card" data-sec="market-price">
@@ -144,15 +146,25 @@
             <summary>Как устроена цена</summary>
             <p class="muted">
                 У каждого товара есть <b style="color:var(--text)">якорь</b> — сглаженная
-                себестоимость производства. Вокруг него цена гуляет в мягком коридоре
-                от 55% до 400% себестоимости: чем ближе к краю, тем труднее её туда
-                продавить, поэтому границы недостижимы, но дефицитный товар честно
-                дорожает втрое, а залежавшийся — падает ниже себестоимости.
+                себестоимость производства с обычной наценкой, то есть НОРМАЛЬНАЯ ЦЕНА.
+                Вокруг неё цена гуляет в мягком коридоре от 55% до 400% себестоимости:
+                чем ближе к краю, тем труднее её туда продавить, поэтому границы
+                недостижимы, но дефицитный товар честно дорожает втрое, а
+                залежавшийся — падает ниже себестоимости.
+            </p>
+            <p class="muted">
+                В полосе «Коридор» засечка посередине — это и есть нормальная цена, а
+                шкала логарифмическая и одинаковая в обе стороны: точка слева от
+                засечки значит «дешевле нормы», справа — «дороже». Раньше полоса была
+                линейной по деньгам, и нормальная цена оказывалась почти у левого
+                края — товар, продающийся ровно как надо, выглядел лежащим на дне.
             </p>
             <p class="muted">
                 У товаров, которых в стране ещё никто не делает, себестоимость
                 считается по рецепту — от цен на сырьё и стоимости труда. Большая
-                наценка на таком товаре и есть приглашение построить завод.
+                наценка на таком товаре и есть приглашение построить завод — потому
+                таблица и красит её зелёным и золотым, а не красным: смотрит она
+                глазами промышленника, а не покупателя.
             </p>
         </details>
     </section>
@@ -232,19 +244,32 @@
             <details class="help">
                 <summary>кто чем живёт</summary>
                 <p class="muted">
-                    Крестьяне кормятся с земли и потому почти не покупают еду. Кустари —
-                    те же селяне, взявшиеся за ремесло: они держат страну в одежде и мебели,
+                    Крестьяне растят зерно и им же кормятся, поэтому хлеб на рынке
+                    покупают мало. Всё, что выше зерна на лестнице еды — продукты,
+                    продовольствие, мясо, — они уже берут за деньги, и чем больше
+                    денег, тем выше их уровень жизни. Кустари — те же селяне,
+                    взявшиеся за ремесло: они держат страну в одежде и мебели,
                     пока нет фабрик. Горожане живут торговлей, ремеслом и искусством —
                     производят услуги, которые покупают все остальные.
                     Рабочие приходят на заводы за зарплатой и обратно в деревню уже
                     не возвращаются — отсюда и берётся безработица.
+                </p>
+                <p class="muted">
+                    <b>Крестьяне на фермах — не рабочие.</b> «Ферма» нанимает деревню,
+                    не меняя ей сословия: человек выходит на чужое поле за жалованье
+                    вместо своего за хлеб и в город не переселяется. Поэтому в
+                    безработицу такие руки не попадают — не взяли, так вернулся на свой
+                    надел. Ровно поэтому и нанять их можно только за плату не ниже той,
+                    что даёт собственная земля.
                 </p>
             </details>
             <div class="grid stats">
                 <div class="stat"><span class="k">Рабочих всего</span><span class="v num" id="pWorkers">—</span></div>
                 <div class="stat"><span class="k">Заняты</span><span class="v num" id="pEmployed">—</span></div>
                 <div class="stat"><span class="k">Без работы</span><span class="v num" id="pIdle">—</span></div>
+                <div class="stat"><span class="k">Крестьян на фермах</span><span class="v num" id="pFarm">—</span></div>
                 <div class="stat"><span class="k">Чтобы нанять, платите от</span><span class="v num good" id="pWage">—</span></div>
+                <div class="stat"><span class="k">Крестьянина — от</span><span class="v num good" id="pFarmWage">—</span></div>
                 <div class="stat"><span class="k">Уровень жизни страны</span><span class="v num" id="pSol">—</span></div>
             </div>
             <div class="tw"><table id="tStrata">
@@ -435,6 +460,36 @@
 
     <!-- ---------- страна ---------- -->
     <section class="page" id="page-country">
+        <details class="card" data-sec="country-size" data-main>
+            <summary>Государство — <span id="cSizeName">—</span></summary>
+            <details class="help">
+                <summary>откуда в стране берутся люди</summary>
+                <p class="muted">
+                    Население — это рынок сбыта, и растёт оно из двух источников.
+                    Первый работает всегда — <b>довольство</b>: сытая страна
+                    прибавляет людей сама, голодная убывает.
+                </p>
+                <p class="muted">
+                    Второй работает только в самом начале партии. Пока идёт
+                    <b>заселение мира</b> — первые шесть пейдеев, — за каждым
+                    промышленником, открывшим дело в вашем государстве, в него
+                    переселяется и его рынок: <b>350 тысяч человек</b> всех сословий
+                    сразу, приходящих в течение нескольких пейдеев. Мир начинается
+                    двадцатью одинаковыми крестьянскими странами, и стартовый размер
+                    вашей определяется не жребием, а тем, скольких она успела
+                    привлечь. Дальше окно закрывается: опоздавшие приходят на готовый
+                    рынок — тот, что вырастили первые.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Размер</span><span class="v" id="cSize">—</span></div>
+                <div class="stat"><span class="k">Население</span><span class="v num" id="cPop">—</span></div>
+                <div class="stat"><span class="k">До следующей ступени</span><span class="v num" id="cSizeNext">—</span></div>
+                <div class="stat"><span class="k">Переселенцев в пути</span><span class="v num" id="cSettlers">—</span></div>
+                <div class="stat"><span class="k">Заселение мира</span><span class="v" id="cJoinWindow">—</span></div>
+                <div class="stat"><span class="k">Промышленников</span><span class="v num" id="cPlayersN">—</span></div>
+            </div>
+        </details>
         <details class="card" data-sec="country-cities" data-main>
             <summary>Области государства</summary>
             <details class="help">
@@ -480,46 +535,43 @@
             <summary>Экономический курс</summary>
             <p class="muted" id="govNote" style="font-size:13px;margin-bottom:16px"></p>
             <div class="grid fields">
-                <div><label class="muted" style="font-size:12px">Налог на прибыль, %</label>
+                <div><label class="muted" style="font-size:12px">
+                        Налог на прибыль, %</label>
                      <input id="gCorp" type="number" step="1" min="0" max="75"></div>
-                <div><label class="muted" style="font-size:12px">Налог с продаж, %</label>
+                <div><label class="muted" style="font-size:12px">
+                        Налог с продаж, %</label>
                      <input id="gSales" type="number" step="1" min="0" max="50"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Удерживается с фонда оплаты труда предприятий и со строек. Платят его только рабочие — у прочих сословий зарплаты нет">
+                <div><label class="muted" style="font-size:12px">
                         Подоходный налог, %</label>
                      <input id="gInc" type="number" step="1" min="0" max="60"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Твёрдая сумма с каждой души. Ложится на всех поровну, а потому тяжелее всего — на бедные сословия. Идёт в казну даже когда в стране ничем не торгуют">
+                <div><label class="muted" style="font-size:12px">
                         Подушная подать, ₡ с души</label>
                      <input id="gPoll" type="number" step="0.05" min="0" max="500"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Доля рыночной выручки крестьян и кустарей. Берётся с тех, кто не получает зарплаты и потому не платит подоходного. В неурожай уменьшается сам собой">
+                <div><label class="muted" style="font-size:12px">
                         Оброк с деревни, %</label>
                      <input id="gTithe" type="number" step="1" min="0" max="50"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Доля кассы сословия за пейдей. Единственный налог с накопленного, а не с дохода: тяжелее всех для высшего класса. Гонит лежачие деньги в оборот">
+                <div><label class="muted" style="font-size:12px">
                         Налог на сбережения, %</label>
                      <input id="gWealth" type="number" step="0.5" min="0" max="20"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Надбавка к налогу с продаж на мясо, вино, дорогое платье, обстановку и оперу. Платит только тот, кто уже живёт лучше обычного">
+                <div><label class="muted" style="font-size:12px">
                         Акциз на роскошь, %</label>
                      <input id="gExcise" type="number" step="1" min="0" max="80"></div>
-                <div><label class="muted" style="font-size:12px">Госрасходы, % казны за пейдей</label>
+                <div><label class="muted" style="font-size:12px">
+                        Госрасходы, % казны за пейдей</label>
                      <input id="gSpend" type="number" step="1" min="0" max="100"></div>
-                <div><label class="muted" style="font-size:12px">Земельная рента, %</label>
+                <div><label class="muted" style="font-size:12px">
+                        Земельная рента, %</label>
                      <input id="gRent" type="number" step="1" min="0" max="50"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Доля стоимости вывезенного, оседающая в казне. Кормит казну с каждой сделки, но отбивает у своих охоту вывозить">
+                <div><label class="muted" style="font-size:12px">
                         Вывозная пошлина, %</label>
                      <input id="gTariff" type="number" step="1" min="0" max="60"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="Защита своих производителей: чужой товар обходится в мировую цену плюс эту долю. Пока дома дешевле — импорт не придёт">
+                <div><label class="muted" style="font-size:12px">
                         Ввозная пошлина, %</label>
                      <input id="gImport" type="number" step="1" min="0" max="60"></div>
-                <div><label class="muted" style="font-size:12px">МРОТ, ₡</label>
+                <div><label class="muted" style="font-size:12px">
+                        МРОТ, ₡</label>
                      <input id="gMin" type="number" step="1" min="0"></div>
-                <div><label class="muted" style="font-size:12px"
-                        title="До какого минуса предприятиям позволено работать в долг">
+                <div><label class="muted" style="font-size:12px">
                         Порог банкротства, ₡</label>
                      <input id="gBank" type="number" step="100000" max="0"></div>
                 <div style="display:flex;align-items:center;gap:8px;align-self:end">
@@ -529,6 +581,13 @@
             </div>
             <div style="margin-top:16px"><button class="primary" id="govSave"
                  onclick="savePolicy()">Утвердить курс</button></div>
+            <details class="help" open>
+                <summary>что делает каждый рычаг и на кого ложится</summary>
+                <div class="tw"><table id="tLevers">
+                    <thead><tr><th>Рычаг</th><th>Платит</th><th>Что делает</th></tr></thead>
+                    <tbody id="leverRows"></tbody>
+                </table></div>
+            </details>
         </details>
         <details class="card" data-sec="gov-elections">
             <summary>Выборы лидера</summary>
@@ -657,26 +716,98 @@
             <p class="muted" id="warNote" style="font-size:13px;margin-bottom:16px"></p>
             <div class="grid stats">
                 <div class="stat"><span class="k">Солдат</span><span class="v num" id="aSold">—</span></div>
+                <div class="stat" title="Офицеры не прибавляют армии штыков — они прибавляют ей умения. Содержание офицера кратно солдатскому и идёт из того же военного бюджета"><span class="k">Офицеров</span><span class="v num" id="aOff">—</span></div>
+                <div class="stat" title="Качество командования: от 1% до 150% к боевой силе фронта. Полное качество даёт офицерский корпус в 5% от числа солдат — но только тех офицеров, что назначены на этот фронт"><span class="k">Командование</span><span class="v num" id="aCmd">—</span></div>
                 <div class="stat"><span class="k">Бюджет тянет</span><span class="v num" id="aAfford">—</span></div>
                 <div class="stat" title="Запас оружия на армейских складах к штатному. Это и есть боеспособность: закупленное оружие остаётся у армии, а не сгорает за пейдей"><span class="k">Вооружены</span><span class="v num" id="aEquip">—</span></div>
                 <div class="stat" title="Сколько оружия армия списывает и докупает за пейдей. Это и есть спрос на рынке — от него зависит цена и доход оружейных заводов"><span class="k">Расход оружия</span><span class="v num" id="aWeapUse">—</span></div>
                 <div class="stat"><span class="k">Снаряды</span><span class="v num" id="aShells">—</span></div>
                 <div class="stat"><span class="k">Боевая сила</span><span class="v num" id="aStr">—</span></div>
                 <div class="stat"><span class="k">Расход казны</span><span class="v num" id="aCost">—</span></div>
+                <div class="stat" title="Офицеры гибнут на фронте чаще солдат — командовать приходится с передовой. Восполняется корпус наймом из высшего общества, и не за один пейдей"><span class="k">Убыль офицеров</span><span class="v num" id="aOffLoss">—</span></div>
+                <div class="stat" title="Сколько людей в высшем обществе и среднем классе готовы взять патент за нынешнее жалованье. Это предел найма, не считая денег"><span class="k">Пойдут в офицеры</span><span class="v num" id="aOffPool">—</span></div>
             </div>
             <div class="grid fields">
                 <div><label class="muted" style="font-size:12px">Военный бюджет, ₡ за пейдей</label>
                      <input id="aBudget" type="number" step="1000" min="0"></div>
                 <div><label class="muted" style="font-size:12px">Жалованье солдату, ₡</label>
                      <input id="aPay" type="number" step="1" min="0"></div>
+                <div><label class="muted" style="font-size:12px">Жалованье офицеру, ₡</label>
+                     <input id="aOffPay" type="number" step="1" min="0">
+                     <span class="muted" style="font-size:11px" id="aOffPayHint"></span></div>
+                <div><label class="muted" style="font-size:12px">Штат офицеров, % от солдат</label>
+                     <input id="aOffTarget" type="number" step="0.5" min="0">
+                     <span class="muted" style="font-size:11px" id="aOffTargetHint"></span></div>
                 <div style="align-self:end" class="muted" id="aHint"></div>
             </div>
+            <details class="help">
+                <summary>откуда берутся офицеры</summary>
+                <p class="muted">
+                    Офицеров <b>нанимают из высшего общества</b> — так же, как солдат
+                    призывают из деревни и городской бедноты, только сословия другие:
+                    патент достаётся тому, у кого есть образование и положение. Сперва
+                    зовут высший класс, и лишь если ему мало платят или его не хватило —
+                    средний.
+                </p>
+                <p class="muted">
+                    Высший класс живёт лучше всех в стране, и служить за гроши не пойдёт:
+                    жалованье должно перебивать его привычный доход. Отсюда и кратная
+                    ставка. Скупому лидеру достаётся корпус из среднего класса — он
+                    набирается медленнее, — а щедрому приходится содержать армию поменьше:
+                    офицеры идут из того же военного бюджета.
+                </p>
+                <p class="muted">
+                    <b>На войне офицеры гибнут чаще солдат</b> — командовать приходится с
+                    передовой. Каждый бой сам собой роняет качество командования на
+                    следующем пейдее, а восполнить корпус разом нельзя: сословие отдаёт
+                    в офицеры лишь малую долю своих людей за пейдей. Затяжная война
+                    обезглавливает армию раньше, чем обескровливает, — потому и держат
+                    штат с запасом сверх уставных 5%.
+                </p>
+            </details>
             <div class="acts" style="margin-top:16px">
                 <button class="primary" id="armySave" onclick="saveArmy()">Утвердить военный бюджет</button>
                 <button class="danger" id="mobBtn" onclick="mobilize()">Объявить мобилизацию</button>
                 <button id="demobBtn" onclick="demobilize()">Отменить мобилизацию</button>
             </div>
             <div id="mobState" style="margin-top:12px"></div>
+        </details>
+
+        <details class="card" data-sec="war-fronts">
+            <summary>Фронты — где стоит армия</summary>
+            <details class="help">
+                <summary>как устроены фронты</summary>
+                <p class="muted">
+                    Армия не одно число на страну: она расставлена по границам, по фронту
+                    на каждого соседа. В бою с государством N дерутся <b>только те войска,
+                    что стоят на фронте против N</b>. Резерв в тылу и полки на других
+                    границах не помогают ничем — сколько бы их ни было.
+                </p>
+                <p class="muted">
+                    Держать всех на всех границах сразу не выйдет: приходится угадывать,
+                    откуда ударят. Переброска не мгновенна — за пейдей с направления
+                    снимается не больше <b id="fMoveShare">34%</b> стоящих там людей,
+                    поэтому решать надо заранее, а ошибку исправлять несколько пейдеев.
+                    Резерв идёт первым, и только потом оголяются соседние фронты.
+                </p>
+                <p class="muted">
+                    <b>Офицеры расставляются отдельно.</b> Качество командования считается
+                    по каждому фронту свое: офицеры, оставленные в тылу или на спокойной
+                    границе, не командуют никем. Столбец «у соседа» — разведка: чужие
+                    полки видно приблизительно, с округлением.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">В резерве солдат</span><span class="v num" id="aReserve">—</span></div>
+                <div class="stat"><span class="k">В резерве офицеров</span><span class="v num" id="aReserveOff">—</span></div>
+            </div>
+            <div class="tw"><table id="tFronts">
+                <thead><tr><th>Граница</th><th class="right">Солдат</th>
+                    <th class="right">Офицеров</th><th class="right">Командование</th>
+                    <th class="right">Боевая сила</th><th class="right">У соседа</th>
+                    <th>Отношения</th><th></th></tr></thead>
+                <tbody id="frontRows"></tbody>
+            </table></div>
         </details>
 
         <details class="card" id="annexCard" data-sec="war-annex">
@@ -750,6 +881,26 @@
                     <th class="right">Уровней</th><th class="right">Рабочих</th>
                     <th class="right">Прибыль/пейдей</th></tr></thead>
                 <tbody id="topRows"></tbody>
+            </table></div>
+        </details>
+        <details class="card" data-sec="top-countries" data-main>
+            <summary>Государства мира</summary>
+            <details class="help">
+                <summary>что означают ступени размера</summary>
+                <p class="muted" id="sizeLadder"></p>
+                <p class="muted">
+                    Население — это рынок сбыта, поэтому ступень размера говорит о стране
+                    больше, чем казна: в крупной стране есть кому продавать. Растёт оно от
+                    довольства людей и от <b>прихода новых промышленников</b> — за каждым
+                    в страну переселяется его собственный рынок.
+                </p>
+            </details>
+            <div class="tw"><table id="tTopCountries">
+                <thead><tr><th>#</th><th>Государство</th><th>Размер</th>
+                    <th class="right">Население</th><th class="right">Областей</th>
+                    <th class="right">ВВП</th><th class="right">Казна</th>
+                    <th class="right">Армия</th><th class="right">Промышленников</th></tr></thead>
+                <tbody id="topCountryRows"></tbody>
             </table></div>
         </details>
     </section>

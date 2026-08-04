@@ -118,18 +118,63 @@ def main() -> None:
     village_sales = sum(
         max(0.0, supply.get(k, 0.0) - used.get(k, 0.0)) * price[k]
         for k in list(config.PEASANT_YIELD) + list(artisan_crafts))
-    own_food = peasants * config.CONSUMPTION_BASKET["food"]["qty"] \
+    own_grain = peasants * config.CONSUMPTION_BASKET["grain"]["qty"] \
         * config.STRATA["peasants"]["level"]
     print(f"Деревня {peasants + artisans:,.0f}, потребляет на "
           f"{village_eq * basket:,.0f} ₡, продаёт на {village_sales:,.0f} ₡ "
-          f"плюс ест своего на {own_food * price['food']:,.0f} ₡")
+          f"плюс ест своего хлеба на {own_grain * price['grain']:,.0f} ₡")
+
+    # ---------------- лестница еды ----------------
+    # Четыре ступени, от дешёвой сытости к дорогому столу. Здесь видно главное:
+    # во что обходится каждая и насколько она дороже предыдущей.
+    print("\n--- Лестница еды ---")
+    print(f"{'ступень':<18}{'на корзину':>12}{'цена':>10}{'выходит, ₡':>13}"
+          f"{'кто делает':>26}")
+    ladder = [("grain", config.CONSUMPTION_BASKET["grain"]["qty"]),
+              ("provisions", config.CONSUMPTION_BASKET["provisions"]["qty"]),
+              ("meat", config.LUXURY_BASKET["meat"]["qty"])]
+    for key, qty in ladder:
+        makers = [i.name for i in world.industries.values()
+                  if i.output_good == key]
+        if key in config.PEASANT_YIELD:
+            makers.insert(0, "крестьяне")
+        print(f"{world.goods[key].name:<18}{qty:>12.3f}{price[key]:>10.2f}"
+              f"{qty * price[key]:>13.2f}{', '.join(makers) or '—':>26}")
+
+    # ---------------- крестьянский труд на фермах ----------------
+    print("\n--- Ферма: наём крестьян ---")
+    farm = world.industries["farm"]
+    alt = society.peasant_alternative(city)
+    print(f"Своё поле даёт крестьянину {alt:.2f} ₡ за пейдей "
+          f"(зерна {config.PEASANT_YIELD['grain']:.2f} по {price['grain']:.2f} ₡ "
+          f"плюс лес и хлопок)")
+    print(f"На ферму он выйдет от {alt * config.FARM_WAGE_EDGE:.2f} ₡ "
+          f"и выйдет весь от {alt * config.FARM_WAGE_FULL:.2f} ₡")
+    upkeep_per_hand = config.UPKEEP_PER_LEVEL / farm.jobs_per_level
+    print(f"Ферма даёт {farm.output_per_worker:.2f} зерна с человека = "
+          f"{farm.output_per_worker * price['grain']:.2f} ₡ выручки; "
+          f"мест на уровень {farm.jobs_per_level:,}")
+    for mult in (1.0, config.FARM_WAGE_EDGE, config.FARM_WAGE_FULL):
+        wage = alt * mult
+        margin = farm.output_per_worker * price["grain"] - wage - upkeep_per_hand
+        print(f"  при ставке {wage:>6.2f} ₡ хозяину остаётся "
+              f"{margin:>7.2f} ₡ с человека за пейдей")
 
     # ---------------- армия ----------------
     print("\n--- Армия и оружейная промышленность ---")
     soldiers = counts.get("soldiers", 0.0)
-    print(f"Солдат на старте: {soldiers:,.0f} "
-          f"(бюджет {soldiers * config.SOLDIER_PAY_DEFAULT:,.0f} ₡ "
-          f"при ставке {config.SOLDIER_PAY_DEFAULT:.0f} ₡)")
+    officers = counts.get("officers", 0.0)
+    slot = society.soldier_slot_cost(country)
+    print(f"Солдат на старте: {soldiers:,.0f}, офицеров {officers:,.0f} "
+          f"({officers / max(soldiers, 1):.1%} при штате "
+          f"{config.OFFICER_TARGET_SHARE:.0%})")
+    print(f"  место в строю обходится в {slot:.2f} ₡ "
+          f"(солдат {config.SOLDIER_PAY_DEFAULT:.0f} ₡ плюс доля офицера по "
+          f"{society.officer_pay(country):.0f} ₡), "
+          f"бюджет {soldiers * slot:,.0f} ₡")
+    print(f"  качество командования при полном штате: "
+          f"{society.command_quality(officers, soldiers):.0%} к боевой силе фронта; "
+          f"без единого офицера — {config.COMMAND_MIN:.0%}")
     # Склады армии: слева ЗАПАС (вооружённость), справа РАСХОД за пейдей
     # (потребление). Заводы кормит именно правая колонка.
     weapons_need = soldiers * config.WEAPONS_PER_SOLDIER
@@ -164,8 +209,8 @@ def main() -> None:
             continue
         st = city.s(key)
         full = society.normal_basket_value(city, key)
-        own = (config.CONSUMPTION_BASKET["food"]["qty"]
-               * config.STRATA[key]["level"] * price["food"]) if key == "peasants" else 0.0
+        own = (config.CONSUMPTION_BASKET["grain"]["qty"]
+               * config.STRATA[key]["level"] * price["grain"]) if key == "peasants" else 0.0
         buy = max(full - own, 1e-9)
         exp = society.target_expectation(st, buy)
         print(f"{config.STRATA[key]['name']:<20}{full:>13.2f}{buy:>14.2f}"
@@ -180,8 +225,8 @@ def main() -> None:
                 continue
             st = city.s(key)
             full = society.normal_basket_value(city, key)
-            own = (config.CONSUMPTION_BASKET["food"]["qty"]
-                   * config.STRATA[key]["level"] * price["food"]) if key == "peasants" else 0.0
+            own = (config.CONSUMPTION_BASKET["grain"]["qty"]
+                   * config.STRATA[key]["level"] * price["grain"]) if key == "peasants" else 0.0
             if society.target_expectation(st, max(full - own, 1e-9)) >= spec["unlock"]:
                 reached.append(config.STRATA[key]["name"])
         print(f"{world.goods[good].name:<20}{spec['unlock']:>15.2f}"

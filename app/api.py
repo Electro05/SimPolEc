@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import logging
+import random
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -30,7 +32,7 @@ from .economy.engine import (
     resolve_annexation as engine_resolve_annexation,
     run_tick,
 )
-from .economy.pricing import price_bounds
+from .economy.pricing import U_MAX, U_MIN, price_bounds
 from .economy import society
 from .models import Building, Player, World
 
@@ -125,13 +127,35 @@ def register(ctx: Ctx) -> dict:
         country.leader_id = player.id
         player.governor_of = country_id
 
+    # ЗАСЕЛЕНИЕ. В первые config.JOIN_WINDOW_TICKS пейдеев жизни мира вместе с
+    # промышленником в страну приходит и его рынок сбыта: население прирастает
+    # по всем сословиям сразу (см. society.queue_settlers). Так стартовый размер
+    # страны определяется не жребием, а тем, скольких она привлекла: мир
+    # начинается двадцатью одинаковыми крестьянскими странами, и той, которую
+    # выбрали пятеро, покупателей нужно впятеро больше.
+    #
+    # Окно закрывается вместе с началом партии. Дальше страна растёт одной
+    # рождаемостью, а опоздавший приходит на готовый рынок — тот, что вырастили
+    # и застолбили первые.
+    coming = 0.0
+    if w.tick < config.JOIN_WINDOW_TICKS:
+        rng = random.Random((w.tick * 7919 + player.id * 104729) & 0x7FFFFFFF)
+        coming = sum(society.queue_settlers(country, rng).values())
+
     token = new_token()
     w.sessions[token] = player.id
     db.add_event(w.tick, player.id, "join",
-                 f"{username} открывает своё дело в государстве {country.name}")
+                 f"{username} открывает своё дело в государстве {country.name}"
+                 + (f". За {config.JOIN_GROWTH_TICKS} пейдеев в страну прибудет "
+                    f"{coming:,.0f} человек" if coming else ""))
     return {"token": token, "username": username,
             "is_governor": player.is_governor, "country_id": country_id,
-            "country_name": country.name}
+            "country_name": country.name,
+            "settlers": round(coming),
+            "settler_ticks": config.JOIN_GROWTH_TICKS,
+            # Открыто ли ещё окно заселения и сколько пейдеев до его конца
+            "join_window_open": w.tick < config.JOIN_WINDOW_TICKS,
+            "join_window_left": max(0, config.JOIN_WINDOW_TICKS - w.tick)}
 
 
 def login(ctx: Ctx) -> dict:
@@ -238,11 +262,43 @@ def map_view(ctx: Ctx) -> dict:
             "foreign_investment_open": country.foreign_investment_open,
             "regions": len(w.country_regions(country.id)),
             "army": round(society.army_size(w, country)),
+            # Размер страны одним словом: губерния перед тобой или держава.
+            "size": society.size_title(_country_pop(w, country.id)),
+            "size_rank": society.size_rank(_country_pop(w, country.id)),
+            "country_population": round(_country_pop(w, country.id)),
+            # РАЗВЕДКА: сколько солдат сосед держит на фронте ПРОТИВ НАС.
+            # Только против нас — что стоит у него на других границах, нас не
+            # касается и знать неоткуда. Число грубое: точной численности чужих
+            # полков не видно ниоткуда, видно «около стольких-то».
+            "front_vs_me": _front_intel(w, country, mine),
             "at_war": bool(w.wars_of(country.id)),
             "at_war_with_me": mine is not None and w.at_war(mine, country.id),
             "allied_with_me": mine is not None and w.allied(mine, country.id),
         })
     return {"nodes": nodes}
+
+
+def _country_pop(w: World, country_id: int) -> float:
+    return sum(c.population for c in w.cities.values()
+               if c.country_id == country_id)
+
+
+def _front_intel(w: World, country, viewer_id: int | None) -> int | None:
+    """Сколько солдат страна держит против наблюдателя — грубо, «около».
+
+    None означает «нам это неоткуда знать»: смотрим на самих себя или граничим
+    не мы. Точное число не отдаётся намеренно — разведка не всеведуща, и
+    решение «лезть или не лезть» должно приниматься с некоторой неуверенностью.
+    """
+    if viewer_id is None or viewer_id == country.id:
+        return None
+    if country.id not in w.neighbor_countries(viewer_id):
+        return None
+    men = society.front_soldiers(country, viewer_id)
+    if men <= 0:
+        return 0
+    step = max(1.0, men * config.FRONT_INTEL_ROUNDING)
+    return int(round(men / step) * round(step))
 
 
 def countries_list(ctx: Ctx) -> dict:
@@ -257,8 +313,16 @@ def countries_list(ctx: Ctx) -> dict:
                         if p.country_id == cid and not p.is_state)
         rows.append({"id": cid, "name": country.name, "color": country.color,
                      "population": round(pop), "players": players_n,
+                     "size": society.size_title(pop),
+                     "size_rank": society.size_rank(pop),
                      "capital": w.cities[country.capital_city_id].name})
-    return {"countries": rows}
+    # Окно заселения — главное, что должен знать выбирающий страну: пока оно
+    # открыто, его приход приводит в страну 350 тысяч покупателей; закрылось —
+    # он приходит на готовый рынок и делит его с теми, кто успел.
+    return {"countries": rows,
+            "join_window_open": w.tick < config.JOIN_WINDOW_TICKS,
+            "join_window_left": max(0, config.JOIN_WINDOW_TICKS - w.tick),
+            "settlers_per_player": sum(config.POPULATION_PER_PLAYER.values())}
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +344,7 @@ def world_state(ctx: Ctx) -> dict:
         pop = sum(x.population for x in cities) or 1.0
         workers = sum(x.s("workers").people for x in cities)
         ids = {x.id for x in cities}
-        employed = sum(b.employed for b in w.buildings.values() if b.city_id in ids)
+        employed = _factory_employed(w, ids)
         return {
             "population": round(pop),
             "regions": len(cities),
@@ -307,6 +371,11 @@ def world_state(ctx: Ctx) -> dict:
             "treasury": round(c.treasury),
             "unrest": round(max((x.unrest for x in home_cities), default=0.0), 3),
             "revolts": sum(1 for x in home_cities if x.revolt_ticks > 0),
+            # Ступень размера рядом с числом душ: в шапке она и заменяет
+            # восьмизначное число смыслом.
+            "size": society.size_title(home["population"]),
+            "size_rank": society.size_rank(home["population"]),
+            "size_next": _next_size(home["population"]),
         })
     return {
         "tick": w.tick,
@@ -324,11 +393,20 @@ def world_state(ctx: Ctx) -> dict:
     }
 
 
+def _next_size(population: float) -> dict | None:
+    """Следующая ступень размера и сколько душ до неё. None — уже вершина."""
+    for threshold, name in config.COUNTRY_SIZES:
+        if population < threshold:
+            return {"name": name, "at": threshold,
+                    "left": round(threshold - population)}
+    return None
+
+
 def _country_brief(w: World, c) -> dict:
     workers = sum(city.s("workers").people for city in w.cities.values()
                   if city.country_id == c.id)
-    employed = sum(b.employed for b in w.buildings.values()
-                   if w.cities[b.city_id].country_id == c.id)
+    employed = _factory_employed(
+        w, {city.id for city in w.cities.values() if city.country_id == c.id})
     leader = w.players.get(c.leader_id) if c.leader_id else None
     return {
         "id": c.id, "name": c.name, "color": c.color,
@@ -358,6 +436,21 @@ def _country_brief(w: World, c) -> dict:
                                                  if ct.country_id == c.id), 4)
                               if workers > 0 else 0.0,
         "regions": len(w.country_regions(c.id)),
+        "population": round(_country_pop(w, c.id)),
+        # Размер страны словом: по нему сразу видно, губерния перед тобой или
+        # держава, — и он же ступень, до которой стоит дорасти.
+        "size": society.size_title(_country_pop(w, c.id)),
+        "size_rank": society.size_rank(_country_pop(w, c.id)),
+        "size_next": _next_size(_country_pop(w, c.id)),
+        # Приток населения за новых игроков: сколько ещё людей в пути и открыто
+        # ли ещё окно заселения (первые пейдеи жизни мира).
+        "settlers": round(sum(c.settlers.values())),
+        "settlers_left": c.settlers_left,
+        "join_window_open": w.tick < config.JOIN_WINDOW_TICKS,
+        "join_window_left": max(0, config.JOIN_WINDOW_TICKS - w.tick),
+        "settlers_per_player": sum(config.POPULATION_PER_PLAYER.values()),
+        "players": sum(1 for p in w.players.values()
+                       if p.country_id == c.id and not p.is_state),
         "unemployment": round(max(0.0, 1.0 - employed / workers), 4)
                         if workers > 1 else 0.0,
         "leader": leader.username if leader else "AI (без лидера)",
@@ -410,14 +503,82 @@ def _budget_brief(w: World, c) -> dict:
     }
 
 
+def _fronts(w: World, c) -> list[dict]:
+    """Расстановка армии по границам — по одной строке на соседа.
+
+    Здесь же лежит и разведка: сколько людей сосед держит ПРОТИВ НАС. Число
+    даётся грубым (config.FRONT_INTEL_ROUNDING) — не потому, что жалко, а
+    потому, что точная численность чужих полков ниоткуда не берётся: видно
+    примерно, «около десяти тысяч».
+    """
+    rows = []
+    for nb in society.fronts_of(w, c):
+        other = w.countries.get(nb)
+        if other is None or not other.alive:
+            continue
+        mine = society.front_soldiers(c, nb)
+        officers = society.front_officers(c, nb)
+        theirs = society.front_soldiers(other, c.id)
+        step = max(1.0, theirs * config.FRONT_INTEL_ROUNDING)
+        rows.append({
+            "country_id": nb, "name": other.name, "color": other.color,
+            "soldiers": round(mine), "officers": round(officers),
+            "command": round(society.command_quality(officers, mine), 3),
+            # сколько офицеров нужно для полного качества командования
+            "officers_needed": round(mine * config.OFFICER_TARGET_SHARE),
+            "strength": round(society.front_strength(w, c, nb)),
+            # разведка: чужой фронт против нас, округлённый
+            "enemy_soldiers": round(theirs / step) * round(step) if theirs > 0 else 0,
+            "enemy_known": theirs > 0,
+            "borders": len(w.border_regions(c.id, nb)),
+            "at_war": w.at_war(c.id, nb),
+            "allied": w.allied(c.id, nb),
+        })
+    rows.sort(key=lambda r: (not r["at_war"], -r["soldiers"]))
+    return rows
+
+
 def _army_brief(w: World, c) -> dict:
     """Сводка по армии государства: люди, деньги, снабжение."""
     soldiers = society.army_size(w, c)
+    officers = society.officer_size(w, c)
     afford = society.affordable_army(w, c)
     need_shells = soldiers * config.SHELLS_PER_SOLDIER_BATTLE
     return {
         "soldiers": round(soldiers),
         "affordable": round(afford),
+        # ---- офицеры и командование ----
+        "officers": round(officers),
+        "officers_target": round(society.affordable_officers(w, c)),
+        "officer_pay": round(society.officer_pay(c), 2),
+        "officer_share": round(officers / soldiers, 4) if soldiers > 1 else 0.0,
+        # Штат — рычаг лидера; «по уставу» — та доля, при которой командование
+        # выходит на потолок. Держать сверх устава имеет смысл на войне: офицеры
+        # гибнут быстрее солдат.
+        "officer_target": round(society.officer_target_share(c), 4),
+        "officer_target_share": config.OFFICER_TARGET_SHARE,
+        "officer_target_max": config.OFFICER_TARGET_MAX,
+        # ---- наём из высшего общества ----
+        # Сколько людей вообще пойдёт в офицеры за нынешнее жалованье и во
+        # сколько обходится патент. По этим двум числам видна причина недобора:
+        # пусто в казне или нанимать некого.
+        "officer_candidates": round(society.officer_candidates(w, c)),
+        "officer_pay_needed": round(society.officer_pay_bar(w, c), 2),
+        "officer_pool": [config.STRATA[k]["name"] for k in config.OFFICER_POOL],
+        "officers_hired": round(c.last_officers_hired),
+        "officers_lost": round(c.last_officers_lost),
+        "officer_recruit_share": config.OFFICER_RECRUIT_SHARE,
+        "officer_casualty_mult": config.OFFICER_CASUALTY_MULT,
+        # Качество командования «в среднем по стране» — справочно. В бою
+        # считается своё на каждом фронте, см. _fronts.
+        "command": round(society.command_quality(officers, soldiers), 3),
+        "command_max": config.COMMAND_MAX,
+        "slot_cost": round(society.soldier_slot_cost(c), 2),
+        # ---- фронты ----
+        "fronts": _fronts(w, c),
+        "reserve": round(society.free_soldiers(w, c)),
+        "reserve_officers": round(society.free_officers(w, c)),
+        "move_share": config.FRONT_MOVE_SHARE,
         "soldier_pay": round(c.soldier_pay, 2),
         "budget": round(c.army_budget, 2),
         "last_cost": round(c.last_army_cost, 2),
@@ -440,6 +601,50 @@ def _army_brief(w: World, c) -> dict:
         "last_mobilized": round(c.last_mobilized),
         "budget_max_share": config.ARMY_TARGET_MAX,
     }
+
+
+def _factory_employed(w: World, city_ids) -> float:
+    """Сколько людей занято на ЗАВОДСКИХ местах в этих областях.
+
+    Крестьяне, нанятые на фермы, сюда не входят, и это принципиально: рабочая
+    сила у них своя (Industry.labour), сословия они не меняют, и в безработице
+    не участвуют — не взяли на чужое поле, вернулся на своё. Считать их вместе
+    с заводскими значит врать в обе стороны сразу: «занято» становится больше
+    числа рабочих, и безработица показывает ноль там, где половина заводского
+    сословия сидит без дела.
+    """
+    total = 0.0
+    for b in w.buildings.values():
+        if b.city_id not in city_ids:
+            continue
+        ind = w.industries.get(b.industry_key)
+        if ind is None or ind.labour == "workers":
+            total += b.employed
+    return total
+
+
+def _corridor_position(price: float, anchor: float) -> float:
+    """Где цена стоит в своём коридоре: 0 — у пола, 0.5 — на якоре, 1 — у потолка.
+
+    Считается В ЛОГАРИФМАХ и по каждой половине отдельно — ровно так, как цену
+    двигает сам движок (см. economy/pricing.py: он работает с ln(price/anchor) и
+    насыщает результат через tanh).
+
+    Прежняя мерка была линейной по деньгам, и коридор от этого врал грубо.
+    Границы стоят на 0.55 и 4.00 якоря, значит сам якорь на линейной шкале
+    оказывался на 13% ширины — почти вплотную к левому краю. Товар, который
+    продаётся ровно по нормальной цене, выглядел «на самом дне», а вся правая
+    половина полосы доставалась ценам от двух себестоимостей и выше, которых в
+    живой экономике почти не бывает. Смотреть на такую полосу было бессмысленно.
+
+    Теперь якорь ровно посередине, пол — у левого края, потолок — у правого, и
+    отклонение вниз читается так же честно, как отклонение вверх.
+    """
+    if anchor <= 0 or price <= 0:
+        return 0.5
+    u = math.log(price / anchor)
+    span = U_MAX if u >= 0 else U_MIN
+    return max(0.0, min(1.0, 0.5 + 0.5 * u / span))
 
 
 def market(ctx: Ctx) -> dict:
@@ -468,7 +673,7 @@ def market(ctx: Ctx) -> dict:
             "anchor": round(local.anchor, 2),
             "unit_cost": round(local.unit_cost, 2),
             "floor": round(lo, 2), "ceiling": round(hi, 2),
-            "position": round((local.price - lo) / (hi - lo), 4) if hi > lo else 0.5,
+            "position": round(_corridor_position(local.price, local.anchor), 4),
             "stock": round(local.stock, 1),
             "demand": round(local.last_demand, 1),
             "supply": round(local.last_supply, 1),
@@ -490,7 +695,14 @@ def market(ctx: Ctx) -> dict:
             "chamber_max": config.TRADE_CHAMBER_MAX_LEVEL,
             "access_per_level": config.TRADE_ACCESS_PER_LEVEL,
             "tariff": round(c.tariff, 4),
-            "import_tariff": round(c.import_tariff, 4)}
+            "import_tariff": round(c.import_tariff, 4),
+            # Пороги раскраски наценки и коридора — одни и те же для таблицы,
+            # для полосы и для легенды под ней. Держим их на сервере, чтобы
+            # правка ANCHOR_MARKUP не разъезжалась с тем, что видит игрок.
+            "margin_bands": {"loss": 1.0, "normal": config.ANCHOR_MARKUP,
+                             "rich": config.MARGIN_RICH_AT},
+            "corridor": {"floor": config.PRICE_FLOOR_MULT,
+                         "ceiling": config.PRICE_CEIL_MULT}}
 
 
 def _chosen_country(ctx: Ctx):
@@ -542,6 +754,50 @@ def _region_list(w: World, country) -> list[dict]:
                             key=lambda x: (x.id != country.capital_city_id, x.name))]
 
 
+def _foreign_regions(w: World, player) -> list[dict]:
+    """Чужие области, куда игроку сейчас можно вложиться.
+
+    Это ровно те области, которые пропустит build(): государство живо, открыло
+    экономику для иностранцев и не воюет с нашим. Список считается здесь, а не
+    на клиенте, чтобы в «Строительстве» нельзя было выбрать область, с которой
+    стройка всё равно вернёт отказ.
+    """
+    if player is None:
+        return []
+    home_id = player.country_id
+    out = []
+    for c in sorted(w.countries.values(), key=lambda x: x.name):
+        if not c.alive or c.id == home_id or not c.foreign_investment_open:
+            continue
+        if w.at_war(home_id, c.id):
+            continue
+        for row in _region_list(w, c):
+            row.update({"country_id": c.id, "country_name": c.name,
+                        "color": c.color})
+            out.append(row)
+    return out
+
+
+def _region_info(w: World, region, player) -> dict:
+    """Сведения о выбранной области — включая чужую.
+
+    Витрина строительства смотрит и на чужие области, а их нет в списке
+    областей своей страны, поэтому подпись под переключателем собирается
+    из этого блока, а не поиском по своему списку.
+    """
+    c = w.countries.get(region.country_id)
+    return {
+        "id": region.id, "name": region.name,
+        "country_id": region.country_id,
+        "country_name": c.name if c else "—",
+        "capital": bool(c and region.id == c.capital_city_id),
+        "foreign": bool(player and region.country_id != player.country_id),
+        "population": round(region.population),
+        "unemployment": round(region.unemployment, 4),
+        "revolt": region.revolt_ticks > 0,
+    }
+
+
 def regions(ctx: Ctx) -> dict:
     """Области выбранной страны и общая сводка по каждой."""
     w = ctx.world
@@ -550,7 +806,7 @@ def regions(ctx: Ctx) -> dict:
     rows = []
     for city in w.country_regions(c.id):
         workers = city.s("workers").people
-        employed = sum(b.employed for b in w.city_buildings(city.id))
+        employed = _factory_employed(w, {city.id})
         rows.append({
             "id": city.id, "name": city.name,
             "capital": city.id == c.capital_city_id,
@@ -861,8 +1117,15 @@ def population(ctx: Ctx) -> dict:
 
     workers = sum(a["people"] for k, a in agg.items() if k == "workers")
     scope_ids = {city.id for city in scope_cities}
-    employed = sum(b.employed for b in w.buildings.values()
-                   if b.city_id in scope_ids)
+    # Занятость считается по СОСЛОВИЯМ, а не одной кучей. Крестьяне на фермах —
+    # тоже наёмные руки, но в рабочие они не переходят и в безработице не
+    # участвуют: не взяли на чужое поле — вернулся на своё. Сложи их с
+    # заводскими, и «занято» перестало бы сходиться с числом рабочих.
+    employed = _factory_employed(w, scope_ids)
+    farm_hands = sum(b.employed for b in w.buildings.values()
+                     if b.city_id in scope_ids
+                     and (w.industries.get(b.industry_key) is not None
+                          and w.industries[b.industry_key].labour == "peasants"))
     sol = (society.country_living_standard(w, c) if whole
            else society.region_living_standard(region))
     return {
@@ -885,6 +1148,10 @@ def population(ctx: Ctx) -> dict:
         "reference_wage": round(society.reference_wage(w, c), 2),
         "workers": round(workers), "employed": round(employed),
         "unemployed": round(max(0.0, workers - employed)),
+        # Крестьяне, нанятые на фермы: деревня на жалованье, а не рабочие.
+        "farm_hands": round(farm_hands),
+        "farm_wage_floor": round(
+            society.peasant_alternative(region) if region is not None else 0.0, 2),
     }
 
 
@@ -893,7 +1160,6 @@ def industries(ctx: Ctx) -> dict:
     c = _chosen_country(ctx)
     region = _chosen_region(ctx)
     wage = society.reference_wage(w, c)
-    upkeep_per_worker = config.UPKEEP_PER_LEVEL / config.JOBS_PER_LEVEL
     me = ctx.player
     state = w.state_player(c.id)
 
@@ -930,11 +1196,21 @@ def industries(ctx: Ctx) -> dict:
                     "upgrade_cost": round(
                         level_cost(i.build_cost_mult, b.level + 1), 2)}
 
+        # Содержание на работника считается по местам ИМЕННО ЭТОЙ отрасли.
+        # Общая константа врала бы всякий раз, когда мест не «как у всех»: у
+        # «Фермы» их впятеро больше, и её расходы выходили бы впятеро завышенными,
+        # а прибыль на работника — отрицательной на ровном месте.
+        upkeep_per_worker = config.UPKEEP_PER_LEVEL / max(i.jobs_per_level, 1)
         row = {
             "key": i.key, "name": i.name, "kind": i.kind,
             "sector": i.sector,
             "sector_name": config.SECTORS.get(i.sector, i.sector),
             "jobs_per_level": i.jobs_per_level,
+            # Кто на этом предприятии работает: рабочие или крестьяне. У «Фермы»
+            # это крестьяне — сословия они не меняют, поэтому её можно ставить
+            # с первого пейдея, когда рабочих в стране ещё нет.
+            "labour": i.labour,
+            "labour_name": config.STRATA.get(i.labour, {}).get("name", i.labour),
             "inputs": inputs,
             "inputs_ready": all(x["available"] for x in inputs),
             "build_cost": round(level_cost(i.build_cost_mult, 1), 2),
@@ -1005,10 +1281,18 @@ def industries(ctx: Ctx) -> dict:
         rows.append(row)
 
     rows.sort(key=lambda r: (r["kind"] == "admin", -r["value_per_worker"]))
+    home = ctx.player_country()
     return {"industries": rows, "reference_wage": round(wage, 2),
             "country_id": c.id, "country_name": c.name,
             "region_id": region.id, "region_name": region.name,
             "regions": _region_list(w, c),
+            # Переключатель в «Строительстве» живёт своей жизнью: свои области
+            # он берёт всегда у своей страны (даже когда смотрим чужую), а
+            # рядом отдельной полосой идут открытые для иностранцев чужие.
+            "home_regions": _region_list(w, home) if home else [],
+            "home_country_id": home.id if home else None,
+            "foreign_regions": _foreign_regions(w, ctx.player),
+            "region": _region_info(w, region, ctx.player),
             "sectors": [{"key": k, "name": v} for k, v in config.SECTORS.items()],
             "chain": {"link_bonus": config.CHAIN_LINK_BONUS,
                       "sector_bonus": config.CHAIN_SECTOR_BONUS,
@@ -1041,7 +1325,29 @@ def leaderboard(ctx: Ctx) -> dict:
             "profit": round(sum(b.last_profit for b in blds), 2),
         })
     rows.sort(key=lambda r: -r["net_worth"])
-    return {"players": rows}
+
+    # Рейтинг государств — по населению, потому что рынок сбыта это люди, и
+    # ступень размера здесь главная строка, а не приписка.
+    countries = []
+    for c in w.countries.values():
+        if not c.alive:
+            continue
+        pop = _country_pop(w, c.id)
+        countries.append({
+            "id": c.id, "name": c.name, "color": c.color,
+            "population": round(pop),
+            "size": society.size_title(pop),
+            "size_rank": society.size_rank(pop),
+            "regions": len(w.country_regions(c.id)),
+            "gdp": round(c.gdp),
+            "treasury": round(c.treasury),
+            "army": round(society.army_size(w, c)),
+            "players": sum(1 for p in w.players.values()
+                           if p.country_id == c.id and not p.is_state),
+        })
+    countries.sort(key=lambda r: -r["population"])
+    return {"players": rows, "countries": countries,
+            "sizes": [{"at": at, "name": name} for at, name in config.COUNTRY_SIZES]}
 
 
 def events(ctx: Ctx) -> dict:
@@ -1053,7 +1359,13 @@ def events(ctx: Ctx) -> dict:
 # ---------------------------------------------------------------------------
 def _building_dto(w: World, b: Building) -> dict:
     ind = w.industries[b.industry_key]
-    cap = b.effective_level * ind.jobs_per_level
+    # Мест в цехе два числа, и путать их нельзя: полный штат по уровням — и
+    # тот, что цех держит на заданной хозяином мощности. Сокращённая смена —
+    # это НЕ недобор людей, поэтому «Рабочие» и заполненность считаются от
+    # рабочей мощности: иначе цех на половинном ходу вечно выглядел бы
+    # недоукомплектованным и пугал бы хозяина мнимой нехваткой рук.
+    cap_full = b.effective_level * ind.jobs_per_level
+    cap = cap_full * max(0.0, min(1.0, b.throttle))
     city = w.cities[b.city_id]
     country = w.countries.get(city.country_id)
     owner = w.players.get(b.owner_id)
@@ -1077,7 +1389,8 @@ def _building_dto(w: World, b: Building) -> dict:
         "foreign": bool(owner and not owner.is_state
                         and owner.country_id != city.country_id),
         "wage": round(b.wage, 2),
-        "jobs": cap,
+        "jobs": round(cap),
+        "jobs_full": cap_full,
         "employed": round(b.employed),
         "fill": round(b.employed / cap, 4) if cap else 0.0,
         "active": b.active,
@@ -1353,8 +1666,19 @@ def set_wage_all(ctx: Ctx) -> dict:
 
 
 def set_throttle(ctx: Ctx) -> dict:
+    """Мощность цеха: какую долю штатных мест он держит и, значит, выпускает.
+
+    Рычаг против затоваривания. Остановить цех целиком — мера тупая: люди
+    расходятся, склад лежит мёртвым грузом, а содержание уровней платится всё
+    равно. Половинная мощность оставляет цех живым, вдвое сокращая и смену, и
+    расход сырья, и выпуск. Содержание построек от мощности не зависит — здание
+    стоит и на четверть хода, и это цена решения.
+    """
     b = _own(ctx)
-    b.throttle = max(0.0, min(1.0, float(ctx.need("throttle"))))
+    value = float(ctx.need("throttle"))
+    if value != value:
+        raise ApiError(400, "Мощность должна быть числом от 0 до 1")
+    b.throttle = max(0.0, min(1.0, value))
     return {"ok": True, "building": _building_dto(ctx.world, b)}
 
 
@@ -1751,11 +2075,18 @@ def confidence_vote(ctx: Ctx) -> dict:
 # Армия
 # ---------------------------------------------------------------------------
 def gov_army(ctx: Ctx) -> dict:
-    """Лидер задаёт ставку жалованья и военный бюджет.
+    """Лидер задаёт военный бюджет и обе ставки жалованья — солдатскую и
+    офицерскую, — а также штат офицеров.
 
-    Численность армии — производная от этих двух чисел: бюджет, делённый на
-    ставку. Отдельного ползунка «сколько солдат» нет намеренно, иначе казну
-    можно было бы увести в минус одним движением.
+    Численность армии — производная от этих чисел: бюджет, делённый на цену
+    места в строю (жалованье солдата плюс положенная ему доля офицера).
+    Отдельного ползунка «сколько солдат» нет намеренно, иначе казну можно было
+    бы увести в минус одним движением.
+
+    Офицерские рычаги устроены так же и решают ровно один вопрос — пойдёт ли на
+    службу высшее общество. Оно живёт лучше всех в стране, и патент берёт лишь
+    тогда, когда жалованье перебивает его привычный доход; скупому лидеру
+    достаются офицеры из среднего класса.
     """
     p, c = ctx.require_leader()
     if ctx.body.get("soldier_pay") is not None:
@@ -1768,9 +2099,28 @@ def gov_army(ctx: Ctx) -> dict:
         if budget < 0:
             raise ApiError(400, "Военный бюджет не может быть отрицательным")
         c.army_budget = budget
+    if ctx.body.get("officer_pay") is not None:
+        opay = float(ctx.body["officer_pay"])
+        if opay < 0:
+            raise ApiError(400, "Жалованье не может быть отрицательным")
+        if opay > 0 and opay < c.soldier_pay * config.OFFICER_PAY_MIN_MULT:
+            raise ApiError(400, "Офицеру не платят меньше солдата: "
+                                f"не ниже {c.soldier_pay:,.2f} ₡")
+        c.officer_pay = min(opay, c.soldier_pay * config.OFFICER_PAY_MAX_MULT)
+    if ctx.body.get("officer_target") is not None:
+        target = float(ctx.body["officer_target"])
+        if target < 0:
+            raise ApiError(400, "Штат не может быть отрицательным")
+        if target > config.OFFICER_TARGET_MAX:
+            raise ApiError(400, "Больше "
+                                f"{config.OFFICER_TARGET_MAX * 100:.0f}% офицеров "
+                                "на солдата содержать бессмысленно")
+        c.officer_target = target
     db.add_event(ctx.world.tick, p.id, "army",
                  f"{c.name}: военный бюджет {c.army_budget:,.0f} ₡, "
-                 f"жалованье {c.soldier_pay:,.2f} ₡")
+                 f"жалованье {c.soldier_pay:,.2f} ₡, "
+                 f"офицеру {society.officer_pay(c):,.2f} ₡ "
+                 f"(штат {society.officer_target_share(c) * 100:.1f}%)")
     return {"ok": True, "army": _army_brief(ctx.world, c)}
 
 
@@ -1794,6 +2144,39 @@ def gov_demobilize(ctx: Ctx) -> dict:
     c.mobilization_left = 0
     db.add_event(ctx.world.tick, p.id, "war", f"{c.name} прекращает мобилизацию")
     return {"ok": True, "mobilization_left": 0}
+
+
+def gov_front(ctx: Ctx) -> dict:
+    """Поставить на фронт против соседа столько-то солдат и офицеров.
+
+    Людей берут сперва из резерва, потом с соседних фронтов — и не мгновенно:
+    за пейдей с каждого направления снимается не больше доли стоящих там людей
+    (config.FRONT_MOVE_SHARE). Поэтому перебросить весь кулак на угрожаемую
+    границу в последний момент нельзя: решать, где держать войска, приходится
+    заранее, а ошибку исправлять несколько пейдеев.
+    """
+    w = ctx.world
+    p, c = ctx.require_leader()
+    target = int(ctx.need("country_id"))
+    if target not in w.countries:
+        raise ApiError(400, "Такого государства нет")
+    soldiers = ctx.body.get("soldiers")
+    officers = ctx.body.get("officers")
+    if soldiers is None and officers is None:
+        raise ApiError(400, "Не указано, сколько людей ставить на фронт")
+
+    res = society.set_front(
+        w, c, target,
+        soldiers=None if soldiers is None else max(0.0, float(soldiers)),
+        officers=None if officers is None else max(0.0, float(officers)))
+    if res.get("error"):
+        raise ApiError(400, res["error"])
+
+    db.add_event(w.tick, p.id, "war",
+                 f"{c.name}: на фронт с {w.countries[target].name} назначено "
+                 f"{res['soldiers']:,.0f} солдат и {res['officers']:,.0f} офицеров")
+    return {"ok": True, "army": _army_brief(w, c),
+            "moved": round(res["moved"]), "short": round(res["short"])}
 
 
 # ---------------------------------------------------------------------------
@@ -1865,10 +2248,19 @@ def diplomacy(ctx: Ctx) -> dict:
                            if other.leader_id and other.leader_id in w.players
                            else "AI (без лидера)"),
                 "leader_is_ai": other.leader_id is None,
-                "population": round(sum(x.population for x in w.cities.values()
-                                        if x.country_id == nb)),
+                "population": round(_country_pop(w, nb)),
+                "size": society.size_title(_country_pop(w, nb)),
+                "size_rank": society.size_rank(_country_pop(w, nb)),
                 "army": round(society.army_size(w, other)),
                 "strength": round(society.army_strength(w, other)),
+                # Что сосед держит ПРОТИВ НАС и что мы держим против него.
+                # Первое — грубая разведка, второе — свой приказ, точное.
+                "front_vs_me": _front_intel(w, other, cid),
+                "my_front": round(society.front_soldiers(c, nb)) if c else 0,
+                "my_front_officers": round(society.front_officers(c, nb)) if c else 0,
+                "my_front_command": round(society.command_quality(
+                    society.front_officers(c, nb),
+                    society.front_soldiers(c, nb)), 3) if c else 0.0,
                 "at_war": w.at_war(cid, nb),
                 "allied": w.allied(cid, nb),
             })
@@ -2498,6 +2890,7 @@ ROUTES: dict[tuple[str, str], Route] = {
     ("GET", "/api/annexations"): (annexations, False),
     ("POST", "/api/annexations/decide"): (annex_decide, True),
     ("POST", "/api/gov/army"): (gov_army, True),
+    ("POST", "/api/gov/front"): (gov_front, True),
     ("POST", "/api/gov/mobilize"): (gov_mobilize, True),
     ("POST", "/api/gov/demobilize"): (gov_demobilize, True),
 

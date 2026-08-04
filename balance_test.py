@@ -80,7 +80,9 @@ def profit_per_worker(world, region, ind, wage: float) -> float:
         return -1e9
     local = region.goods[ind.output_good]
     input_cost = sum(q * region.goods[k].price for k, q in ind.inputs.items())
-    upkeep = config.UPKEEP_PER_LEVEL / config.JOBS_PER_LEVEL
+    # Содержание считаем по местам ИМЕННО ЭТОЙ отрасли: у фермы их впятеро
+    # больше заводских, и общая константа завышала бы ей расходы в пять раз.
+    upkeep = config.UPKEEP_PER_LEVEL / max(ind.jobs_per_level, 1)
     return (local.price - input_cost) * ind.output_per_worker - wage - upkeep
 
 
@@ -216,7 +218,10 @@ def main() -> int:
     def bot_home():
         return world.countries[bot.country_id] if bot else None
 
-    food_shortage = []
+    # Сыта ли страна — меряется по ЗЕРНУ: это первая ступень лестницы еды и
+    # единственное, без чего человек голодает. Продукты и продовольствие —
+    # ступени выше, их нехватка бьёт по уровню жизни, а не по животу.
+    grain_shortage = []
     worst_cash = float("inf")
     # Роспись казны обязана сходиться с остатком до червонца: каждое движение
     # казны помечено статьёй, и сумма статей равна изменению остатка. Если
@@ -224,7 +229,13 @@ def main() -> int:
     # поймает пропажу — а вкладка «Казна» перестала бы врать незаметно.
     budget_drift = 0.0
     war = None
-    war_log = {"battles": 0, "damaged": 0, "news": [], "separate_peace": False}
+    war_log = {"battles": 0, "damaged": 0, "news": [], "separate_peace": False,
+               # Офицеры — отдельный счёт. Их гибель на фронте и последующий
+               # найм из высшего общества это не убыль людей (их немного), а
+               # убыль КОМАНДОВАНИЯ: качество падает сразу, а восполняется
+               # медленно, и проверять надо обе половины механики.
+               "officers_lost": 0.0, "officers_hired": 0.0,
+               "command_before": 0.0, "command_after": 0.0}
     for i in range(1, TICKS + 1):
         if war_setup:
             # даём странам вооружиться, потом объявляем войну
@@ -242,6 +253,12 @@ def main() -> int:
                     war_setup["ally"].id not in war.attackers
                     and not war.ended
                     and war_setup["attacker"].id in war.attackers)
+        if war_setup and war is None and i == 24:
+            # Качество командования накануне войны — с ним и сравним то, во что
+            # его превратят бои.
+            att0 = war_setup["attacker"]
+            war_log["command_before"] = society.command_quality(
+                society.officer_size(world, att0), society.army_size(world, att0))
         r = run_tick(world)
         for co in world.countries.values():
             if co.alive:
@@ -254,9 +271,15 @@ def main() -> int:
             war_log["damaged"] += sum(x["buildings_attacker"] + x["buildings_defender"]
                                       for x in war.last_report)
             war_log["news"] += r.get("news", [])
+            war_log["officers_lost"] += sum(
+                x["officers_attacker"] + x["officers_defender"]
+                for x in war.last_report)
+            for co in (war_setup["attacker"], war_setup["defender"]):
+                if co.alive:
+                    war_log["officers_hired"] += co.last_officers_hired
         history.append(r)
-        food_shortage.append(_home_region(world, bc).goods["food"].last_shortage
-                             if bc else 0.0)
+        grain_shortage.append(_home_region(world, bc).goods["grain"].last_shortage
+                              if bc else 0.0)
         if bot is not None:
             if i % 3 == 0:
                 play(world, bot)
@@ -323,7 +346,7 @@ def main() -> int:
     print("\n--- Проверки ---")
     money_drift = last["money_supply"] / first["money_supply"] - 1
     pop_change = last["population"] / first["population"] - 1
-    tail = food_shortage[-20:]
+    tail = grain_shortage[-20:]
     avg_shortage = sum(tail) / len(tail)
     treasury = sum(c.treasury for c in world.countries.values())
     checks = [
@@ -352,7 +375,7 @@ def main() -> int:
         ("все цены внутри коридора", not problems,
          "; ".join(problems) or "ок"),
         ("страна сыта", avg_shortage < 0.20,
-         f"средний дефицит еды {avg_shortage:.1%} за 20 пейдеев"),
+         f"средний дефицит зерна {avg_shortage:.1%} за 20 пейдеев"),
         ("крестьяне не разорены", totals["peasants"][2] > 0.30,
          f"довольство {totals['peasants'][2]:.1%}"),
         ("ВВП положительный", last["gdp"] > 0, f"{last['gdp']:,.0f}"),
@@ -451,6 +474,12 @@ def main() -> int:
                   f"  вооружены {co.army_equip:>6.0%}")
         print(f"  боёв проведено: {war_log['battles']}, "
               f"выбито уровней предприятий: {war_log['damaged']}")
+        war_log["command_after"] = society.command_quality(
+            society.officer_size(world, att), society.army_size(world, att))
+        print(f"  офицеров выбито: {war_log['officers_lost']:,.0f}, "
+              f"нанято из высшего общества: {war_log['officers_hired']:,.0f}; "
+              f"командование у «{att.name}» {war_log['command_before']:.0%} → "
+              f"{war_log['command_after']:.0%}")
         for line in war_log["news"][:5]:
             print(f"  · {line}")
         damaged_now = sum(1 for b in world.buildings.values() if b.damage > 0)
@@ -459,6 +488,14 @@ def main() -> int:
              f"{war_log['battles']} боёв"),
             ("война бьёт по промышленности", war_log["damaged"] > 0,
              f"{war_log['damaged']} уровней выбито, сейчас в руинах {damaged_now}"),
+            # Офицеры гибнут на фронте — и это должно быть видно не только в
+            # потерях, но и в качестве командования: армия воюет всё хуже, пока
+            # корпус не восполнят наймом.
+            ("офицеры гибнут на фронте", war_log["officers_lost"] > 0,
+             f"выбито {war_log['officers_lost']:,.0f} офицеров"),
+            ("корпус восполняется наймом из высшего общества",
+             war_log["officers_hired"] > 0,
+             f"нанято {war_log['officers_hired']:,.0f} офицеров"),
             ("сепаратный мир вынул только союзника", war_log["separate_peace"],
              "союзник вышел, война продолжилась" if war_log["separate_peace"]
              else "война оборвалась вместе с выходом союзника"),

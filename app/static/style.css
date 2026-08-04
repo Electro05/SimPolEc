@@ -232,21 +232,47 @@ th {
     padding: 6px var(--row-x); border-bottom: 1px solid var(--line);
 }
 td { padding: var(--row-y) var(--row-x); border-bottom: 1px solid rgba(38, 46, 58, .5); }
+/* Колонка с кнопками. Раньше «не переносить» стояло инлайном в каждом
+   генераторе строк — из-за этого на телефоне кнопки было нечем ужать. */
+td.nw { white-space: nowrap; }
+td.nw input { width: 110px; }
+/* Подписанное поле в ячейке таблицы. Два числа подряд («солдат» и «офицеров»
+   на фронт) без подписей неразличимы — тем более на телефоне, где шапка
+   таблицы не видна вовсе. */
+.fin { display: inline-flex; flex-direction: column; gap: 2px; vertical-align: top; }
+.fin > span {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .4px;
+    color: var(--dim);
+}
 tbody tr:hover { background: rgba(76, 154, 255, .05); }
 tbody tr.sel { background: rgba(76, 154, 255, .12); }
 tr.clickable { cursor: pointer; }
 
-/* ------------- ценовой коридор ------------- */
+/* ------------- ценовой коридор -------------
+   Шкала логарифмическая и симметричная: пол слева, ПОТОЛОК справа, а нормальная
+   цена (якорь) ровно посередине — засечка .anchor стоит на 50% жёстко, её не
+   надо двигать из скрипта. Отсюда и градиент: красное слева — торгуют ниже
+   себестоимости, зелёное вокруг середины — нормальная прибыль, золотое
+   справа — дефицит, ради которого строят заводы. Цвета совпадают с раскраской
+   столбца «Наценка», иначе полоса и число рассказывали бы разное. */
 .corridor { position: relative; height: 20px; }
 .corridor .track {
     position: absolute; top: 8px; left: 0; right: 0; height: 4px;
     border-radius: 2px;
-    background: linear-gradient(90deg, #1f6feb33, #23863633 35%, #d2992233 72%, #f8514933);
+    background: linear-gradient(90deg,
+        #f8514955, #d2992255 28%, #3fb95055 50%, #d4a01e55 76%, #e3b34155);
 }
 .corridor .anchor {
-    position: absolute; top: 3px; width: 2px; height: 14px;
-    background: var(--muted); border-radius: 1px;
+    position: absolute; top: 2px; left: 50%; width: 2px; height: 16px;
+    margin-left: -1px; background: var(--muted); border-radius: 1px;
 }
+/* Подпись под таблицей рынка: расшифровка наценки и коридора */
+.legend-note { font-size: 12.5px; line-height: 1.75; margin-top: 10px; }
+.mchip {
+    display: inline-flex; align-items: center; gap: 5px;
+    margin: 4px 10px 0 0; white-space: nowrap;
+}
+.mchip i { width: 9px; height: 9px; border-radius: 2px; flex: 0 0 auto; }
 .corridor .dot {
     position: absolute; top: 4px; width: 12px; height: 12px;
     margin-left: -6px; border-radius: 50%;
@@ -262,6 +288,12 @@ tr.clickable { cursor: pointer; }
 .tag.services { color: #e3b341; border-color: #e3b34155; }
 .tag.military { color: #f85149; border-color: #f8514955; }
 .tag.luxury { color: #e3b341; border-color: #e3b34155; }
+/* Значок подсказки у названия отрасли: пояснение висит в title */
+.q {
+    display: inline-block; width: 15px; height: 15px; line-height: 15px;
+    text-align: center; border-radius: 50%; font-size: 11px; cursor: help;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
 /* Расшифровка потребления: много мелких плашек, им нужен воздух и перенос */
 .tag.eat { margin: 0 3px 4px 0; white-space: nowrap; }
 /* Лестница роскоши: что открывается на каком уровне жизни */
@@ -286,6 +318,10 @@ tr.clickable { cursor: pointer; }
     background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
     padding: 0 8px; font-size: 12px; color: var(--muted); }
 .wagefield input { border: none; background: none; width: 90px; padding: 4px 7px; }
+/* Мощность цеха живёт в том же поле, что и зарплата: оба — рычаги смены. */
+.wagefield select.thr { border: none; background: none; color: var(--text);
+    padding: 4px 2px; font: inherit; cursor: pointer; }
+.wagefield select.thr option { background: var(--panel); color: var(--text); }
 /* Цветной кружок государства в таблицах */
 .dot-c { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     margin-right: 6px; vertical-align: middle; }
@@ -330,6 +366,16 @@ tr.clickable { cursor: pointer; }
 .regions .rg.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .regions .rg.riot { border-color: #f85149; color: #f85149; }
 .regions .rg.on.riot { background: #f85149; color: #fff; }
+
+/* Переключатель стройки: своя страна и заграница разными полосами — вложение
+   за границу не то же самое, что стройка дома, и путать их нельзя. */
+.rgroup { margin-bottom: 10px; }
+.rgl { display: block; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .5px; color: var(--dim); font-weight: 600; margin-bottom: 6px; }
+.rgl .dim { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.regions .rg.fgn { border-style: dashed; }
+.regions .rg.fgn .cn { color: var(--dim); margin-left: 6px; }
+.regions .rg.fgn.on .cn { color: #dbe6f5; }
 
 /* ====================================================================
    ЧАТ
@@ -468,7 +514,17 @@ tr.clickable { cursor: pointer; }
     /* Правила парные (th + td) и опираются на порядок колонок: он одинаков
        в <thead> здесь и в генераторах строк в app.js. Строки-заглушки
        используют colspan и всегда попадают в :nth-child(1), поэтому под
-       скрытие не подпадают. */
+       скрытие не подпадают.
+
+       ГЛАВНОЕ ПРАВИЛО: прячем только справочные колонки. Колонка с кнопкой
+       остаётся всегда — иначе действие на телефоне становится невозможным,
+       а не просто неудобным. */
+
+    /* Кнопки в таблице переносятся по строкам и жмутся: на узком экране им
+       важнее поместиться, чем стоять в один ряд. */
+    td.nw { white-space: normal; }
+    td.nw button { margin: 1px 0; }
+    td.nw input { width: 92px; }
 
     /* Рынок: остаются товар, цена, наценка, дефицит */
     #tMarket th:nth-child(2), #tMarket td:nth-child(2),
@@ -486,6 +542,11 @@ tr.clickable { cursor: pointer; }
     #tBuild th:nth-child(8), #tBuild td:nth-child(8),
     #tBuild th:nth-child(9), #tBuild td:nth-child(9),
     #tBuild th:nth-child(10), #tBuild td:nth-child(10) { display: none; }
+
+    /* Рычаги курса: остаются название и объяснение. «Платит» уходит — на кого
+       ложится рычаг, сказано и в самом объяснении, а третий столбец здесь
+       длинный, и ему нужна вся ширина экрана. */
+    #tLevers th:nth-child(2), #tLevers td:nth-child(2) { display: none; }
 
     /* Сословия: сословие, людей, доля, уровень жизни, довольство */
     #tStrata th:nth-child(2), #tStrata td:nth-child(2),
@@ -523,12 +584,19 @@ tr.clickable { cursor: pointer; }
     #tExQuotes th:nth-child(6), #tExQuotes td:nth-child(6),
     #tExQuotes th:nth-child(7), #tExQuotes td:nth-child(7) { display: none; }
 
-    /* Промышленники: имя, касса, капитал, состояние */
+    /* Промышленники: имя, касса, состояние, субсидия, банкротство.
+       Раньше уезжали как раз две последние колонки — с полем субсидии и
+       кнопками банкротства, и лидер не мог спасти промышленника с телефона.
+       Теперь вместо них уходят справочные капитал, предприятия, рабочие
+       и прибыль: их видно на ПК, а решение принимается по кассе и состоянию. */
+    #tCitizens th:nth-child(3), #tCitizens td:nth-child(3),
     #tCitizens th:nth-child(4), #tCitizens td:nth-child(4),
     #tCitizens th:nth-child(5), #tCitizens td:nth-child(5),
-    #tCitizens th:nth-child(6), #tCitizens td:nth-child(6),
-    #tCitizens th:nth-child(8), #tCitizens td:nth-child(8),
-    #tCitizens th:nth-child(9), #tCitizens td:nth-child(9) { display: none; }
+    #tCitizens th:nth-child(6), #tCitizens td:nth-child(6) { display: none; }
+
+    /* Промышленники на занятой земле: имя, хозяйство, решение.
+       Таблица собирается в app.js, поэтому правило по классу, а не по id. */
+    .tAnnex td:nth-child(3), .tAnnex td:nth-child(4) { display: none; }
 
     /* Роспись казны: статья, сумма, доля */
     #tBudgetIn th:nth-child(3), #tBudgetIn td:nth-child(3),
@@ -538,6 +606,50 @@ tr.clickable { cursor: pointer; }
     #tAdmin th:nth-child(2), #tAdmin td:nth-child(2),
     #tAdmin th:nth-child(3), #tAdmin td:nth-child(3),
     #tAdmin th:nth-child(5), #tAdmin td:nth-child(5) { display: none; }
+
+    /* --- фронты: не таблица, а карточки ---
+       Единственная таблица, из которой на телефоне нельзя выбросить ни одного
+       столбца: на фронте важно всё сразу — сколько там наших солдат, сколько
+       офицеров, чего это стоит в бою и что напротив у соседа. Восемь колонок в
+       ширину телефона не влезают никак, поэтому строка разворачивается в
+       карточку: подпись слева, число справа, по строке на показатель.
+
+       Подписи берутся из data-l, который проставляет renderFronts в app.js, —
+       поэтому «наших солдат» и «у соседа против нас» названы прямо, и путаницы,
+       чьи это люди, не возникает. */
+    #tFronts thead { display: none; }
+    #tFronts, #tFronts tbody, #tFronts tr, #tFronts td { display: block; width: 100%; }
+    #tFronts tr {
+        border: 1px solid var(--line); border-radius: 10px;
+        padding: 8px 11px; margin-bottom: 10px; background: var(--panel);
+    }
+    #tFronts tr.sel { border-color: var(--bad); }
+    #tFronts td {
+        border: none; padding: 4px 0;
+        display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+        text-align: right;
+    }
+    #tFronts td + td { border-top: 1px solid rgba(38, 46, 58, .5); }
+    #tFronts td::before {
+        content: attr(data-l); flex: 1 1 auto; text-align: left;
+        font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+        color: var(--dim); white-space: normal;
+    }
+    /* Шапка карточки — название соседа: подпись ей не нужна, и делить строку
+       пополам тоже незачем. */
+    #tFronts td:first-child { display: block; text-align: left; padding-top: 0; }
+    #tFronts td:first-child::before { display: none; }
+    #tFronts td:first-child b { font-size: 15px; }
+    /* Приказ по фронту: два подписанных поля в ряд и кнопка во всю ширину —
+       так на телефоне видно, какое число куда, и промахнуться пальцем нельзя. */
+    #tFronts td.nw { display: flex; flex-wrap: wrap; gap: 8px; text-align: left; }
+    #tFronts td.nw::before { flex: 1 0 100%; }
+    #tFronts td.nw > label.fin { flex: 1 1 0; min-width: 0; }
+    #tFronts td.nw > label.fin input { width: 100%; }
+    #tFronts td.nw button { flex: 1 0 100%; min-height: 36px; }
+    /* Заглушка «соседей нет» живёт в той же таблице и подписи не имеет. */
+    #tFronts td.empty::before { display: none; }
+    #tFronts td.empty { text-align: center; }
 
     /* Соседи: государство, боевая сила, отношения, кнопка */
     #tNeighbors th:nth-child(2), #tNeighbors td:nth-child(2),

@@ -4,37 +4,66 @@
    SimPolEc — клиент. Ванильный JS, без сборки и зависимостей.
    ====================================================================== */
 
-const S = {
+/** Чистое состояние одного игрока. Заводится и при запуске, и при каждой
+ *  смене аккаунта: иначе после входа другим игроком на экране оставались бы
+ *  области, витрины и чат прошлого — до перезагрузки страницы. Здесь
+ *  перечислены ВСЕ поля, которые набивает refresh(), чтобы сброс не оставлял
+ *  хвостов. Вне этого набора живёт только token и счётчик сессий. */
+function freshState() {
+    return {
+        me: null,
+        world: null,
+        market: [],
+        series: {},
+        macro: [],
+        buildings: [],
+        cities: [],
+        industries: [],
+        people: null,
+        good: 'food',          // выбранный товар для графика
+        region: null,          // выбранная область (её рынок и население)
+        regionName: '',
+        regions: [],
+        marketCountryId: null,
+        access: null,
+        xGood: 'steel',        // выбранный товар на бирже
+        buildSector: 'all',    // фильтр отраслей в строительстве
+        buildRegion: null,     // область стройки: своя или чужая, открытая для нас
+        buildInfo: null,       // сведения о ней (чужая область в S.cities не лежит)
+        buildHome: [],         // свои области — всегда свои, даже при взгляде вовне
+        buildForeign: [],      // чужие области, открытые для иностранных инвестиций
+        buildWage: 0,          // привычный заработок в стране, где строим
+        sectors: [],
+        chainRules: null,
+        exchange: null,
+        diplo: null,
+        citizens: null,
+        annex: null,
+        govBuildings: [],
+        canManageState: false,
+        elections: null,
+        map: null,
+        mapPick: null,
+        page: 'market',
+        lastTick: -1,
+        secondsLeft: 0,
+        // чат: канал, собеседник и последние прочитанные id по каждому каналу
+        chat: null,
+        chatOpen: false,
+        chatCh: 'world',
+        chatPeer: 0,
+        chatSeen: {},
+        chatJump: false,
+        admin: null,
+    };
+}
+
+const S = Object.assign({
     token: localStorage.getItem('simpolec.token') || null,
-    me: null,
-    world: null,
-    market: [],
-    series: {},
-    macro: [],
-    buildings: [],
-    cities: [],
-    industries: [],
-    people: null,
-    good: 'food',          // выбранный товар для графика
-    region: null,          // выбранная область (её рынок и население)
-    regions: [],
-    xGood: 'steel',        // выбранный товар на бирже
-    buildSector: 'all',    // фильтр отраслей в строительстве
-    sectors: [],
-    chainRules: null,
-    exchange: null,
-    diplo: null,
-    page: 'market',
-    lastTick: -1,
-    secondsLeft: 0,
-    // чат: канал, собеседник и последние прочитанные id по каждому каналу
-    chat: null,
-    chatOpen: false,
-    chatCh: 'world',
-    chatPeer: 0,
-    chatSeen: {},
-    admin: null,
-};
+    // Номер сессии. Растёт на каждый вход и выход; ответы запросов, ушедших
+    // от прошлого аккаунта, по нему отбрасываются.
+    session: 0,
+}, freshState());
 
 /* ------------------------------ утилиты ------------------------------ */
 const $ = id => document.getElementById(id);
@@ -78,6 +107,20 @@ async function api(path, body, method) {
 }
 
 /* ------------------------------ вход ------------------------------ */
+/** Забыть всё, что относилось к прошлому игроку.
+ *
+ *  Смена аккаунта — это новая игра с нуля: чужая страна, чужие области, чужой
+ *  чат. Раньше в S оставалась, например, выбранная область прошлого аккаунта,
+ *  и она уезжала в запросы как ?region_id=, поэтому новый игрок видел рынок и
+ *  население чужой страны, пока не перезагрузит страницу. */
+function resetSession() {
+    S.session++;                  // ответы старых запросов теперь не в счёт
+    Object.assign(S, freshState());
+    // Раздел тоже сбрасываем: у нового игрока может не быть админки,
+    // а открытая страница осталась бы от прошлого.
+    goPage('market');
+}
+
 async function doAuth(kind) {
     const username = $('u').value.trim(), password = $('p').value;
     const sel = $('regCountry');
@@ -87,8 +130,14 @@ async function doAuth(kind) {
         const body = { username, password };
         if (kind === 'register' && country_id) body.country_id = country_id;
         const r = await api('/api/' + kind, body);
+        // Курсор оставался в поле пароля, а половина витрин не перерисовывается,
+        // пока фокус в каком-нибудь input, — налоги и жалованье так и висели
+        // от прошлого аккаунта.
+        if (document.activeElement) document.activeElement.blur();
+        resetSession();
         S.token = r.token;
         localStorage.setItem('simpolec.token', r.token);
+        $('u').value = ''; $('p').value = '';
         await start();
     } catch (e) {
         $('authErr').textContent = e.message;
@@ -102,8 +151,19 @@ async function loadCountriesForRegister() {
         const r = await api('/api/countries');
         if (!r.countries || !r.countries.length) throw new Error('Список пуст');
         sel.innerHTML = r.countries.map(c =>
-            `<option value="${c.id}">${esc(c.name)} — ${esc(c.capital)}, ${qty(c.population)} чел. (${c.players} игр.)</option>`
+            `<option value="${c.id}">${esc(c.name)} — ${esc(c.capital)}, ${esc(c.size)}, ${qty(c.population)} чел. (${c.players} игр.)</option>`
         ).join('');
+        // Окно заселения — то, ради чего стоит поспешить: пока оно открыто,
+        // ваш приход приводит в страну её будущий рынок сбыта.
+        const note = $('joinNote');
+        if (note) note.innerHTML = r.join_window_open
+            ? `<b class="good">Идёт заселение мира</b> — осталось ${r.join_window_left}
+               пейдей(-ев). Кто открывает дело сейчас, приводит в свою страну
+               <b>${qty(r.settlers_per_player)}</b> человек: это и будут ваши
+               покупатели и рабочие руки. Позже страны растут только рождаемостью.`
+            : `<span class="dim">Заселение мира закончилось: страны растут только
+               рождаемостью. Выбирайте ту, где рынок уже вырос, — или ту, где
+               меньше конкурентов.</span>`;
     } catch (e) {
         // Молчать нельзя: пустой список выглядит как поломка формы,
         // а причина обычно в том, что сервер не поднялся или база старая.
@@ -128,12 +188,18 @@ function logout() {
     api('/api/logout', {}).catch(() => {});
     localStorage.removeItem('simpolec.token');
     S.token = null;
+    // Чистим состояние сразу на выходе: следующий вход начнётся с пустого
+    // экрана, даже если игрок войдёт тем же аккаунтом.
+    resetSession();
+    renderChat();          // окно чата убираем вместе с перепиской
     showAuth();
 }
 
 async function start() {
+    const gen = S.session;
+    let me;
     try {
-        S.me = await api('/api/me');
+        me = await api('/api/me');
     } catch (e) {
         // Токен протух или мир пересоздан — возвращаем на форму входа
         // и обязательно наполняем список государств.
@@ -142,6 +208,11 @@ async function start() {
         showAuth();
         return;
     }
+    if (gen !== S.session) return;   // за время запроса сменили аккаунт
+    S.me = me;
+    // Непрочитанное в чате помним по каждому игроку отдельно, поэтому читаем
+    // отметки только теперь, когда известно, кто вошёл.
+    S.chatSeen = loadSeen();
     $('auth').style.display = 'none';
     $('game').style.display = '';
     await refresh(true);
@@ -150,16 +221,25 @@ async function start() {
 
 /* ------------------------------ загрузка ------------------------------ */
 async function refresh(full) {
+    // Номер сессии на момент запроса. Если за время ответа игрок вышел или
+    // вошёл другим аккаунтом, данные прошлого игрока выбрасываем: иначе они
+    // легли бы поверх нового мира и держались бы до перезагрузки страницы.
+    const gen = S.session;
     try {
         const rq = S.region ? '?region_id=' + S.region : '';
         const [world, me, market, buildings] = await Promise.all([
             api('/api/world'), api('/api/me'), api('/api/market' + rq),
             api('/api/buildings'),
         ]);
+        if (gen !== S.session) return;
         S.world = world; S.me = me;
         // Админка появляется в меню только у того, кому она положена.
         $('navAdmin').hidden = !me.is_admin;
         S.market = market.goods; S.buildings = buildings.buildings;
+        // Пороги наценки и границы коридора приходят с сервера: правка
+        // ANCHOR_MARKUP не должна разъезжаться с раскраской и легендой.
+        S.bands = market.margin_bands || {};
+        S.corridor = market.corridor || {};
         S.marketCountryId = market.country_id;
         S.region = market.region_id;          // сервер мог поправить выбор
         S.regionName = market.region_name;
@@ -175,19 +255,31 @@ async function refresh(full) {
         const newTick = world.tick !== S.lastTick;
         if (newTick || full) {
             const rq2 = S.region ? '&region_id=' + S.region : '';
+            // «Строительство» смотрит на свою область — но может смотреть и на
+            // чужую, открытую для иностранных инвестиций. Остальные витрины
+            // при этом остаются дома.
+            const rqb = S.buildRegion ? '&region_id=' + S.buildRegion : rq2;
             const [series, macro, regions, industries, people, govBuildings,
                    mapData, el, exch, diplo, cits, annex] = await Promise.all([
                 api('/api/market/history?limit=120' + rq2),
                 api('/api/macro/history?limit=120'),
-                api('/api/regions'), api('/api/industries?x=1' + rq2),
+                api('/api/regions'), api('/api/industries?x=1' + rqb),
                 api('/api/population?x=1' + rq2),
                 api('/api/gov/buildings'), api('/api/map'), api('/api/elections'),
                 api('/api/exchange?limit=120'), api('/api/diplomacy'),
                 api('/api/gov/citizens'), api('/api/annexations'),
             ]);
+            if (gen !== S.session) return;
             S.series = series.series; S.macro = macro.rows;
             S.cities = regions.regions; S.industries = industries.industries;
             S.sectors = industries.sectors || []; S.chainRules = industries.chain;
+            // Область стройки сервер мог поправить (например, чужая страна
+            // закрыла экономику или началась война) — верим ему, а не себе.
+            S.buildRegion = industries.region_id;
+            S.buildInfo = industries.region;
+            S.buildHome = industries.home_regions || [];
+            S.buildForeign = industries.foreign_regions || [];
+            S.buildWage = industries.reference_wage;
             S.people = people; S.govBuildings = govBuildings.buildings;
             S.canManageState = govBuildings.can_manage;
             S.map = mapData.nodes; S.elections = el;
@@ -216,7 +308,14 @@ function renderHeader() {
     $('hWorth').textContent = money(S.me.net_worth) + ' ₡';
     $('hTick').textContent = '#' + S.world.tick;
     $('hPop').textContent = qty(h.population);
-    $('hPop').title = 'Во всём мире: ' + qty(wld.population) + ' в ' + wld.countries + ' государствах';
+    // Размер страны одним словом. Восьмизначное число ни о чём не говорит,
+    // а «средняя страна» говорит сразу: губерния перед тобой или держава.
+    $('hPop').className = 'v num ' + SIZE_TONE[h.size_rank || 0];
+    $('hPop').title = (h.size ? h.size + '. ' : '')
+        + (h.size_next
+            ? 'До ступени «' + h.size_next.name + '» ещё ' + qty(h.size_next.left) + ' чел. '
+            : 'Выше ступени уже нет. ')
+        + 'Во всём мире: ' + qty(wld.population) + ' в ' + wld.countries + ' государствах';
     $('hRegions').textContent = h.regions || 0;
     $('hRegions').className = 'v num ' + (h.revolts ? 'bad' : '');
     $('hRegions').title = h.revolts ? h.revolts + ' обл. в мятеже' : 'Областей в стране';
@@ -252,6 +351,17 @@ function regionPicker(boxId, list, selected) {
 
 function pickRegion(id) {
     S.region = id;
+    // Выбор своей области общий для всех витрин, поэтому и стройка
+    // возвращается домой из чужой страны.
+    S.buildRegion = null;
+    refresh(true);
+}
+
+/** Выбрать чужую область для стройки. Меняется только «Строительство»:
+ *  рынок, население и казна остаются на своей области — вкладываться за
+ *  границу вы можете, а хозяйничать там нет. */
+function pickBuildRegion(id) {
+    S.buildRegion = id;
     refresh(true);
 }
 
@@ -278,6 +388,10 @@ const CAT = {
     consumer: 'потреб.', services: 'услуги', military: 'военное',
     luxury: 'роскошь',
 };
+
+/** Цвет ступени размера страны: от крошечной к крупной. Порядок совпадает с
+ *  config.COUNTRY_SIZES, ступень приходит с сервера как size_rank. */
+const SIZE_TONE = ['dim', 'muted', 'good', 'gold', 'gold'];
 
 /** Доступность рынка области: одно число на оба конца торговли.
  *  Внутри страны — как быстро область сравнивается ценами с соседями,
@@ -306,15 +420,41 @@ function renderAccess() {
                 : '. Область включена в общий рынок полностью.');
 }
 
+/** Раскраска наценки — ГЛАЗАМИ ПРОМЫШЛЕННИКА, и потому однонаправленная:
+ *  чем больше наценка, тем зеленее. Продавать ниже себестоимости — плохо,
+ *  дефицит — приглашение построить завод. Прежняя палитра красила дорогое
+ *  красным, а дешёвое зелёным, то есть смотрела глазами покупателя, — и по ней
+ *  нельзя было понять, куда вкладывать деньги. */
+function marginTone(margin) {
+    const b = S.bands || {};
+    if (margin < (b.loss || 1)) return 'loss';        // ниже себестоимости
+    if (margin < (b.normal || 1.12)) return 'thin';   // тоньше обычной прибыли
+    if (margin < (b.rich || 1.6)) return 'fair';      // обычная прибыль дела
+    return 'rich';                                    // дефицит, сверхприбыль
+}
+
+const MARGIN_COLOR = {
+    loss: 'var(--bad)', thin: 'var(--warn)',
+    fair: 'var(--good)', rich: 'var(--gold)',
+};
+const MARGIN_HINT = {
+    loss: 'Продают ниже себестоимости — держать такой цех себе в убыток',
+    thin: 'Наценка тоньше обычной прибыли дела: цех сводит концы с концами',
+    fair: 'Обычная прибыль дела — столько платит рынок за налаженное',
+    rich: 'Дефицитная сверхприбыль. Вот сюда и стоит строиться',
+};
+
 function renderMarket() {
     $('marketRegion').textContent = S.regionName || '—';
     renderAccess();
+    renderCorridorLegend();
     regionPicker('marketRegions', S.regions, S.region);
     $('marketRows').innerHTML = S.market.map(g => {
+        // Положение в коридоре сервер считает в логарифмах и по половинам:
+        // 0 — пол, 0.5 — якорь (нормальная цена), 1 — потолок.
         const pos = Math.max(0, Math.min(1, g.position)) * 100;
-        const anchorPos = ((g.anchor - g.floor) / (g.ceiling - g.floor)) * 100;
-        const col = g.margin >= 1.4 ? 'var(--bad)' : g.margin >= 1.05 ? 'var(--warn)'
-            : g.margin >= .9 ? 'var(--accent)' : 'var(--good)';
+        const tone = marginTone(g.margin);
+        const col = MARGIN_COLOR[tone];
         const short = g.shortage > .3 ? 'bad' : g.shortage > .05 ? 'warn' : 'dim';
         return `<tr class="clickable ${g.key === S.good ? 'sel' : ''}"
                     onclick="pickGood('${g.key}')">
@@ -329,10 +469,12 @@ function renderMarket() {
                     (g.price / g.country_price - 1 >= 0 ? '+' : '')
                     + pct(g.price / g.country_price - 1)}</span>` : '')}</td>
             <td class="right dim">${g.unit_cost.toFixed(2)}</td>
-            <td class="right" style="color:${col}">×${g.margin.toFixed(2)}</td>
-            <td><div class="corridor" title="от ${g.floor} до ${g.ceiling} ₡">
+            <td class="right" style="color:${col}"
+                title="${MARGIN_HINT[tone]}">×${g.margin.toFixed(2)}</td>
+            <td><div class="corridor" title="Пол ${g.floor} ₡ — нормальная цена ${
+                g.anchor} ₡ — потолок ${g.ceiling} ₡">
                 <div class="track"></div>
-                <div class="anchor" style="left:${anchorPos}%"></div>
+                <div class="anchor"></div>
                 <div class="dot" style="left:${pos}%;background:${col}"></div>
             </div></td>
             <td class="right">${g.storable ? qty(g.stock) : '<span class="dim">не хранится</span>'}</td>
@@ -342,6 +484,29 @@ function renderMarket() {
     }).join('');
     drawPriceChart();
     drawMacroChart();
+}
+
+/** Подпись под таблицей рынка: что в этой раскраске хорошо, а что плохо.
+ *  Без неё и наценка, и коридор оставались ребусом — цветной, но немой. */
+function renderCorridorLegend() {
+    const el = $('marginLegend');
+    if (!el) return;
+    const b = S.bands || {}, c = S.corridor || {};
+    const chip = (tone, text) =>
+        `<span class="mchip"><i style="background:${MARGIN_COLOR[tone]}"></i>${text}</span>`;
+    el.innerHTML =
+        '<b>Наценка</b> — во сколько раз цена выше себестоимости. Смотрим на неё '
+        + 'глазами промышленника: чем она больше, тем выгоднее здесь дело. '
+        + chip('loss', 'ниже ×' + (b.loss || 1).toFixed(2) + ' — торгуют себе в убыток')
+        + chip('thin', 'до ×' + (b.normal || 1.12).toFixed(2) + ' — тоньше обычной прибыли')
+        + chip('fair', 'до ×' + (b.rich || 1.6).toFixed(2) + ' — обычная прибыль дела')
+        + chip('rich', 'выше — дефицит, сюда и стоит строиться')
+        + '<br><b>Коридор</b> — где цена стоит между полом и потолком. Засечка '
+        + 'посередине — <b>нормальная цена</b> (себестоимость с обычной наценкой). '
+        + 'Слева от неё цена падает до '
+        + pct(c.floor || .55) + ' себестоимости, справа поднимается до '
+        + pct(c.ceiling || 4) + '; шкала в обе стороны одинаковая, поэтому '
+        + 'отклонение вниз читается так же честно, как вверх.';
 }
 
 function pickGood(key) { S.good = key; renderMarket(); }
@@ -525,6 +690,12 @@ function renderPeople() {
     $('pIdle').textContent = qty(p.unemployed);
     $('pIdle').className = 'v num ' + (p.unemployed > p.workers * .2 ? 'bad' : 'dim');
     $('pWage').textContent = p.reference_wage.toFixed(2) + ' ₡';
+    // Крестьяне на фермах идут отдельной строкой от рабочих: сословия они не
+    // меняют, в безработицу не попадают и планка найма у них своя — доход со
+    // своего надела, а не привычка заводского рабочего.
+    $('pFarm').textContent = qty(p.farm_hands || 0);
+    $('pFarm').className = 'v num ' + (p.farm_hands ? 'good' : 'dim');
+    $('pFarmWage').textContent = (p.farm_wage_floor || 0).toFixed(2) + ' ₡';
 
     const solCol = v => v < .75 ? 'bad' : v < 1.0 ? 'warn' : v < 1.25 ? 'good' : 'gold';
     $('pSol').textContent = (p.living_standard || 0).toFixed(2);
@@ -602,6 +773,26 @@ function wageSpread(list, inputId) {
     if (el && document.activeElement !== el) el.value = Math.round(hi);
     return lo === hi ? `Сейчас у всех ${lo.toFixed(2)} ₡`
         : `Сейчас от ${lo.toFixed(2)} до ${hi.toFixed(2)} ₡`;
+}
+
+/** Ступени мощности цеха. Не ползунок: доля выпуска — решение, а не оттенок,
+ *  и десятка ступеней хватает на любую соразмерность рынку. Текущее значение
+ *  подставляется в список, даже если оно пришло не по ступеням. */
+const THROTTLE_STEPS = [1, .9, .8, .7, .6, .5, .4, .3, .2, .1];
+
+function throttleField(b) {
+    const now = Math.max(0, Math.min(1, b.throttle == null ? 1 : b.throttle));
+    const steps = THROTTLE_STEPS.slice();
+    if (!steps.some(s => Math.abs(s - now) < .005)) steps.push(now);
+    steps.sort((a, c) => c - a);
+    const opts = steps.map(s => `<option value="${s.toFixed(2)}"${
+        Math.abs(s - now) < .005 ? ' selected' : ''}>${Math.round(s * 100)}%</option>`).join('');
+    return `<label class="wagefield" title="Мощность цеха: какую долю штатных мест он держит.
+Половинная мощность — половина смены, половина сырья и половина выпуска.
+Содержание построек платится полностью: здание стоит и на четверть хода.">
+        <span>Мощность</span>
+        <select class="thr" onchange="setThrottle(${b.id}, this.value)">${opts}</select>
+    </label>`;
 }
 
 /** Из чего сложилась прибавка за цепочку — подсказка на цифре бонуса. */
@@ -682,6 +873,9 @@ function renderBiz() {
             <div class="bar"><i style="width:${Math.min(100, b.fill * 100)}%"></i></div>
             <dl>
                 <dt>Рабочие</dt><dd>${qty(b.employed)} / ${qty(b.jobs)} (${pct(b.fill)})</dd>
+                ${b.throttle < .999 ? `<dt>Мощность</dt>
+                <dd class="warn" title="Штат по уровням — ${qty(b.jobs_full)} мест">${
+                    pct(b.throttle)} — сокращённая смена</dd>` : ''}
                 <dt>Зарплата</dt><dd class="${lowWage ? 'warn' : ''}">${b.wage.toFixed(2)} ₡</dd>
                 ${b.chain_bonus > 0 ? `<dt>Цепочка</dt>
                 <dd class="chain" title="${chainTitle(b.chain)}">+${pct(b.chain_bonus)} к выпуску</dd>` : ''}
@@ -707,8 +901,9 @@ function renderBiz() {
                 а цена падает. Нужен тот, кто пустит его в дело.</div>`
             : glut ? `<div class="warn" style="font-size:12px;margin-bottom:8px">
                 Продано лишь ${pct(b.sell_through)} выпуска — остальное легло на склад
-                и денег не принесло, хотя зарплаты и налоги уплачены. Сбавьте выпуск,
-                снизьте цену спросом или ищите рынок в соседней области.</div>` : ''}
+                и денег не принесло, хотя зарплаты и налоги уплачены. Сбавьте
+                <b>мощность</b> под сбыт (${pct(b.sell_through)} — вот она, соразмерность),
+                ищите рынок в соседней области или пускайте товар в дело сами.</div>` : ''}
             ${starved ? `<div class="bad" style="font-size:12px;margin-bottom:8px">
                 Не хватает сырья — цех простаивает. Постройте поставщика
                 или переждите.</div>` : ''}
@@ -721,6 +916,7 @@ function renderBiz() {
                     <input type="number" id="w${b.id}" value="${b.wage.toFixed(0)}" min="0"
                            onchange="setWage(${b.id})">
                 </label>
+                ${admin ? '' : throttleField(b)}
                 <button class="sm" onclick="upgrade(${b.id})" ${S.me.bankrupt ? 'disabled' : ''}
                     title="Следующий уровень">Ур. ${b.level + 1} — ${money(b.upgrade_cost)} ₡</button>
                 ${b.damage ? `<button class="sm primary" onclick="repairBiz(${b.id})"
@@ -776,6 +972,14 @@ const upgrade = id => act(async () => {
     toast('Уровень ' + r.building.level);
 });
 const toggleBiz = id => act(() => api('/api/buildings/toggle', { id }));
+/** Мощность цеха — доля штатных мест, которые он держит. Работает и на выпуск,
+ *  и на штат разом: сбавили вдвое — вдвое меньше смена, сырьё и товар. */
+const setThrottle = (id, value) => act(async () => {
+    const r = await api('/api/buildings/throttle', { id, throttle: Number(value) });
+    const t = r.building.throttle;
+    toast(t >= .999 ? 'Полный ход' : `Мощность ${Math.round(t * 100)}% — `
+        + `штат ${qty(r.building.jobs)} из ${qty(r.building.jobs_full)} мест`);
+});
 const repairBiz = id => act(async () => {
     const r = await api('/api/buildings/repair', { id });
     toast('Восстановлено, потрачено ' + money(r.spent) + ' ₡');
@@ -795,17 +999,76 @@ function matchesQuery(i, q) {
     return hay.includes(q);
 }
 
+/** Переключатель областей в «Строительстве»: своя страна и, отдельной
+ *  полосой, заграница.
+ *
+ *  Чужие области идут не вперемешку со своими, а своей категорией и с гербом
+ *  государства: стройка за границей — другое дело, чем стройка дома. Выпуск
+ *  такого завода ляжет на ЗДЕШНИЙ прилавок, а прибыль вернётся вам.
+ *  Список чужих областей приходит с сервера уже отфильтрованным — в нём
+ *  только страны, открывшие экономику и не воюющие с нами. */
+function buildRegionPicker() {
+    const box = $('buildRegions');
+    if (!box) return;
+    const home = S.buildHome || [], foreign = S.buildForeign || [];
+    const sel = S.buildRegion;
+    const group = (label, note, html) => `<div class="rgroup">
+        <span class="rgl">${label}${note ? ` <span class="dim">${note}</span>` : ''}</span>
+        <div class="regions">${html}</div></div>`;
+
+    const mine = home.map(r => `<button class="rg${r.id === sel ? ' on' : ''}${
+        r.revolt ? ' riot' : ''}" onclick="pickRegion(${r.id})"
+        title="${r.revolt ? 'В области бунт' : qty(r.population) + ' чел.'}">
+        ${esc(r.name)}${r.capital ? ' ★' : ''}${r.revolt ? ' 🔥' : ''}</button>`).join('');
+
+    // Своя страна у игрока одна, а чужих может быть много — поэтому у чужих
+    // область подписана государством.
+    const theirs = foreign.map(r => `<button class="rg fgn${r.id === sel ? ' on' : ''}${
+        r.revolt ? ' riot' : ''}" onclick="pickBuildRegion(${r.id})"
+        title="${esc(r.country_name)}: ${r.revolt ? 'в области бунт'
+            : qty(r.population) + ' чел.'}">
+        <i class="dot-c" style="background:${esc(r.color)}"></i>${esc(r.name)}${
+        r.capital ? ' ★' : ''}${r.revolt ? ' 🔥' : ''}
+        <span class="cn">${esc(r.country_name)}</span></button>`).join('');
+
+    box.innerHTML = group('Свои области', '', mine)
+        + (foreign.length
+            ? group('Иностранные инвестиции',
+                    '— страны, открывшие экономику для чужих денег', theirs)
+            : group('Иностранные инвестиции', '',
+                    '<span class="dim" style="font-size:12px">Ни одно государство '
+                    + 'сейчас не пускает иностранный капитал. Открытость страны '
+                    + 'включает её лидер в разделе «Государство».</span>'));
+}
+
 function renderBuild() {
     // Строим в области: у каждой свой рынок сырья и своя рабочая сила.
-    regionPicker('buildRegions', S.regions, S.region);
-    const here = S.cities.find(c => c.id === S.region);
-    const wage = S.people ? S.people.reference_wage : 0;
+    buildRegionPicker();
+    const here = S.buildInfo;
+    const foreign = !!(here && here.foreign);
+    // Страна могла закрыть экономику или объявить войну, пока мы смотрели её
+    // область: тогда выбранной области уже нет в списке открытых.
+    const shut = foreign && !(S.buildForeign || []).some(r => r.id === here.id);
+    const wage = S.buildWage || 0;
     $('buildHint').innerHTML = `${here ? `Строим в области <b>${esc(here.name)}</b>${
-        here.capital ? ' (столица)' : ''} — ${qty(here.population)} чел.,
+        here.capital ? ' (столица)' : ''}${foreign
+            ? ` — <b>${esc(here.country_name)}</b>, заграница` : ''} — ${
+        qty(here.population)} чел.,
         безработица ${pct(here.unemployment)}.<br>` : ''}Чтобы люди пошли на завод, платить надо больше,
         чем даёт привычное занятие — сейчас это <b class="good">${wage.toFixed(2)} ₡</b> за пейдей.
         Новому предприятию зарплата ставится с запасом автоматически. Если в стране есть
-        свободные рабочие, они нанимаются и при меньшей ставке.`;
+        свободные рабочие, они нанимаются и при меньшей ставке.<br>
+        <b>Крестьянские предприятия</b> (помечены плашкой с сословием) живут по своему
+        правилу: они нанимают деревню, а не рабочих, поэтому строить их можно с первого
+        пейдея — но крестьянина кормит своя земля, и на чужое поле он выйдет, только
+        если там платят не меньше${S.people && S.people.farm_wage_floor
+            ? ` <b class="good">${S.people.farm_wage_floor.toFixed(2)} ₡</b>` : ''}.${foreign ? `<br>
+        <b>Иностранная стройка.</b> Завод работает по здешним законам: нанимает
+        здешних людей, покупает сырьё и продаёт выпуск на здешнем рынке, платит
+        здешние налоги. Прибыль остаётся вашей. Казна в чужую землю не вкладывается,
+        а война с ${esc(here.country_name)} закроет вход и оставит заводы под ударом.`
+        : ''}${shut ? `<br><b class="bad">${esc(here.country_name)} больше не
+        принимает иностранные деньги — стройка здесь отклоняется.</b>` : ''}`;
 
     const ch = S.chainRules || {};
     $('chainNote').innerHTML = `Разрозненные заводы работают хуже связанных.
@@ -840,8 +1103,16 @@ function renderBuild() {
         const chain = i.chain || {};
         // Такой же завод здесь уже стоит — значит только уровень
         const mine = i.mine, stateHere = i.state_here;
+        // Крестьянское предприятие («Ферма») нанимает не рабочих, а деревню, и
+        // мест ему нужно кратно больше. Без пометки игрок читал бы строку как
+        // обычный завод и не понимал, ни кого он нанимает, ни почему в столбце
+        // мест впятеро больше обычного.
+        const rural = i.labour === 'peasants';
         return `<tr>
-            <td>${esc(i.name)}<br><span class="tag">${esc(i.sector_name)}</span></td>
+            <td>${esc(i.name)}${i.description
+                ? ` <span class="q" title="${esc(i.description)}">?</span>` : ''}
+                <br><span class="tag">${esc(i.sector_name)}</span>${rural
+                ? ` <span class="tag luxury" title="Работают крестьяне, а не рабочие: сословия они не меняют и в город не переселяются. Мест нужно ${qty(i.jobs_per_level)} на уровень, а платить надо не меньше, чем даёт свой надел">${esc(i.labour_name)} ×${qty(i.jobs_per_level)}</span>` : ''}</td>
             <td>${esc(i.output_good_name)} <span class="dim">${i.output_per_worker}/раб.</span></td>
             <td class="dim" style="font-size:13px">${ins}</td>
             <td class="right ${i.value_per_worker > 0 ? 'good' : 'bad'}">${i.value_per_worker.toFixed(1)} ₡
@@ -859,13 +1130,15 @@ function renderBuild() {
             <td class="right ${short}">${i.shortage > .005 ? pct(i.shortage) : '—'}</td>
             <td class="right dim">${i.state_levels} / ${i.private_levels}</td>
             <td class="right">${mine ? money(mine.upgrade_cost) : money(i.build_cost)} ₡</td>
-            <td class="right" style="white-space:nowrap">
+            <td class="right nw">
                 ${mine
                     ? `<button class="sm primary" onclick="upgrade(${mine.id})"
                         title="Такое предприятие здесь у вас уже есть — второе не строят">
                         Ур. ${mine.level} → ${mine.level + 1}</button>`
-                    : `<button class="sm primary" onclick="buildBiz('${i.key}')">Построить</button>`}
-                ${S.me.is_governor ? (stateHere
+                    : `<button class="sm primary" onclick="buildBiz('${i.key}')"${
+                        shut ? ' disabled title="Страна закрыла экономику"' : ''
+                        }>Построить</button>`}
+                ${S.me.is_governor && !foreign ? (stateHere
                     ? `<button class="sm" onclick="upgrade(${stateHere.id})"
                         title="Казённое предприятие этой отрасли здесь уже есть">
                         казной ур. ${stateHere.level + 1}</button>`
@@ -879,7 +1152,9 @@ function renderBuild() {
     }).join('') : '<tr><td colspan="12" class="empty">Ничего не нашлось — '
         + 'смените отрасль или запрос</td></tr>';
 
-    const admins = S.industries.filter(i => i.kind === 'admin');
+    // Административные здания ставит только казна, а казна за границу не ходит:
+    // при взгляде на чужую область карточка ни к чему.
+    const admins = foreign ? [] : S.industries.filter(i => i.kind === 'admin');
     $('adminCard').style.display = admins.length ? '' : 'none';
     $('adminRows').innerHTML = admins.map(i => {
         // Здание с пределом развития: показываем, сколько уровней уже занято в
@@ -910,13 +1185,41 @@ function pickSector(key) { S.buildSector = key; renderBuild(); }
 
 const buildBiz = (key, state) => act(async () => {
     const r = await api('/api/buildings/build',
-        { industry_key: key, city_id: S.region, state: !!state });
+        { industry_key: key, city_id: S.buildRegion || S.region, state: !!state });
     toast((state ? 'Казна строит: ' : 'Построено: ')
         + r.building.industry + ' в городе ' + r.building.city);
 });
 
 /* ------------------------------ страна ------------------------------ */
 function renderCountry() {
+    // ---- размер страны и приток людей ----
+    // Население тут не строчка в отчёте, а главный ресурс промышленника: это
+    // и рабочие руки, и покупатели. Поэтому ступень размера и очередь
+    // переселенцев стоят первыми, до всякой экономики.
+    const c = S.world.country || {};
+    $('cSizeName').textContent = c.size || '—';
+    $('cSize').textContent = c.size || '—';
+    $('cSize').className = 'v ' + SIZE_TONE[c.size_rank || 0];
+    $('cPop').textContent = qty(c.population || 0);
+    $('cSizeNext').textContent = c.size_next
+        ? qty(c.size_next.left) + ' чел.' : 'вершина';
+    $('cSizeNext').title = c.size_next
+        ? 'До ступени «' + c.size_next.name + '»' : 'Выше ступени размера нет';
+    $('cSizeNext').className = 'v num ' + (c.size_next ? 'dim' : 'gold');
+    $('cSettlers').textContent = c.settlers
+        ? qty(c.settlers) + ' за ' + c.settlers_left + ' пейд.' : '—';
+    $('cSettlers').className = 'v num ' + (c.settlers ? 'good' : 'dim');
+    // Окно заселения открыто только в первые пейдеи жизни МИРА. Пока оно
+    // открыто, звать людей в свою страну — самое выгодное, что можно сделать.
+    $('cJoinWindow').textContent = c.join_window_open
+        ? 'идёт, ещё ' + c.join_window_left + ' пейд.' : 'закончилось';
+    $('cJoinWindow').className = 'v ' + (c.join_window_open ? 'good' : 'dim');
+    $('cJoinWindow').title = c.join_window_open
+        ? 'Каждый новый промышленник приводит в страну ' + qty(c.settlers_per_player || 0)
+          + ' человек. Потом окно закроется, и страна будет расти только рождаемостью'
+        : 'Страны растут только рождаемостью: новые игроки приходят на готовый рынок';
+    $('cPlayersN').textContent = c.players != null ? c.players : '—';
+
     // области своей страны: у каждой свой рынок, своё довольство и своё
     // озлобление — сравнивать их между собой и есть смысл этой таблицы
     $('cityRows').innerHTML = S.cities.map(c => {
@@ -1004,28 +1307,101 @@ function renderGov() {
     $('gBank').value = Math.round(c.bankruptcy_limit);
     const cb = $('gForeign');
     if (cb) cb.checked = !!c.foreign_investment_open;
+    renderLevers();
     const can = S.me.is_governor && c.leader_is_ai === false && c.id === S.me.country_id;
     $('govSave').disabled = !can;
     $('govNote').innerHTML = can
         ? 'Вы лидер государства «' + c.name + '». Налоги наполняют казну, госрасходы '
-        + 'возвращают деньги людям. Земельная рента забирает часть выручки деревни в '
-        + 'пользу высшего класса. Помните, что <b>подоходный налог</b> удерживается '
-        + 'только с заводских зарплат, а их получают одни рабочие: деревня и горожане '
-        + 'проходят мимо него целиком. Взять с них можно <b>подушной податью</b> (с души, '
-        + 'ложится на всех поровну и потому больнее всего — на бедных), <b>оброком</b> '
-        + '(доля рыночной выручки крестьян и кустарей), <b>налогом на сбережения</b> '
-        + '(с накопленного, тяжелее всего для высшего класса) и <b>акцизом на роскошь</b> '
-        + '(его платит только тот, кто уже живёт лучше обычного). '
-        + '<b>Вывозная пошлина</b> берётся с каждой сделки на '
-        + 'бирже и оседает в казне, но чем она выше, тем меньше своим смысла вывозить. '
-        + '<b>Ввозная</b> защищает своих: чужой товар обходится в мировую цену плюс '
-        + 'пошлину, и пока дома дешевле — импорт до прилавка не дойдёт. Откройте страну '
-        + 'для иностранных инвестиций, чтобы чужие промышленники могли строить у вас.'
+        + 'возвращают деньги людям — и почти каждый рычаг ложится на своё сословие, '
+        + 'а не на страну вообще. Главное, что стоит помнить: <b>подоходный налог</b> '
+        + 'удерживается только с зарплат, а их получают рабочие да нанятые на фермы '
+        + 'крестьяне — прочая деревня и горожане живут выручкой с рынка и проходят '
+        + 'мимо него целиком. Взять с них можно подушной податью, оброком, налогом '
+        + 'на сбережения и акцизом на роскошь. Кто именно платит каждый рычаг — '
+        + 'в таблице под полями.'
         : (c.leader_is_ai
             ? 'Государством управляет AI. Зарегистрируйтесь здесь и победите на выборах, '
               + 'чтобы стать лидером.'
             : 'Лидер государства — «' + (c.leader || 'другой игрок') + '». Здесь видно, '
               + 'по каким правилам живёт страна.');
+}
+
+/** Рычаги экономического курса — ОДИН список на всё.
+ *
+ *  Отсюда берётся и подпись при наведении на поле, и видимая таблица под ними.
+ *  Раньше пояснения жили инлайновыми `title` в разметке, и дописывали их по
+ *  одному: у новых налогов подсказки были, у старых — нет, а на телефоне
+ *  наведения нет вовсе, так что половина рычагов вообще ничем не объяснялась.
+ *  Теперь объяснение у каждого, и правится оно в одном месте.
+ *
+ *  [id поля, подпись, кто платит, что делает]
+ */
+const POLICY_LEVERS = [
+    ['gCorp', 'Налог на прибыль', 'предприятия',
+     'Доля прибыли по факту продаж. Платится стране, где стоит завод, даже если '
+     + 'хозяин иностранец. Высокая ставка первой убивает цеха с тонкой наценкой '
+     + 'и отбивает охоту строиться.'],
+    ['gSales', 'Налог с продаж', 'все покупатели',
+     'Доля каждой покупки на прилавке. Его платят и люди, и заводы, берущие '
+     + 'сырьё, — поэтому дорожает вся цепочка сразу, а не только прилавок.'],
+    ['gInc', 'Подоходный налог', 'кто получает зарплату',
+     'Удерживается с фонда оплаты труда предприятий и со строек. Платят его '
+     + 'рабочие на заводах и крестьяне, нанятые на фермы. Прочие сословия живут '
+     + 'выручкой с рынка и подоходного не видят вовсе.'],
+    ['gPoll', 'Подушная подать', 'все поголовно',
+     'Твёрдая сумма с каждой души, а не доля. Единственный доход, не зависящий '
+     + 'от того, торгует ли кто-нибудь: идёт в казну и в мёртвой экономике. Он '
+     + 'же самый злой — с бедняка берут столько же, сколько с богача.'],
+    ['gTithe', 'Оброк с деревни', 'крестьяне и кустари',
+     'Доля рыночной выручки деревни. Берётся с тех, кто зарплаты не получает и '
+     + 'потому мимо подоходного проходит, — это большая часть страны. В неурожай '
+     + 'уменьшается сам собой вместе с выручкой.'],
+    ['gWealth', 'Налог на сбережения', 'у кого есть накопления',
+     'Доля кассы сословия за пейдей. Единственный налог с накопленного, а не с '
+     + 'дохода: тяжелее всех для высшего класса, почти незаметен для того, кто '
+     + 'проедает заработок в тот же пейдей. Заодно гонит лежачие деньги в оборот.'],
+    ['gExcise', 'Акциз на роскошь', 'кто живёт лучше обычного',
+     'Надбавка к налогу с продаж на мясо, вино, дорогое платье, обстановку и '
+     + 'оперу. Хлеба бедняка не касается вовсе — в этом весь смысл отдельной ставки.'],
+    ['gSpend', 'Госрасходы', 'казна — населению',
+     'Какую долю казны государство возвращает людям за пейдей: пособия и '
+     + 'жалованье бюджетникам. Единственный канал, которым собранное идёт обратно '
+     + 'в экономику. Обнулите его — и налоги просто высосут из страны деньги.'],
+    ['gRent', 'Земельная рента', 'крестьяне — помещикам',
+     'Доля рыночной выручки крестьян, уходящая высшему классу, а НЕ в казну. '
+     + 'Наполняет кошельки тех, кто покупает роскошь, но обирает самое бедное '
+     + 'сословие страны.'],
+    ['gTariff', 'Вывозная пошлина', 'свои вывозящие',
+     'Доля стоимости вывезенного через биржу, оседающая в казне. Кормит её с '
+     + 'каждой сделки, но чем выше ставка, тем меньше своим смысла вывозить.'],
+    ['gImport', 'Ввозная пошлина', 'казна при закупке',
+     'Защита своих производителей: чужой товар обходится в мировую цену плюс эту '
+     + 'долю, и пока дома дешевле — импорт до прилавка не дойдёт. Запретительная '
+     + 'ставка даёт своему заводу продавать дорого, но покупателю дешевле не станет.'],
+    ['gMin', 'МРОТ', 'предприятия',
+     'Нижняя граница зарплаты: меньше неё цех не платит, что бы ни стояло в его '
+     + 'карточке. Поднимает доход рабочих — и первыми закрывает убыточные цеха.'],
+    ['gBank', 'Порог банкротства', 'предприятия',
+     'До какого минуса делу позволено работать в долг. Пробило порог — все цеха '
+     + 'встают под замок и сами уже не откроются: решать будет государство.'],
+    ['gForeign', 'Иностранные инвестиции', 'решение лидера',
+     'Пускать ли чужих промышленников строиться в вашей стране. Их заводы платят '
+     + 'здешние налоги и нанимают здешних людей, но прибыль уходит хозяину.'],
+];
+
+function renderLevers() {
+    const rows = $('leverRows');
+    for (const [id, name, who, note] of POLICY_LEVERS) {
+        const input = $(id);
+        if (!input) continue;
+        // Подпись при наведении — из того же списка, что и таблица ниже
+        const label = input.closest('div').querySelector('label');
+        if (label) label.title = note;
+    }
+    if (!rows) return;
+    rows.innerHTML = POLICY_LEVERS.map(([, name, who, note]) =>
+        `<tr><td><b>${esc(name)}</b></td><td class="dim">${esc(who)}</td>
+             <td class="dim" style="font-size:13px">${esc(note)}</td></tr>`).join('');
 }
 
 /** Роспись казны: каждая статья — своя строка, доли считаются от итога.
@@ -1158,13 +1534,13 @@ function renderCitizens() {
             ? `<span class="bad">банкрот с #${p.bankrupt_since}</span>`
             : p.halted ? '<span class="warn">часть цехов под замком</span>'
                 : '<span class="dim">в деле</span>'}</td>
-        <td class="right" style="white-space:nowrap">${lead ? `
-            <input type="number" id="sub${p.id}" style="width:110px" step="100000"
+        <td class="right nw">${lead ? `
+            <input type="number" id="sub${p.id}" step="100000"
                    value="${Math.max(0, Math.round(p.rescue_cost)) || ''}"
                    placeholder="сумма">
             <button class="sm ${p.bankrupt ? 'primary' : ''}"
                 onclick="giveSubsidy(${p.id})">Выдать</button>` : ''}</td>
-        <td class="right" style="white-space:nowrap">${
+        <td class="right nw">${
             !lead || (!p.bankrupt && !p.halted) ? '<span class="dim">—</span>'
             : !p.can_release && p.bankrupt
                 ? `<span class="dim" title="Сначала субсидия">не хватает ${
@@ -1223,6 +1599,9 @@ function renderGovBuildings() {
             <div class="bar"><i style="width:${Math.min(100, b.fill * 100)}%"></i></div>
             <dl>
                 <dt>Рабочие</dt><dd>${qty(b.employed)} / ${qty(b.jobs)} (${pct(b.fill)})</dd>
+                ${b.throttle < .999 ? `<dt>Мощность</dt>
+                <dd class="warn" title="Штат по уровням — ${qty(b.jobs_full)} мест">${
+                    pct(b.throttle)} — сокращённая смена</dd>` : ''}
                 <dt>Зарплата</dt><dd>${b.wage.toFixed(2)} ₡</dd>
                 ${b.chain_bonus > 0 ? `<dt>Цепочка</dt>
                 <dd class="chain" title="${chainTitle(b.chain)}">+${pct(b.chain_bonus)} к выпуску</dd>` : ''}
@@ -1244,6 +1623,7 @@ function renderGovBuildings() {
                     <input type="number" id="w${b.id}" value="${b.wage.toFixed(0)}"
                            min="0" onchange="setWage(${b.id})">
                 </label>
+                ${admin ? '' : throttleField(b)}
                 <button class="sm" onclick="upgrade(${b.id})">Ур. ${b.level + 1} — ${
                     money(b.upgrade_cost)} ₡</button>
                 ${b.damage ? `<button class="sm primary" onclick="repairBiz(${b.id})">Починить — ${
@@ -1297,7 +1677,7 @@ function renderAnnexations() {
             <td class="right">${r.buildings} предпр., ${r.levels} ур.</td>
             <td class="right dim">${qty(r.employees)} рабочих</td>
             <td class="dim" style="font-size:12px">${r.industries.map(esc).join(', ') || '—'}</td>
-            <td class="right" style="white-space:nowrap">${decided
+            <td class="right nw">${decided
                 ? (r.decision === 'expel'
                     ? '<span class="bad">выдворен, заводы снесены</span>'
                     : '<span class="good">оставлен в деле</span>')
@@ -1308,9 +1688,9 @@ function renderAnnexations() {
         return `<div class="biz${a.resolved ? '' : ' hurt'}">
             <h3>${esc(a.city)} <span class="lvl">отнята у ${esc(a.former)}${
                 a.resolved ? '' : ` · решить за ${Math.max(0, left)} пейдей(-ев)`}</span></h3>
-            ${a.pending.length ? `<div class="tw"><table style="font-size:13px"><tbody>${
+            ${a.pending.length ? `<div class="tw"><table class="tAnnex" style="font-size:13px"><tbody>${
                 rows(a.pending, false)}</tbody></table></div>` : ''}
-            ${a.decided.length ? `<div class="tw"><table style="font-size:12px;margin-top:8px"><tbody>${
+            ${a.decided.length ? `<div class="tw"><table class="tAnnex" style="font-size:12px;margin-top:8px"><tbody>${
                 rows(a.decided, true)}</tbody></table></div>` : ''}
             ${a.resolved ? '<div class="muted" style="font-size:12px;margin-top:8px">Решено.</div>'
             : lead && a.pending.length ? `<div class="acts" style="margin-top:10px">
@@ -1341,6 +1721,60 @@ const decideAnnex = (annexId, decision, playerId) => act(async () => {
 });
 
 /* --------------------------- война и дипломатия --------------------------- */
+/** Качество командования: 1% — почти толпа, 150% — вымуштрованная армия. */
+function cmdTone(q) {
+    return q < .3 ? 'bad' : q < .8 ? 'warn' : q < 1.4 ? 'good' : 'gold';
+}
+
+/** Расстановка армии по границам. Главная тактическая витрина: здесь видно,
+ *  где войска стоят, чего этот фронт стоит в бою и что напротив у соседа. */
+function renderFronts(a, lead) {
+    const rows = a.fronts || [];
+    $('aReserve').textContent = qty(a.reserve || 0);
+    $('aReserve').className = 'v num ' + ((a.reserve || 0) > 0 ? 'good' : 'dim');
+    $('aReserveOff').textContent = qty(a.reserve_officers || 0);
+    const ms = $('fMoveShare');
+    if (ms) ms.textContent = pct(a.move_share || .34);
+
+    $('frontRows').innerHTML = rows.length ? rows.map(f => {
+        // Разведка: своё число точное, чужое — округлённое. Показываем это
+        // прямо в подписи, чтобы игрок не принимал оценку за факт.
+        const enemy = f.enemy_known
+            ? `<span title="Разведка: число приблизительное">~${qty(f.enemy_soldiers)}</span>`
+            : '<span class="dim">пусто</span>';
+        const rel = f.at_war ? '<span class="bad">война</span>'
+            : f.allied ? '<span class="good">союз</span>'
+            : '<span class="dim">мир</span>';
+        const shortOff = f.soldiers > 0 && f.officers < f.officers_needed * .9;
+        // data-l — подпись ячейки. На ПК она не видна (столбцы подписаны
+        // шапкой), а на телефоне строка разворачивается в карточку, и подпись
+        // становится единственным способом понять, где чьи люди: без неё
+        // читаются четыре голых числа подряд. См. #tFronts в style.css.
+        return `<tr${f.at_war ? ' class="sel"' : ''}>
+            <td data-l="Граница"><b style="color:${esc(f.color)}">${esc(f.name)}</b>
+                <br><span class="dim" style="font-size:12px">${f.borders} обл. на границе</span></td>
+            <td class="right" data-l="Наших солдат">${qty(f.soldiers)}</td>
+            <td class="right ${shortOff ? 'warn' : ''}" data-l="Наших офицеров"
+                title="Для полного командования нужно ${qty(f.officers_needed)}">${qty(f.officers)}${
+                    shortOff ? `<span class="dim" style="font-size:12px"> из ${qty(f.officers_needed)}</span>` : ''}</td>
+            <td class="right ${cmdTone(f.command)}" data-l="Командование">${
+                f.soldiers > 0 ? pct(f.command) : '—'}</td>
+            <td class="right" data-l="Боевая сила">${qty(f.strength)}</td>
+            <td class="right dim" data-l="У соседа против нас">${enemy}</td>
+            <td data-l="Отношения">${rel}</td>
+            <td class="nw" data-l="Поставить на фронт">${lead ? `
+                <label class="fin"><span>Солдат</span>
+                    <input id="fs${f.country_id}" type="number" min="0" step="1000"
+                           value="${Math.round(f.soldiers)}" title="Солдат на этот фронт"></label>
+                <label class="fin"><span>Офицеров</span>
+                    <input id="fo${f.country_id}" type="number" min="0" step="100"
+                           value="${Math.round(f.officers)}" title="Офицеров на этот фронт"></label>
+                <button class="sm primary" onclick="setFront(${f.country_id})">Ставить</button>
+                ` : '<span class="dim">решает лидер</span>'}</td>
+        </tr>`;
+    }).join('') : '<tr><td colspan="8" class="empty">Соседей нет — фронтам взяться неоткуда</td></tr>';
+}
+
 function renderWar() {
     const d = S.diplo;
     if (!d) return;
@@ -1349,6 +1783,37 @@ function renderWar() {
 
     $('aSold').textContent = qty(a.soldiers || 0);
     $('aAfford').textContent = qty(a.affordable || 0);
+    // Офицеры и командование стоят рядом с числом солдат намеренно: одно без
+    // другого не читается. Двадцать тысяч штыков без командиров стоят меньше,
+    // чем десять с ними.
+    $('aOff').textContent = qty(a.officers || 0) + ' / ' + qty(a.officers_target || 0);
+    $('aOff').title = `Жалованье офицера ${money(a.officer_pay || 0)} ₡. Штат — `
+        + `${pct(a.officer_target || .05)} от числа солдат, для полного командования `
+        + `нужно ${pct(a.officer_target_share || .05)}. Нанимают из высшего общества`;
+    $('aOff').className = 'v num ' + ((a.officers || 0) + 1 < (a.officers_target || 0) * .9
+        ? 'warn' : 'good');
+    // Убыль офицеров и наём стоят рядом: по одному числу не понять, успевает
+    // ли корпус восполняться. На войне не успевает почти никогда.
+    const lost = a.officers_lost || 0, hired = a.officers_hired || 0;
+    $('aOffLoss').innerHTML = lost > 0
+        ? `<span class="bad">−${qty(lost)}</span> <span class="dim">/</span> `
+          + `<span class="good">+${qty(hired)}</span>`
+        : (hired > 0 ? `<span class="good">+${qty(hired)}</span>` : '<span class="dim">—</span>');
+    $('aOffLoss').title = lost > 0
+        ? `За пейдей выбито ${qty(lost)} офицеров (на фронте они гибнут в `
+          + `${(a.officer_casualty_mult || 1.6).toFixed(1)} раза чаще солдат), нанято ${qty(hired)}`
+        : 'Потерь нет. На войне офицеры гибнут чаще солдат — командовать приходится с передовой';
+    $('aOffPool').textContent = qty(a.officer_candidates || 0);
+    $('aOffPool').className = 'v num ' + ((a.officer_candidates || 0) > 0 ? 'dim' : 'bad');
+    $('aOffPool').title = (a.officer_candidates || 0) > 0
+        ? `Столько людей в сословиях «${(a.officer_pool || []).join('», «')}» пойдут `
+          + `в офицеры за ${money(a.officer_pay || 0)} ₡. За пейдей сословие отдаёт `
+          + `не больше ${pct(a.officer_recruit_share || .03)} своих людей`
+        : 'За такое жалованье патент не берёт никто: высшее общество живёт лучше';
+    $('aCmd').textContent = pct(a.command || 0);
+    $('aCmd').title = 'Средняя по стране. В бою считается своя на каждом фронте — '
+        + 'офицеры, оставленные в тылу, не командуют никем';
+    $('aCmd').className = 'v num ' + cmdTone(a.command || 0);
     // вооружённость — ЗАПАС арсенала к штату; расход — ПОТРЕБЛЕНИЕ за пейдей.
     // Это разные вещи: полный арсенал не значит, что завод остался без заказа.
     $('aEquip').textContent = pct(a.equip || 0);
@@ -1366,8 +1831,15 @@ function renderWar() {
 
     $('warNote').innerHTML = lead
         ? 'Численность армии — это не ползунок, а арифметика: <b>военный бюджет ÷ '
-        + 'жалованье солдату</b>. Больше этого числа никого не наберут, поэтому казна '
-        + 'не уйдёт в минус случайно. Оружие и снаряды казна закупает на ваш рынок '
+        + 'цену места в строю</b> (' + money(a.slot_cost || 0) + ' ₡ — жалованье солдата '
+        + 'плюс положенная ему доля офицера). Больше этого числа никого не наберут, '
+        + 'поэтому казна не уйдёт в минус случайно. <b>Офицеры</b> штыков не прибавляют, '
+        + 'но дают <b>качество командования</b> — до +' + pct(a.command_max || 1.5)
+        + ' к силе фронта, если их не меньше ' + pct(a.officer_target_share || .05)
+        + ' от числа солдат и они назначены именно на этот фронт. Нанимают их '
+        + '<b>из высшего общества</b>, и служить оно идёт только за жалованье выше '
+        + 'своего привычного дохода; на войне офицеры гибнут чаще солдат, а корпус '
+        + 'восполняется медленно. Оружие и снаряды казна закупает на ваш рынок '
         + 'на армейские склады. <b>Вооружённость</b> — это запас на складах: он '
         + 'остаётся у армии и решает исход боя. <b>Расход оружия</b> — сколько '
         + 'списывается и докупается за пейдей: это и есть заказ оружейным заводам, '
@@ -1379,13 +1851,36 @@ function renderWar() {
     if (!(document.activeElement && document.activeElement.tagName === 'INPUT')) {
         $('aBudget').value = Math.round(a.budget || 0);
         $('aPay').value = (a.soldier_pay || 0).toFixed(0);
+        $('aOffPay').value = (a.officer_pay || 0).toFixed(0);
+        $('aOffTarget').value = ((a.officer_target || .05) * 100).toFixed(1);
     }
     const pay = Number($('aPay').value) || 0;
     const budget = Number($('aBudget').value) || 0;
-    $('aHint').innerHTML = pay > 0
-        ? `Хватит на <b class="good">${qty(Math.floor(budget / pay))}</b> солдат`
+    const offPay = Number($('aOffPay').value) || 0;
+    const offTarget = (Number($('aOffTarget').value) || 0) / 100;
+    // Цена места в строю считается прямо здесь, из введённых чисел: лидер
+    // должен видеть, во что обошёлся щедрый офицерский оклад, ДО того как
+    // нажмёт «утвердить», а не пейдеем позже по осевшей численности армии.
+    const slot = pay + offTarget * offPay;
+    $('aHint').innerHTML = slot > 0
+        ? `Хватит на <b class="good">${qty(Math.floor(budget / slot))}</b> солдат `
+          + `и <b class="good">${qty(Math.floor(budget / slot * offTarget))}</b> офицеров `
+          + `<span class="dim">(место в строю — ${money(slot)} ₡)</span>`
         : '<span class="bad">При нулевом жалованье армии не будет</span>';
+    // Черта, ниже которой высшее общество патента не берёт. Главное число
+    // офицерского найма: по нему видно, кого лидер вообще может нанять.
+    const bar = a.officer_pay_needed || 0;
+    $('aOffPayHint').innerHTML = bar > 0
+        ? (offPay + 1e-9 >= bar
+            ? `<span class="good">высшее общество идёт служить</span> (нужно от ${money(bar)} ₡)`
+            : `<span class="warn">для высшего общества мало</span> — нужно от ${money(bar)} ₡, `
+              + 'иначе патент возьмёт только средний класс')
+        : '<span class="dim">нанимать некого</span>';
+    $('aOffTargetHint').innerHTML = offTarget + 1e-9 >= (a.officer_target_share || .05)
+        ? `<span class="dim">по уставу ${pct(a.officer_target_share || .05)} — командование будет полным</span>`
+        : `<span class="warn">меньше уставных ${pct(a.officer_target_share || .05)}: командование неполное</span>`;
     ['armySave', 'mobBtn', 'demobBtn'].forEach(id => { $(id).disabled = !lead; });
+    ['aOffPay', 'aOffTarget'].forEach(id => { $(id).disabled = !lead; });
 
     $('mobState').innerHTML = a.mobilization_left > 0
         ? `<div class="bad" style="font-size:13px">Идёт мобилизация: осталось
@@ -1395,6 +1890,8 @@ function renderWar() {
         : `<div class="muted" style="font-size:13px">Мобилизации нет. Приказ соберёт
            людей быстро и не глядя на жалованье — в том числе рабочих с ваших же
            заводов, — но всю страну это разозлит.</div>`;
+
+    renderFronts(a, lead);
 
     // ---- войны ----
     $('warList').innerHTML = (d.wars || []).length ? d.wars.map(w => {
@@ -1406,10 +1903,26 @@ function renderWar() {
                 <i style="width:${Math.min(100, o.progress * 100).toFixed(0)}%;
                    background:var(--bad)"></i></div></td>
             <td class="right dim">${pct(o.progress)}</td></tr>`).join('');
+        // По одной «боевой силе» не понять, из-за чего проиграли: не хватило
+        // штыков на этом участке или офицеров оставили в тылу. Поэтому рядом
+        // стоят люди на фронте и качество командования — два числа, которыми
+        // сила и объясняется.
         const rep = (w.report || []).map(r => `<tr>
-            <td>${esc(r.attacker_name)} ⚔ ${esc(r.defender_name)}</td>
-            <td class="right dim">${qty(r.strength_attacker)} : ${qty(r.strength_defender)}</td>
-            <td class="right bad">−${qty(r.losses_attacker)} / −${qty(r.losses_defender)}</td>
+            <td>${esc(r.attacker_name)} ⚔ ${esc(r.defender_name)}
+                <br><span class="dim" style="font-size:12px">${
+                    esc(r.region_attacker)} → ${esc(r.region_defender)}</span></td>
+            <td class="right dim" title="Людей на этом участке фронта">${
+                qty(r.men_attacker || 0)} : ${qty(r.men_defender || 0)}</td>
+            <td class="right" title="Качество командования: офицеры, назначенные именно на этот фронт"><span
+                class="${cmdTone(r.command_attacker || 0)}">${pct(r.command_attacker || 0)}</span>
+                <span class="dim">:</span>
+                <span class="${cmdTone(r.command_defender || 0)}">${pct(r.command_defender || 0)}</span></td>
+            <td class="right dim" title="Боевая сила с учётом вооружения, снабжения, духа и командования">${
+                qty(r.strength_attacker)} : ${qty(r.strength_defender)}</td>
+            <td class="right bad" title="Потери солдат и офицеров">−${qty(r.losses_attacker)} / −${qty(r.losses_defender)}${
+                (r.officers_attacker || r.officers_defender)
+                    ? `<br><span style="font-size:12px">офицеров −${qty(r.officers_attacker || 0)} / −${qty(r.officers_defender || 0)}</span>`
+                    : ''}</td>
             <td class="right dim">${qty(r.civilians_attacker + r.civilians_defender)} мирных</td>
             <td class="right dim">${r.buildings_attacker + r.buildings_defender} ур. разрушено</td>
         </tr>`).join('');
@@ -1491,11 +2004,18 @@ function renderWar() {
                       title="Через столько пар областей идёт общая граница">${
                     n.borders > 1 ? n.borders + ' участка границы' : ''}</span></td>
             <td class="dim">${esc(n.leader)}</td>
-            <td class="right">${qty(n.population)}</td>
-            <td class="right">${qty(n.army)}</td>
-            <td class="right">${qty(n.strength)}</td>
+            <td class="right">${qty(n.population)}
+                <br><span class="dim" style="font-size:12px">${esc(n.size || '')}</span></td>
+            <td class="right">${qty(n.army)}
+                <br><span class="dim" style="font-size:12px"
+                    title="Разведка: сколько солдат сосед держит на границе с нами. Число приблизительное">${
+                    n.front_vs_me == null ? '' : 'против нас ~' + qty(n.front_vs_me)}</span></td>
+            <td class="right">${qty(n.strength)}
+                <br><span class="dim" style="font-size:12px"
+                    title="Наши войска на этом фронте и качество командования там">у нас ${
+                    qty(n.my_front || 0)}${n.my_front ? ', ' + pct(n.my_front_command || 0) : ''}</span></td>
             <td>${rel}</td>
-            <td class="right" style="white-space:nowrap">${acts}</td>
+            <td class="right nw">${acts}</td>
         </tr>`;
     }).join('') : '<tr><td colspan="7" class="empty">Соседей не осталось</td></tr>';
 }
@@ -1504,8 +2024,23 @@ const saveArmy = () => act(async () => {
     await api('/api/gov/army', {
         army_budget: Number($('aBudget').value),
         soldier_pay: Number($('aPay').value),
+        officer_pay: Number($('aOffPay').value),
+        officer_target: (Number($('aOffTarget').value) || 0) / 100,
     });
     toast('Военный бюджет утверждён');
+});
+/** Приказ по фронту. Люди идут сперва из резерва, потом с соседних границ —
+ *  и не мгновенно, поэтому сервер честно сообщает, скольких не хватило. */
+const setFront = (id) => act(async () => {
+    const r = await api('/api/gov/front', {
+        country_id: id,
+        soldiers: Number($('fs' + id).value) || 0,
+        officers: Number($('fo' + id).value) || 0,
+    });
+    toast(r.short > 0
+        ? `Переброшено ${qty(r.moved)}, не хватило ${qty(r.short)} — за пейдей `
+          + 'с направления снимают только часть'
+        : `Переброшено ${qty(r.moved)} человек`);
 });
 const mobilize = () => act(async () => {
     if (!confirm('Объявить мобилизацию? Людей заберут приказом, в том числе с ваших '
@@ -1607,8 +2142,16 @@ function renderMap() {
         + `<dt>Озлобление</dt><dd class="${sel.revolt ? 'bad' : 'dim'}">${
             sel.revolt ? 'БУНТ' : pct(sel.unrest)}</dd>`
         + `<dt>Всего областей у страны</dt><dd>${sel.regions}</dd>`
+        + `<dt>Размер страны</dt><dd class="${SIZE_TONE[sel.size_rank || 0]}">${
+            esc(sel.size || '—')}<span class="dim"> · ${qty(sel.country_population || 0)}</span></dd>`
         + `<dt>Лидер</dt><dd>${esc(sel.leader)}</dd>`
         + `<dt>Армия страны</dt><dd>${qty(sel.army)}</dd>`
+        // Разведка: что сосед держит на границе ИМЕННО С НАМИ. Только это и
+        // видно — что стоит у него на других фронтах, знать неоткуда.
+        + (sel.front_vs_me == null ? ''
+            : `<dt title="Разведка: число приблизительное">Против вас на границе</dt>`
+              + `<dd class="${sel.front_vs_me > 0 ? 'warn' : 'dim'}">${
+                  sel.front_vs_me > 0 ? '~' + qty(sel.front_vs_me) : 'пусто'}</dd>`)
         + `<dt>Отношения</dt><dd>${rel}</dd>`
         + `<dt>Казна</dt><dd>${money(sel.treasury)} ₡</dd>`
         + `<dt>Инвестиции</dt><dd>${sel.foreign_investment_open
@@ -1623,7 +2166,9 @@ function pickMapNode(id) { S.mapPick = id; renderMap(); }
 
 /* ------------------------------ рейтинг ------------------------------ */
 function renderTop() {
+    const gen = S.session;
     api('/api/leaderboard').then(r => {
+        if (gen !== S.session || !S.me) return;
         $('topRows').innerHTML = r.players.length ? r.players.map((p, i) => `<tr>
             <td class="dim">${i + 1}</td>
             <td>${esc(p.username)}${p.is_state ? ' <span class="tag">государство</span>' : ''}${
@@ -1637,6 +2182,28 @@ function renderTop() {
             <td class="right ${p.profit >= 0 ? 'good' : 'bad'}">${
                 (p.profit >= 0 ? '+' : '') + money(p.profit)} ₡</td>
         </tr>`).join('') : '<tr><td colspan="8" class="empty">Пока никого</td></tr>';
+
+        // Рейтинг государств — по населению: рынок сбыта это люди, и ступень
+        // размера здесь главная строка, а не приписка мелким шрифтом.
+        const mine = S.me.country_id;
+        $('topCountryRows').innerHTML = (r.countries || []).map((c, i) => `<tr${
+            c.id === mine ? ' class="sel"' : ''}>
+            <td class="dim">${i + 1}</td>
+            <td><span class="dot-c" style="background:${c.color}"></span> ${esc(c.name)}${
+                c.id === mine ? ' <span class="tag">ваша</span>' : ''}</td>
+            <td class="${SIZE_TONE[c.size_rank || 0]}">${esc(c.size)}</td>
+            <td class="right">${qty(c.population)}</td>
+            <td class="right dim">${c.regions}</td>
+            <td class="right">${money(c.gdp)} ₡</td>
+            <td class="right dim">${money(c.treasury)} ₡</td>
+            <td class="right dim">${qty(c.army)}</td>
+            <td class="right">${c.players}</td>
+        </tr>`).join('') || '<tr><td colspan="9" class="empty">Государств нет</td></tr>';
+
+        const ladder = $('sizeLadder');
+        if (ladder) ladder.innerHTML = (r.sizes || []).map((sz, i) =>
+            `<span class="step"><b class="${SIZE_TONE[i]}">${esc(sz.name)}</b> — от ${
+                qty(sz.at)} чел.</span>`).join(' ');
     }).catch(() => {});
 }
 
@@ -1646,14 +2213,18 @@ function renderTop() {
    свёрнуто в кружок и живёт поверх всех разделов — переписка не должна
    заставлять уходить с рынка или из строительства.
    ========================================================================== */
-const CHAT_SEEN_KEY = 'simpolec.chatseen';
+/** Отметки «дочитано» свои у каждого игрока: на одном браузере играют по
+ *  очереди, и прочитанное одним не должно гасить значки другому. */
+const seenStoreKey = () => 'simpolec.chatseen.' + (S.me ? S.me.id : 0);
 
 function loadSeen() {
-    try { return JSON.parse(localStorage.getItem(CHAT_SEEN_KEY)) || {}; }
+    if (!S.me) return {};
+    try { return JSON.parse(localStorage.getItem(seenStoreKey())) || {}; }
     catch (e) { return {}; }
 }
 function saveSeen() {
-    try { localStorage.setItem(CHAT_SEEN_KEY, JSON.stringify(S.chatSeen)); }
+    if (!S.me) return;
+    try { localStorage.setItem(seenStoreKey(), JSON.stringify(S.chatSeen)); }
     catch (e) {}
 }
 
@@ -1786,8 +2357,11 @@ function renderChat() {
 
 async function loadChat() {
     if (!S.token) return;
+    const gen = S.session;
     try {
-        S.chat = await api('/api/chat');
+        const chat = await api('/api/chat');
+        if (gen !== S.session) return;   // за время запроса сменили аккаунт
+        S.chat = chat;
         renderChat();
     } catch (e) {
         // Чат — дело десятое: молчащий сервер не должен ронять игру.
@@ -1841,8 +2415,11 @@ async function sendChat() {
    ========================================================================== */
 async function loadAdmin() {
     if (!S.me || !S.me.is_admin) return;
+    const gen = S.session;
     try {
-        S.admin = await api('/api/admin/state');
+        const admin = await api('/api/admin/state');
+        if (gen !== S.session) return;
+        S.admin = admin;
         renderAdmin();
     } catch (e) {
         console.error(e);
@@ -2117,8 +2694,10 @@ window.addEventListener('resize', () => {
 // Обработчики висят в разметке на onclick, поэтому кладём их в window явно.
 Object.assign(window, {
     doAuth, logout, showAuth, pickGood, savePolicy, pickMapNode, pickRegion,
-    voteFor, setWage, setWageAll, upgrade, toggleBiz, demolish, buildBiz, repairBiz,
-    pickXGood, saveArmy, mobilize, demobilize, declareWar, offerPeace,
+    pickBuildRegion,
+    voteFor, setWage, setWageAll, setThrottle, upgrade, toggleBiz, demolish,
+    buildBiz, repairBiz,
+    pickXGood, saveArmy, setFront, mobilize, demobilize, declareWar, offerPeace,
     offerAlliance, acceptOffer, declineOffer, breakAlliance,
     voteConfidence, giveSubsidy, decideAnnex, endBankruptcy,
     pickSector, renderBuild,
@@ -2129,7 +2708,7 @@ Object.assign(window, {
 });
 
 applySections();
-S.chatSeen = loadSeen();
+// Отметки «дочитано» подтягиваются в start(), когда станет известно, кто вошёл.
 
 // Enter отправляет реплику — в чате это привычнее кнопки.
 $('chatInput').addEventListener('keydown', e => {

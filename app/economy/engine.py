@@ -263,36 +263,29 @@ def update_chain_bonuses(world: World, cities: list) -> None:
 # ---------------------------------------------------------------------------
 # Рынок труда
 # ---------------------------------------------------------------------------
-def allocate_labor(world: World, country: Country, city_id: int) -> float:
-    """Распределить рабочих города по предприятиям. Возвращает занятость."""
-    city = world.cities[city_id]
-    buildings = world.city_buildings(city_id)
-    workers = city.s("workers").people
-    active = [b for b in buildings
-              if b.active and b.effective_level > 0 and b.throttle > EPS]
+def farm_willingness(wage: float, alternative: float) -> float:
+    """Какая доля свободных крестьян согласна выйти на чужое поле за такую плату.
 
-    for b in buildings:
-        if b not in active:
-            b.employed = 0.0
+    Крестьянин — не безработный: своя земля кормит его и без хозяина. Поэтому
+    ставку он сравнивает не с нулём, а с тем, что даёт собственный надел при
+    нынешних ценах (society.peasant_alternative). Ниже FARM_WAGE_EDGE не идёт
+    никто, выше FARM_WAGE_FULL выходят все, между ними доля растёт плавно.
 
-    if not active or workers <= EPS:
-        city.unemployment = 1.0 if workers > EPS else 0.0
+    Без этой проверки вся затея разваливалась бы: хозяин фермы ставил бы МРОТ,
+    деревня работала бы за гроши, и промышленность разоряла бы село ровно так
+    же, как раньше это делала дешёвая ферма, отбиравшая у него сбыт.
+    """
+    if alternative <= EPS:
+        return 1.0
+    ratio = wage / alternative
+    lo, hi = config.FARM_WAGE_EDGE, config.FARM_WAGE_FULL
+    if ratio <= lo:
         return 0.0
+    return min(1.0, (ratio - lo) / max(hi - lo, 1e-9))
 
-    # Разрушенные войной уровни рабочих мест не дают, пока их не починят.
-    caps = {b.id: b.effective_level * world.industries[b.industry_key].jobs_per_level
-            * max(0.0, min(1.0, b.throttle)) for b in active}
-    total_cap = sum(caps.values())
-    if total_cap <= EPS:
-        for b in active:
-            b.employed = 0.0
-        city.unemployment = 1.0
-        return 0.0
 
-    wages = {b.id: max(b.wage, country.min_wage) for b in active}
-
-    # Жадное заполнение по убыванию зарплаты: кто больше платит, нанимает первым.
-    supply = min(workers, total_cap)
+def _fill_jobs(active: list, caps: dict, wages: dict, supply: float) -> dict:
+    """Жадно раздать людей по местам: кто больше платит, нанимает первым."""
     alloc = {b.id: 0.0 for b in active}
     remaining = supply
     for b in sorted(active, key=lambda x: (wages[x.id], -x.id), reverse=True):
@@ -301,16 +294,76 @@ def allocate_labor(world: World, country: Country, city_id: int) -> float:
         take = min(caps[b.id], remaining)
         alloc[b.id] = take
         remaining -= take
+    return alloc
+
+
+def allocate_labor(world: World, country: Country, city_id: int) -> dict[str, float]:
+    """Распределить людей города по предприятиям. Возвращает занятость по сословиям.
+
+    Рабочих рук в стране два вида, и смешивать их нельзя (см. Industry.labour):
+
+    * **рабочие** — заводское сословие. Их сперва надо создать, переманив
+      зарплатой из деревни и города, и обратно дороги нет. Отсюда безработица:
+      встал завод — человеку некуда деваться;
+    * **крестьяне** — рабочие руки «Фермы». Сословия они не меняют и никуда не
+      переселяются, поэтому и безработицы у них не бывает: не взяли на чужое
+      поле — вернулся на своё. Зато и нанять их можно только за плату не хуже
+      собственного надела (см. farm_willingness).
+
+    Оттого и раздаются места двумя отдельными проходами: своя рабочая сила,
+    свой потолок и свои правила согласия у каждого.
+    """
+    city = world.cities[city_id]
+    buildings = world.city_buildings(city_id)
+    workers = city.s("workers").people
+    active = [b for b in buildings
+              if b.active and b.effective_level > 0 and b.throttle > EPS]
+    for b in buildings:
+        if b not in active:
+            b.employed = 0.0
+
+    wages = {b.id: max(b.wage, country.min_wage) for b in active}
+    # Разрушенные войной уровни рабочих мест не дают, пока их не починят.
+    caps = {b.id: b.effective_level * world.industries[b.industry_key].jobs_per_level
+            * max(0.0, min(1.0, b.throttle)) for b in active}
+    by_labour: dict[str, list] = defaultdict(list)
+    for b in active:
+        by_labour[world.industries[b.industry_key].labour].append(b)
+
+    # --- заводское сословие ---------------------------------------------
+    factory = by_labour.get("workers", [])
+    factory_cap = sum(caps[b.id] for b in factory)
+    alloc = _fill_jobs(factory, caps, wages, min(workers, factory_cap))
+
+    # --- крестьянский труд на фермах ------------------------------------
+    # Свободны те, кто не занят на чужом поле; сколько из них согласится —
+    # решает ставка против дохода со своего надела. Согласие считается по
+    # каждому хозяйству отдельно: щедрый наберёт людей, скупой останется ни с чем.
+    farms = by_labour.get("peasants", [])
+    if farms:
+        alt = society.peasant_alternative(city)
+        village = city.s("peasants").people
+        willing = {b.id: farm_willingness(wages[b.id], alt) for b in farms}
+        farm_caps = {b.id: caps[b.id] * willing[b.id] for b in farms}
+        hands = min(village, sum(farm_caps.values()))
+        alloc.update(_fill_jobs(farms, farm_caps, wages, hands))
+        caps = {**caps, **farm_caps}
 
     s = config.LABOR_STICKINESS
     for b in active:
         b.employed = max(0.0, min(caps[b.id], b.employed * s + alloc[b.id] * (1 - s)))
 
+    # Безработица — беда одного заводского сословия: крестьянину, которого не
+    # взяли на ферму, есть куда вернуться, и в безработные он не попадает.
+    hired_workers = sum(b.employed for b in factory)
+    city.unemployment = (max(0.0, 1.0 - hired_workers / workers)
+                         if workers > EPS else 0.0)
     employed = sum(b.employed for b in active)
-    city.unemployment = max(0.0, 1.0 - employed / max(workers, EPS))
     if employed > EPS:
         city.avg_wage = sum(b.employed * wages[b.id] for b in active) / employed
-    return employed
+    return {"workers": hired_workers,
+            "peasants": sum(b.employed for b in by_labour.get("peasants", [])),
+            "total": employed}
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +708,7 @@ def _empty_country_result(country: Country) -> dict:
         "markets": {}, "input_demand": {}, "consumer_demand": {},
         "production": {}, "prod_cost": {}, "consumer_spend": 0.0,
         "total_wages": 0.0, "subsidy": 0.0, "employed_total": 0.0,
-        "total_workers": 0.0, "pop": 0.0, "village": 0.0,
+        "total_workers": 0.0, "farm_hands": 0.0, "pop": 0.0, "village": 0.0,
         "artisan_spend": 0.0, "public_spend": 0.0, "value_added": 0.0,
         "army_cost": 0.0, "mobilized": 0.0,
         "living_standard": 1.0,
@@ -680,6 +733,11 @@ def run_country(world: World, country: Country) -> dict:
 
     for city in cities:
         for st in city.strata.values():
+            # Прошлый доход запоминается перед обнулением: по нему сословие и
+            # судит, стоит ли идти служить или менять занятие. Своего дохода за
+            # идущий пейдей человек ещё не получил, и сравнивать жалованье было
+            # бы не с чем — см. Stratum.usual_income_per_capita.
+            st.last_income = st.income
             st.income = 0.0
         society.update_service_cost(city)
 
@@ -691,8 +749,20 @@ def run_country(world: World, country: Country) -> dict:
     # неоплаченная армия разбегается и воевать становится некому. Призыв и
     # мобилизация идут до найма, чтобы забранные приказом люди не успели
     # выйти на смену.
+    # Приток за новых игроков идёт первым: приехавшие в этот пейдей люди
+    # должны успеть и поесть, и выйти на работу, а не ждать следующего.
+    society.settle_newcomers(world, country)
+
     society.pay_army(world, country)
     society.conscript(world, country)
+    # Потери командиров считает война (step_wars идёт после экономики), а
+    # обнуляется счётчик здесь — в начале следующего пейдея. Так витрина весь
+    # пейдей показывает потери последнего боя, а не пустой ноль.
+    country.last_officers_lost = 0.0
+    society.commission_officers(world, country)
+    # Расстановка по фронтам приводится в чувство после всех перемен в армии:
+    # погибших, разбежавшихся и распущенных на фронте уже нет.
+    society.normalize_fronts(world, country)
     mobilized = society.mobilize(world, country)
     if country.mobilization_left > 0:
         country.mobilization_left -= 1
@@ -708,7 +778,9 @@ def run_country(world: World, country: Country) -> dict:
     society.wear_weapons(world, country)
 
     # --- Фаза 1–2: наём и распределение рабочих ----------------------------
-    employed_by_city: dict[int, float] = {}
+    # Раздача мест идёт ДО крестьянского урожая (фаза 3) не случайно: кто ушёл
+    # за зарплату на чужое поле, тот в этот пейдей не пашет своё.
+    employed_by_city: dict[int, dict[str, float]] = {}
     for city in cities:
         society.recruit_workers(world, country, city)
         employed_by_city[city.id] = allocate_labor(world, country, city.id)
@@ -722,7 +794,7 @@ def run_country(world: World, country: Country) -> dict:
     }
 
     # --- Фаза 3: деревня и услуги ------------------------------------------
-    own_food: dict[int, float] = {}
+    own_grain: dict[int, float] = {}
     craft_plans: dict[int, dict] = {}
     input_demand: dict[int, dict[str, float]] = {c.id: defaultdict(float)
                                                  for c in cities}
@@ -730,7 +802,7 @@ def run_country(world: World, country: Country) -> dict:
     crafts = society.artisan_crafts(world)
     for city in cities:
         m = markets[city.id]
-        own_food[city.id] = society.produce_peasants(world, country, city, m)
+        own_grain[city.id] = society.produce_peasants(world, country, city, m)
         society.produce_services(world, country, city, m)
 
         artisans = city.s("artisans")
@@ -825,7 +897,12 @@ def run_country(world: World, country: Country) -> dict:
     prod_cost: dict[int, dict[str, float]] = {c.id: defaultdict(float) for c in cities}
     total_wages = 0.0
     value_added = 0.0
-    wage_income: dict[int, float] = defaultdict(float)
+    # Фонд оплаты труда — ПО СОСЛОВИЯМ: {(область, сословие): начислено}.
+    # Заводскую зарплату получают рабочие, а зарплату с фермы — крестьяне,
+    # оставаясь крестьянами. Пока копилка была одна, деньги за поле уходили бы
+    # заводскому сословию, а деревня, ради которой всё и затевалось, не видела
+    # бы от найма ни червонца.
+    wage_income: dict[tuple[int, str], float] = defaultdict(float)
 
     for b, owner, employed, wage_bill, upkeep, needs, planned in plans:
         ind = inds[b.industry_key]
@@ -869,10 +946,10 @@ def run_country(world: World, country: Country) -> dict:
         b.last_inputs = spent_inputs
         b.last_wages = wages_paid
         b.last_costs = spent_inputs + wages_paid + upkeep
-        wage_income[b.city_id] += wages_paid + upkeep
+        wage_income[(b.city_id, ind.labour)] += wages_paid + upkeep
 
-    for cid, gross in wage_income.items():
-        st = world.cities[cid].s("workers")
+    for (cid, stratum), gross in wage_income.items():
+        st = world.cities[cid].s(stratum)
         st.income += gross * (1.0 - country.income_tax)
         st.cash += gross * (1.0 - country.income_tax)
         country.collect("income_tax", gross * country.income_tax)
@@ -904,7 +981,7 @@ def run_country(world: World, country: Country) -> dict:
     consumer_spend = 0.0
     for city in cities:
         res = society.consume(world, country, city, markets[city.id],
-                              own_food[city.id])
+                              own_grain[city.id])
         fulfilment[city.id] = res
         for r in res.values():
             for g, qty in r.get("plan", {}).items():
@@ -926,8 +1003,17 @@ def run_country(world: World, country: Country) -> dict:
         share = city.population / pop_all
         consumer_demand[city.id]["shells"] += want_shells * share
         consumer_demand[city.id]["weapons"] += want_weapons * share
-        society.restock_shells(world, country, city, markets[city.id], share)
-        society.restock_weapons(world, country, city, markets[city.id], share)
+
+    # Спрос делится между областями по населению — армию снабжают отовсюду, и
+    # цену это двигает везде. А вот САМА ЗАКУПКА идёт подряд, по всей стране,
+    # пока недостача не закрыта или пока не кончились снаряды и деньги. Раньше
+    # закупка тоже шла по разнарядке, и получалась нелепость: снаряды лежат в
+    # столице, две трети народу живёт в провинции — и две трети заказа
+    # пропадали впустую, хотя товар был. Недостача при этом считается заново на
+    # каждой области, поэтому вторая область докупает ровно остаток.
+    for city in cities:
+        society.restock_shells(world, country, city, markets[city.id])
+        society.restock_weapons(world, country, city, markets[city.id])
 
     # Вооружённость — доля штатного арсенала, лежащая на складах. Именно она,
     # а не численность и не покупки за этот пейдей, решает исход боёв.
@@ -979,7 +1065,7 @@ def run_country(world: World, country: Country) -> dict:
     # сытое сословие переносит её заметно легче голодного.
     mobilizing = country.mobilization_left > 0
     for city in cities:
-        employed = employed_by_city.get(city.id, 0.0)
+        hired = employed_by_city.get(city.id, {})
         for key in config.STRATA_ORDER:
             st = city.s(key)
             if st.people <= EPS:
@@ -998,7 +1084,7 @@ def run_country(world: World, country: Country) -> dict:
         pop = city.population or 1.0
         city.satisfaction = sum(st.satisfaction * st.people
                                 for st in city.strata.values()) / pop
-        society.drift_and_switch(world, city, employed)
+        society.drift_and_switch(world, city, hired.get("workers", 0.0))
         society.demography(world, city)
 
     for city in cities:
@@ -1009,7 +1095,8 @@ def run_country(world: World, country: Country) -> dict:
 
     # --- Локальные макропоказатели ----------------------------------------
     total_workers = sum(c.s("workers").people for c in cities)
-    employed_total = sum(employed_by_city.values())
+    employed_total = sum(x.get("total", 0.0) for x in employed_by_city.values())
+    farm_hands = sum(x.get("peasants", 0.0) for x in employed_by_city.values())
     village = sum(rev for m in markets.values()
                   for oid, rev in m.revenue.items() if oid < 0)
     country.gdp = value_added + village - artisan_spend + public_spend
@@ -1027,6 +1114,10 @@ def run_country(world: World, country: Country) -> dict:
         "subsidy": subsidy,
         "employed_total": employed_total,
         "total_workers": total_workers,
+        # Крестьяне, нанятые на фермы. В «рабочие» они не переходят и в
+        # индустриализацию не считаются — это по-прежнему деревня, но деревня
+        # на жалованье.
+        "farm_hands": farm_hands,
         "pop": pop,
         "village": village,
         "artisan_spend": artisan_spend,
@@ -1060,7 +1151,7 @@ def _update_local_prices(world: World, country: Country, res: dict) -> None:
 
     for city in regions:
         demands[city.id] = _region_unit_costs(
-            world, city, wage_ref,
+            world, city, wage_ref, res["markets"][city.id],
             res["production"].get(city.id, {}), res["prod_cost"].get(city.id, {}),
             res["input_demand"].get(city.id, {}),
             res["consumer_demand"].get(city.id, {}))
@@ -1136,13 +1227,33 @@ def _sane_unit_cost(actual: float, previous: float, notional: float | None) -> f
     return min(actual, notional * config.UNIT_COST_SANITY)
 
 
-def _region_unit_costs(world: World, city, wage_ref: float,
+def _region_unit_costs(world: World, city, wage_ref: float, market,
                        production: dict, prod_cost: dict,
                        input_demand: dict, consumer_demand: dict) -> dict:
     """Проход первый: себестоимость каждого товара в этой области.
 
     Возвращает спрос по товарам — он понадобится второму проходу, а считать
     его дважды незачем.
+
+    **Считается ПО ВСЕМ, кто товар делает, а не по одним заводам.** Цену на
+    рынке задаёт средняя себестоимость всех продавцов, а не самого дешёвого из
+    них: пока рядом стоит миллион крестьян со своими наделами, хлеб не может
+    стоить столько, во сколько он обходится одной образцовой ферме.
+
+    Именно на этом ломалась вся агропромышленность. `production` — это выпуск
+    ОДНИХ ПРЕДПРИЯТИЙ; выпуск деревни и кустарей в него не входит. Стоило игроку
+    поставить ферму, и себестоимость зерна начинала считаться по ней одной,
+    хотя на её долю приходилась пятая часть хлеба в области. Ферма же вчетверо
+    производительнее надела, значит её себестоимость вчетверо ниже — и якорь
+    зерна обваливался вслед за ней, утаскивая цену. Деревня, продававшая
+    остальные четыре пятых, теряла половину выручки за один пейдей: **ферма
+    разоряла село самим фактом своего появления**, и строить её было вредно.
+
+    Теперь заводской выпуск идёт по своей фактической себестоимости, а
+    деревенский — по рецептурной (`notional_unit_cost`, труд крестьянина на его
+    выработку), и обе складываются с весом своего выпуска. Ферма по-прежнему
+    удешевляет хлеб — но ровно настолько, насколько её доля в общем урожае, а
+    не так, будто кроме неё в стране никто не пашет.
     """
     total_demand: dict[str, float] = defaultdict(float)
     for src in (input_demand, consumer_demand):
@@ -1155,7 +1266,14 @@ def _region_unit_costs(world: World, city, wage_ref: float,
         local = society.lg(city, key)
         notional = society.notional_unit_cost(world, city, key, wage_ref)
         plant = production.get(key, 0.0)
-        if plant > EPS:
+        # Всё, что сделано в области за пейдей, минус заводское, — это выпуск
+        # деревни и кустарей. Своей бухгалтерии у них нет, поэтому их труд
+        # оценивается по рецепту.
+        outside = max(0.0, market.produced.get(key, 0.0) - plant)
+        if plant > EPS and outside > EPS and notional is not None:
+            blended = (prod_cost[key] + outside * notional) / (plant + outside)
+            local.unit_cost = _sane_unit_cost(blended, local.unit_cost, notional)
+        elif plant > EPS:
             local.unit_cost = _sane_unit_cost(prod_cost[key] / plant,
                                               local.unit_cost, notional)
         elif notional is not None:
@@ -1833,6 +1951,22 @@ def declare_war(world: World, attacker_id: int, defender_id: int,
             war.defenders.append(ally)
 
     world.wars[war.id] = war
+
+    # Резерв выдвигается на новые фронты сам. Без этого страна, которой войну
+    # объявили, встречала бы врага пустой границей просто потому, что лидер не
+    # успел ничего нажать, — а у AI-государств нажимать и вовсе некому. Войска
+    # с ДРУГИХ фронтов при этом не трогаются: снимать их — отдельное решение и
+    # отдельный риск.
+    for side, other in ((war.attackers, war.defenders),
+                        (war.defenders, war.attackers)):
+        for cid in side:
+            country = world.countries.get(cid)
+            if country is None or not country.alive:
+                continue
+            society.normalize_fronts(world, country)
+            for enemy in other:
+                if enemy in world.neighbor_countries(cid):
+                    society.deploy_reserve(world, country, enemy)
     return war
 
 
@@ -1875,15 +2009,21 @@ def _battle(world: World, war: War, region_a: int, region_d: int) -> None:
     """
     ra, rd = world.cities[region_a], world.cities[region_d]
     ca, cd = world.countries[ra.country_id], world.countries[rd.country_id]
-    sa = society.army_strength(world, ca)
-    sd = society.army_strength(world, cd)
+
+    # Дерётся не армия страны, а ФРОНТ против этого конкретного противника.
+    # Полки, стоящие на другой границе, и резерв в тылу здесь не помогают ничем:
+    # в этом и весь смысл фронтов.
+    #
+    # Один фронт может проходить сразу по нескольким парам смежных областей —
+    # тогда стоящие на нём войска растягиваются по всем, и на каждом участке их
+    # оказывается меньше. Широкая граница ослабляет оборону, и это правильно.
+    pairs = max(1, len(world.border_regions(ca.id, cd.id)))
+    men_a = society.front_soldiers(ca, cd.id) / pairs
+    men_d = society.front_soldiers(cd, ca.id) / pairs
+    sa = society.front_strength(world, ca, cd.id) / pairs
+    sd = society.front_strength(world, cd, ca.id) / pairs
     if sa <= EPS and sd <= EPS:
         return                      # воевать некому — фронт стоит
-
-    # Силы страны делятся между её фронтами: на два направления сразу
-    # армии хватает хуже, чем на одно.
-    sa /= max(1, _front_count(world, war, ca.id))
-    sd /= max(1, _front_count(world, war, cd.id))
 
     r = society.rng_for(world, region_a * 1000 + region_d, salt=91)
     luck = config.BATTLE_LUCK
@@ -1893,18 +2033,20 @@ def _battle(world: World, war: War, region_a: int, region_d: int) -> None:
     if total <= EPS:
         return
 
-    # Расход снарядов и потери оружия: стреляют оба, независимо от исхода.
-    spent_a = _burn_shells(world, ca)
-    spent_d = _burn_shells(world, cd)
-    _lose_weapons(world, ca)
-    _lose_weapons(world, cd)
+    # Расход снарядов и потери оружия: стреляют оба, независимо от исхода, —
+    # но по числу тех, кто ДЕЙСТВИТЕЛЬНО в бою, а не по всей армии.
+    spent_a = _burn_shells(world, ca, men_a)
+    spent_d = _burn_shells(world, cd, men_d)
+    _lose_weapons(world, ca, men_a)
+    _lose_weapons(world, cd, men_d)
 
-    # При равных силах каждый теряет BATTLE_LOSS_RATE своей армии; перевес
-    # противника увеличивает потери, свой — уменьшает.
-    loss_a = min(0.60, config.BATTLE_LOSS_RATE * 2.0 * fd / total)
-    loss_d = min(0.60, config.BATTLE_LOSS_RATE * 2.0 * fa / total)
-    dead_a = _kill_soldiers(world, ca, loss_a)
-    dead_d = _kill_soldiers(world, cd, loss_d)
+    # При равных силах каждый теряет BATTLE_LOSS_RATE стоящих здесь людей;
+    # перевес противника увеличивает потери, свой — уменьшает. Гибнут именно
+    # войска этого фронта: тыл и другие направления потерь не несут.
+    loss_a = min(config.BATTLE_LOSS_MAX, config.BATTLE_LOSS_RATE * 2.0 * fd / total)
+    loss_d = min(config.BATTLE_LOSS_MAX, config.BATTLE_LOSS_RATE * 2.0 * fa / total)
+    dead_a, off_a = _kill_front(world, ca, cd.id, loss_a / pairs)
+    dead_d, off_d = _kill_front(world, cd, ca.id, loss_d / pairs)
 
     edge = fa / total - 0.5         # -0.5 … +0.5, перевес нападающего
     ruin_d = _ravage(world, rd, max(0.0, 0.5 + edge), r)
@@ -1919,6 +2061,15 @@ def _battle(world: World, war: War, region_a: int, region_d: int) -> None:
         "defender": cd.id, "defender_name": cd.name,
         "region_attacker": ra.name, "region_defender": rd.name,
         "strength_attacker": round(sa), "strength_defender": round(sd),
+        # Сколько людей стояло на фронте и как ими командовали. Без этих двух
+        # чисел разбор боя нечитаем: по одной «силе» не понять, проиграли из-за
+        # нехватки штыков или из-за того, что офицеров оставили в тылу.
+        "men_attacker": round(men_a), "men_defender": round(men_d),
+        "command_attacker": round(society.command_quality(
+            society.front_officers(ca, cd.id), society.front_soldiers(ca, cd.id)), 3),
+        "command_defender": round(society.command_quality(
+            society.front_officers(cd, ca.id), society.front_soldiers(cd, ca.id)), 3),
+        "officers_attacker": round(off_a), "officers_defender": round(off_d),
         "edge": round(adv, 3),
         "losses_attacker": round(dead_a), "losses_defender": round(dead_d),
         "shells_attacker": round(spent_a), "shells_defender": round(spent_d),
@@ -1931,50 +2082,81 @@ def _battle(world: World, war: War, region_a: int, region_d: int) -> None:
     })
 
 
-def _front_count(world: World, war: War, country_id: int) -> int:
-    """Сколько областей страны сейчас под боями в этой войне."""
-    n = 0
-    for enemy in war.enemies_of(country_id):
-        n += len(world.border_regions(country_id, enemy))
-    return n
-
-
 def _bump_occupation(war: War, country_id: int, region_id: int, delta: float) -> None:
     """Накопить перевес страны над конкретной чужой областью."""
     key = f"{country_id}>{region_id}"
     war.occupation[key] = max(0.0, min(1.2, war.occupation.get(key, 0.0) + delta))
 
 
-def _burn_shells(world: World, country: Country) -> float:
-    need = society.army_size(world, country) * config.SHELLS_PER_SOLDIER_BATTLE
-    spent = min(need, country.army_shells)
+def _burn_shells(world: World, country: Country, men: float) -> float:
+    """Снаряды, выпущенные в бою. Считаются по тем, кто в нём участвовал."""
+    spent = min(max(0.0, men) * config.SHELLS_PER_SOLDIER_BATTLE,
+                country.army_shells)
     country.army_shells = max(0.0, country.army_shells - spent)
     return spent
 
 
-def _lose_weapons(world: World, country: Country) -> float:
+def _lose_weapons(world: World, country: Country, men: float) -> float:
     """Оружие, разбитое и брошенное в бою. Воевать — дорого и по арсеналу."""
-    lost = min(society.army_size(world, country) * config.WEAPONS_BATTLE_LOSS,
-               country.army_weapons)
+    lost = min(max(0.0, men) * config.WEAPONS_BATTLE_LOSS, country.army_weapons)
     country.army_weapons = max(0.0, country.army_weapons - lost)
     society.update_army_equip(world, country)
     return lost
 
 
-def _kill_soldiers(world: World, country: Country, share: float) -> float:
-    """Убыль армии. Деньги погибших пропадают вместе с ними."""
+def _kill_front(world: World, country: Country, enemy_id: int,
+                share: float) -> tuple[float, float]:
+    """Убыль войск НА ОДНОМ ФРОНТЕ. Возвращает (солдат, офицеров).
+
+    Гибнут только те, кто в этом бою и был: резерв и полки на других границах
+    потерь не несут. Поэтому доля считается от людей на фронте, а не от армии
+    страны, — иначе бой на дальней границе выкашивал бы гарнизон столицы.
+
+    Убыль снимается сразу с двух учётов, и оба обязательны: из сословия (это
+    живые люди в областях) и из расстановки по фронтам (это то, кем лидер
+    считает себя командующим). Разойдись они — и на бумажном фронте воевали бы
+    давно погибшие.
+
+    ОФИЦЕРЫ ГИБНУТ ЧАЩЕ СОЛДАТ — в config.OFFICER_CASUALTY_MULT раз, — потому
+    что командовать приходится с передовой, а не из тыла. Механика эта не про
+    численность (офицеров и так немного), а про качество командования: оно
+    считается от доли офицеров на фронте, поэтому каждый бой сам собой роняет
+    его на следующем пейдее. Армия, которая вчера дралась в полную силу,
+    сегодня дерётся хуже — и чем дольше идёт война, тем сильнее она
+    обезглавлена. Восполнить корпус быстро нельзя: офицеров нанимают из высшего
+    общества понемногу за пейдей и за отдельное жалованье
+    (society.commission_officers).
+    """
     if share <= EPS:
-        return 0.0
-    dead = 0.0
-    for city in society.country_cities(world, country):
-        st = city.s("soldiers")
-        if st.people <= EPS:
-            continue
-        gone = st.people * share
-        st.cash = max(0.0, st.cash * (1.0 - share))
-        st.people = max(0.0, st.people - gone)
-        dead += gone
-    return dead
+        return 0.0, 0.0
+    out = []
+    for key, holder, rate in (
+            ("soldiers", country.fronts,
+             min(config.BATTLE_LOSS_MAX, share)),
+            ("officers", country.front_officers,
+             min(config.OFFICER_LOSS_MAX, share * config.OFFICER_CASUALTY_MULT))):
+        fkey = society.front_key(enemy_id)
+        on_front = max(0.0, holder.get(fkey, 0.0))
+        total = sum(c.s(key).people
+                    for c in society.country_cities(world, country))
+        dead = min(on_front * rate, total)
+        holder[fkey] = max(0.0, on_front - dead)
+        if key == "officers":
+            # Потери командиров считаются отдельной строкой: по ним лидер и
+            # видит, что армия осталась без офицеров, — по числу штыков этого
+            # не понять.
+            country.last_officers_lost += dead
+        if dead > EPS and total > EPS:
+            # людей списываем с областей пропорционально их гарнизонам
+            loss = dead / total
+            for city in society.country_cities(world, country):
+                st = city.s(key)
+                if st.people <= EPS:
+                    continue
+                st.cash = max(0.0, st.cash * (1.0 - loss))
+                st.people = max(0.0, st.people - st.people * loss)
+        out.append(dead)
+    return out[0], out[1]
 
 
 def _ravage(world: World, city, intensity: float, r) -> dict:

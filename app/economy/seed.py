@@ -23,9 +23,15 @@ from ..models import (
 # ---------------------------------------------------------------------------
 # Товары (глобальные чертежи)
 # ---------------------------------------------------------------------------
+#
+# ЛЕСТНИЦА ЕДЫ — три ступени, от дешёвой сытости к дорогому столу:
+#   Зерно → Продовольствие → Мясо.
+# Зерно растит и ест сама деревня, остальное — переделы: «Пищевой завод» и
+# «Скотоводческая ферма». Чем выше ступень, тем дороже единица и тем сильнее
+# она поднимает уровень жизни.
 GOODS = [
     # key           название        категория       tier  якорь  хранится   порча/тик
-    ("grain",       "Зерно",        "raw",          0,     2.4,  True,     config.PERISH_RATES["grain"]),
+    ("grain",       "Зерно",        "consumer",     1,     6.0,  True,     config.PERISH_RATES["grain"]),
     ("wood",        "Лес",          "raw",          0,     7.0,  True,     0.0),
     ("cotton",      "Хлопок",       "raw",          0,     7.0,  True,     0.0),
     ("coal",        "Уголь",        "raw",          0,     7.9,  True,     0.0),
@@ -34,7 +40,7 @@ GOODS = [
     ("boards",      "Доски",        "intermediate", 0,    30.0,  True,     0.0),
     ("cloth",       "Ткань",        "intermediate", 0,    30.0,  True,     0.0),
     ("steel",       "Сталь",        "intermediate", 0,    49.5,  True,     0.0),
-    ("food",        "Еда",          "consumer",     1,    11.3,  True,     config.PERISH_RATES["food"]),
+    ("provisions",  "Продовольствие", "consumer",   2,    22.0,  True,     config.PERISH_RATES["provisions"]),
     ("services",    "Услуги",       "services",     2,    99.0,  False,    0.0),
     ("clothes",     "Одежда",       "consumer",     2,    93.0,  True,     0.0),
     ("furniture",   "Мебель",       "consumer",     2,   175.0,  True,     0.0),
@@ -46,7 +52,7 @@ GOODS = [
     ("shells",      "Снаряды",      "military",     2,    48.0,  True,     0.0),
     # Роскошь. В обычную корзину не входит: её начинают хотеть, только когда
     # ожидания уровня жизни дорастают до соответствующей ступени.
-    ("meat",        "Мясо",         "luxury",       3,    26.0,  True,     config.PERISH_RATES["meat"]),
+    ("meat",        "Мясо",         "luxury",       3,    62.0,  True,     config.PERISH_RATES["meat"]),
     ("wine",        "Вино",         "luxury",       3,    28.0,  True,     0.0),
     ("fine_clothes", "Роскошная одежда", "luxury",  3,   165.0,  True,     0.0),
     ("fine_furniture", "Роскошная мебель", "luxury", 3,  400.0,  True,     0.0),
@@ -63,9 +69,23 @@ GOODS = [
 # обычный товар, и должна достраиваться к уже поднятой цепочке: ателье к
 # ткацкой фабрике, скотоводство к ферме.
 J = config.JOBS_PER_LEVEL
+#: Отрасли, где работают КРЕСТЬЯНЕ, а не рабочие (Industry.labour).
+#: Крестьянин выходит на чужое поле за зарплату, не меняя сословия и не
+#: переселяясь в город, — поэтому ферму можно поставить с первого пейдея, когда
+#: рабочих в стране ещё нет ни одного. Плата за это — мест нужно кратно больше:
+#: поле берут числом рук, а не станками.
+PEASANT_INDUSTRIES = {"farm"}
+
 INDUSTRIES = [
     # key, название, выход, ед/работник, мест/уровень, входы, множитель, сектор
-    ("farm",       "Ферма",                  "grain",      26.0, J, {}, 0.9, "agro"),
+    #
+    # ФЕРМА — крестьянское предприятие. Один нанятый крестьянин снимает с
+    # хозяйской земли почти втрое против своего надела (config.PEASANT_YIELD),
+    # но и людей на ферму нужно впятеро против заводского цеха.
+    # Ферма НЕ отнимает у деревни сбыт, а нанимает саму деревню: зерна в стране
+    # становится больше, оно дешевеет, а село живёт зарплатой, которая по
+    # правилу найма (config.FARM_WAGE_EDGE) обязана быть выше своего надела.
+    ("farm",       "Ферма",                  "grain",       5.8, 5 * J, {}, 2.6, "agro"),
     ("logging",    "Лесозаготовка",          "wood",        9.0, J, {}, 1.0, "forest"),
     ("plantation", "Плантация",              "cotton",      9.0, J, {}, 0.9, "textile"),
     ("coalmine",   "Угольная шахта",         "coal",        8.0, J, {}, 1.1, "mining"),
@@ -77,7 +97,11 @@ INDUSTRIES = [
     ("smelter",    "Металлургический завод", "steel",       3.2, J,
      {"ore": 2.0, "coal": 1.0}, 1.6, "mining"),
 
-    ("foodplant",  "Пищевой завод",          "food",       11.0, J, {"grain": 2.0}, 1.2, "agro"),
+    # Пищевой передел — вторая ступень лестницы еды. Зерно в готовую еду: мука,
+    # крупа, масло, выпечка, копчёное. Дороже зерна, но не роскошь: это то, что
+    # покупает всякий, у кого на хлеб уже хватает, — и потому первое, ради чего
+    # деревне есть смысл зарабатывать деньги.
+    ("foodplant",  "Пищевой завод",          "provisions",  8.0, J, {"grain": 3.0}, 1.2, "agro"),
     ("tailor",     "Швейная фабрика",        "clothes",     2.6, J, {"cloth": 2.0}, 1.3, "textile"),
     ("furniture",  "Мебельная фабрика",      "furniture",   1.7, J, {"boards": 4.0}, 1.4, "forest"),
     ("toolworks",  "Инструментальный завод", "tools",       1.6, J,
@@ -94,8 +118,12 @@ INDUSTRIES = [
 
     # Роскошь. Всё это переводит дешёвое сырьё в дорогой товар, поэтому
     # окупается только там, где людям есть на что его покупать.
-    ("ranch",      "Скотоводческая ферма",   "meat",        1.2, J,
-     {"grain": 4.0}, 1.2, "agro"),
+    # Мясо — верх лестницы еды и самое дорогое, что на ней есть: скотине идёт
+    # всемеро больше зерна, чем выходит мяса, — оттого оно и роскошь. Единица
+    # мяса обязана стоить дороже единицы продовольствия: это вершина лестницы,
+    # и если её обогнать ступенью ниже, вся лестница теряет смысл.
+    ("ranch",      "Скотоводческая ферма",   "meat",        1.1, J,
+     {"grain": 7.0}, 1.2, "agro"),
     ("winery",     "Винодельня",             "wine",        0.8, J,
      {"grain": 3.0}, 1.3, "agro"),
     ("couture",    "Ателье",                 "fine_clothes", 0.9, J,
@@ -105,16 +133,50 @@ INDUSTRIES = [
 ]
 
 # ---------------------------------------------------------------------------
+# Пояснения к отраслям, у которых механика не читается по одной таблице
+# «выход — сырьё — мест». Показываются подсказкой в «Строительстве».
+# ---------------------------------------------------------------------------
+INDUSTRIES_NOTES_SRC = [
+    ("farm",
+     "Крестьянское предприятие: работают на нём КРЕСТЬЯНЕ, а не рабочие, и "
+     "мест нужно впятеро против заводского цеха. Крестьянин не меняет сословия "
+     "и никуда не переселяется — он выходит на чужое поле за деньги вместо "
+     "своего за хлеб, и с хозяйской земли снимает почти втрое против своего "
+     "надела. Поэтому ферму можно ставить с первого пейдея, когда рабочих в "
+     "стране ещё нет ни одного. Но и платить придётся честно: ниже того, что "
+     "даёт собственный надел, на поле не выйдет никто.\n\n"
+     "СТРОИТЬ НАДО КРУПНО. Одна маленькая ферма деревне во вред: хлеба на рынке "
+     "прибавляется, цена падает — а жалованье получает лишь горстка нанятых, и "
+     "остальное село просто теряет выручку. Дешёвый хлеб окупается для деревни "
+     "только тогда, когда на фермах работает заметная её часть. Ставьте ферму "
+     "уровнями и стройте рядом пищевой завод: он выкупает зерно и держит цену."),
+    ("foodplant",
+     "Пищевой передел: зерно в готовую еду — муку, крупу, масло, выпечку, "
+     "копчёное. Вторая ступень лестницы еды. Дороже хлеба, но НЕ роскошь: её "
+     "берут все, у кого на зерно уже хватает, начиная с деревни, — поэтому "
+     "спрос на неё есть даже в бедной стране, и растёт он вместе с достатком."),
+    ("ranch",
+     "Вершина лестницы еды. Скотине идёт всемеро больше зерна, чем выходит "
+     "мяса, — оттого мясо и самое дорогое, что бывает на столе. Покупают его "
+     "только сословия, доросшие ожиданиями до роскоши."),
+]
+INDUSTRY_NOTES = dict(INDUSTRIES_NOTES_SRC)
+
+# ---------------------------------------------------------------------------
 # Административные здания. Ничего не производят, содержат служащих и
 # потребляют товары. Строит только государство.
 # ---------------------------------------------------------------------------
+# Штат казённых зданий кормят ЗЕРНОМ — тем же хлебом, что ест вся страна:
+# служащий на казённом пайке не барин. Раньше в пайке стояла «Еда», но еда с
+# тех пор поднялась на ступень выше и стала «Продуктами» — переделом, которого
+# в доиндустриальной стране ещё никто не делает.
 ADMIN = [
     # key, название, мест/уровень, потребление на уровень, множитель, описание,
     # предел уровней (0 — без предела)
-    ("townhall", "Ратуша", 900, {"food": 420.0, "furniture": 26.0}, 1.5,
-     "Управа города. Содержит служащих и создаёт спрос на еду и мебель.", 0),
+    ("townhall", "Ратуша", 900, {"grain": 780.0, "furniture": 26.0}, 1.5,
+     "Управа города. Содержит служащих и создаёт спрос на хлеб и мебель.", 0),
     ("trade_chamber", "Торговая палата", 700,
-     {"food": 320.0, "tools": 18.0}, config.TRADE_CHAMBER_COST_MULT,
+     {"grain": 600.0, "tools": 18.0}, config.TRADE_CHAMBER_COST_MULT,
      "Ведомство торговли — единственное, что поднимает ДОСТУПНОСТЬ РЫНКА "
      "области. Без палат область живёт своим прилавком и доступна общей "
      "экономике на 10%; каждый уровень палаты добавляет ещё 10%, девятый "
@@ -123,7 +185,7 @@ ADMIN = [
      "задаёт объём вывоза и ввоза. Стоит дорого и дорожает с каждым уровнем: "
      "единый рынок страна строит десятилетиями.",
      config.TRADE_CHAMBER_MAX_LEVEL),
-    ("academy", "Академия", 600, {"food": 280.0, "furniture": 18.0}, 1.8,
+    ("academy", "Академия", 600, {"grain": 520.0, "furniture": 18.0}, 1.8,
      "Учебное заведение. Пока только содержит штат — "
      "развитие технологий появится позже.", 0),
 ]
@@ -138,7 +200,7 @@ CULTURE = [
     # key, название, выпуск, ед/работник, мест/уровень, входы,
     # содержание на уровень, множитель цены, описание
     ("opera", "Оперный театр", "luxury_services", 0.5, J, {"wine": 0.35},
-     {"food": 300.0, "fine_furniture": 6.0}, 2.4,
+     {"grain": 560.0, "fine_furniture": 6.0}, 2.4,
      "Опера, салоны и галереи. Единственный источник роскошных услуг — "
      "того самого, на что тратит деньги разбогатевшее общество. "
      "Строит только государство."),
@@ -183,6 +245,10 @@ START_SHARES = {
     "town_high": 0.05,
     # Небольшой гарнизон есть у всех: он и создаёт стартовый спрос на оружие.
     "soldiers": 0.01,
+    # Офицерский корпус ровно по штату (config.OFFICER_TARGET_SHARE от солдат):
+    # стартовая армия укомплектована, но стоит лидеру её удвоить — и командиров
+    # на всех уже не хватит, пока он их не наберёт.
+    "officers": 0.01 * config.OFFICER_TARGET_SHARE,
 }
 
 START_STOCK_TICKS = 1.0  # на сколько пейдеев спроса заполнить стартовый склад
@@ -214,7 +280,9 @@ def _make_industries(world: World) -> None:
         world.industries[key] = Industry(
             key=key, name=name, output_good=out, output_per_worker=opw,
             jobs_per_level=jpl, inputs=dict(inputs), build_cost_mult=mult,
-            kind="industry", sector=sector)
+            kind="industry", sector=sector,
+            description=INDUSTRY_NOTES.get(key, ""),
+            labour="peasants" if key in PEASANT_INDUSTRIES else "workers")
     for key, name, jpl, upkeep, mult, desc, cap in ADMIN:
         world.industries[key] = Industry(
             key=key, name=name, output_good=None, output_per_worker=0.0,
@@ -306,8 +374,11 @@ def build_world() -> World:
             foreign_investment_open=False,
             color=color,
             soldier_pay=config.SOLDIER_PAY_DEFAULT,
-            # бюджет ровно под стартовый гарнизон
-            army_budget=pop * START_SHARES["soldiers"] * config.SOLDIER_PAY_DEFAULT,
+            # Бюджет ровно под стартовый гарнизон — вместе с его офицерами:
+            # место в строю стоит жалованья солдата плюс доли командира,
+            # см. society.soldier_slot_cost.
+            army_budget=pop * START_SHARES["soldiers"] * config.SOLDIER_PAY_DEFAULT
+            * (1.0 + config.OFFICER_TARGET_SHARE * config.OFFICER_PAY_MULT),
             # Гарнизон начинает вооружённым: иначе первые пейдеи все страны
             # стоят с пустыми арсеналами и разом выгребают рынок оружия.
             army_weapons=pop * START_SHARES["soldiers"] * config.WEAPONS_PER_SOLDIER,
@@ -339,14 +410,12 @@ def build_world() -> World:
     # --- стартовые мировые цены = средние по якорям ---
     w.world_prices = {k: g.anchor for k, g in w.goods.items()}
 
-    # --- стартовые склады еды/зерна у крестьян каждой области ---
+    # --- стартовый хлебный запас у крестьян каждой области ---
+    # Зерно — и еда деревни, и её товар: своей отдельной «еды» у неё больше нет.
     for city in w.cities.values():
         peasants = city.s("peasants")
-        # зерно и еда — на ~1 пейдей внутреннего спроса
-        food_demand = peasants.people * config.CONSUMPTION_BASKET["food"]["qty"]
-        peasants.warehouse["food"] = food_demand * START_STOCK_TICKS
-        peasants.warehouse["grain"] = food_demand * 0.5 * START_STOCK_TICKS
-        city.goods["food"].stock = peasants.warehouse["food"]
+        grain_demand = peasants.people * config.CONSUMPTION_BASKET["grain"]["qty"]
+        peasants.warehouse["grain"] = grain_demand * START_STOCK_TICKS
         city.goods["grain"].stock = peasants.warehouse["grain"]
 
     return w
@@ -389,6 +458,62 @@ def _link(world: World, a: int, b: int) -> None:
             node.neighbors.append(y)
 
 
+def _retire_industry(world: World, key: str, added: list[str]) -> bool:
+    """Упразднить отрасль: снести её цеха с возвратом вложенного и убрать чертёж.
+
+    Возврат — как при обычном сносе: игрок не виноват, что правила изменились,
+    и терять из-за этого деньги не должен.
+    """
+    ind = world.industries.get(key)
+    if ind is None:
+        return False
+    razed = 0
+    for b in [x for x in world.buildings.values() if x.industry_key == key]:
+        owner = world.players.get(b.owner_id)
+        if owner is not None:
+            owner.cash += config.DEMOLISH_REFUND * sum(
+                config.BUILD_COST_BASE * ind.build_cost_mult
+                * lv ** config.BUILD_COST_EXPONENT
+                for lv in range(1, b.level + 1))
+        world.buildings.pop(b.id, None)
+        razed += 1
+    world.industries.pop(key, None)
+    added.append(f"отрасль «{ind.name}» упразднена"
+                 + (f" (снесено {razed}, вложенное возвращено)" if razed else ""))
+    return True
+
+
+def _retire_good(world: World, key: str, added: list[str]) -> bool:
+    """Вычистить товар из мира целиком — чертёж, прилавки и все склады.
+
+    Оставить его висеть нельзя ни в одном месте: рынок области, склад сословия,
+    склад игрока, ремесло кустаря и мировая цена — каждое из них при следующем
+    пейдее наткнулось бы на товар, которого больше нет в `world.goods`, и повело
+    бы себя по-разному (где-то KeyError, где-то молчаливый ноль). Товар на руках
+    просто пропадает: возвращать за него нечего, продавать — некому.
+    """
+    good = world.goods.pop(key, None)
+    if good is None:
+        return False
+    for city in world.cities.values():
+        city.goods.pop(key, None)
+        for st in city.strata.values():
+            st.warehouse.pop(key, None)
+            st.consumed.pop(key, None)
+            if st.craft_mix.pop(key, None) is not None:
+                # доли ремёсел должны снова складываться в единицу
+                total = sum(st.craft_mix.values())
+                if total > 0:
+                    st.craft_mix = {k: v / total for k, v in st.craft_mix.items()}
+    for p in world.players.values():
+        for store in p.warehouses.values():
+            store.pop(key, None)
+    world.world_prices.pop(key, None)
+    world.last_trades.pop(key, None)
+    added.append(f"товар «{good.name}» изъят из обращения")
+    return True
+
+
 def migrate_world(world: World) -> list[str]:
     """Дополнить уже сохранённый мир тем, что появилось в новых версиях.
 
@@ -403,17 +528,36 @@ def migrate_world(world: World) -> list[str]:
     added: list[str] = []
 
     for key, name, cat, tier, anchor, storable, perish in GOODS:
-        if key in world.goods:
+        old = world.goods.get(key)
+        if old is None:
+            world.goods[key] = Good(key=key, name=name, category=cat, tier=tier,
+                                    anchor=anchor, storable=storable,
+                                    perish_rate=perish)
+            added.append(f"товар «{name}»")
             continue
-        world.goods[key] = Good(key=key, name=name, category=cat, tier=tier,
-                                anchor=anchor, storable=storable, perish_rate=perish)
-        added.append(f"товар «{name}»")
+        # Чертёж товара мог поменяться в самой игре: зерно из сырья превратилось
+        # в главную еду страны, продовольствие поменяло ступень. Имя, разряд и порча живут в снимке мира, поэтому старая база
+        # без этой правки навсегда осталась бы с прежними подписями. Цены и
+        # склады (LocalGood) при этом не трогаются — игра продолжается с места.
+        if old.name != name:
+            added.append(f"товар «{old.name}» переименован в «{name}»")
+        elif (old.category, old.tier) != (cat, tier):
+            added.append(f"товар «{name}» переведён в другой разряд потребления")
+        old.name, old.category, old.tier = name, cat, tier
+        old.perish_rate = perish
 
     known = set(world.industries)
     _make_industries(world)
     for key, ind in world.industries.items():
         if key not in known:
             added.append(f"отрасль «{ind.name}»")
+
+    # --- «Мельница» и «Продукты» упразднены --------------------------------
+    # Между зерном и продовольствием стояла лишняя ступень: два передела подряд
+    # на одно и то же зерно задирали цену готовой еды и уводили её из бедных
+    # корзин. Теперь «Пищевой завод» мелет зерно сам.
+    if _retire_industry(world, "mill", added) | _retire_good(world, "food", added):
+        added.append("лестница еды укоротилась: зерно → продовольствие → мясо")
 
     # --- «Торговая площадь» уступила место «Торговой палате» ----------------
     # Пропускную способность области теперь задаёт одна постройка — казённая
@@ -577,6 +721,66 @@ def migrate_world(world: World) -> list[str]:
     if models._LOADED_VERSION[0] < 5 and config.START_POP_MULT != 1.0:
         _scale_world(world, config.START_POP_MULT)
         added.append(f"население мира увеличено в {config.START_POP_MULT:g} раза")
+
+    # --- версия 5 -> 6: лестница еды и крестьянский труд на фермах ----------
+    # Деревня больше не делает отдельную «еду»: она растит зерно, им же и
+    # кормится. Сама «Еда» поднялась ступенью выше и стала «Продуктами» —
+    # переделом зерна, а «Ферма» из заводика с рабочими превратилась в
+    # крестьянское хозяйство. Чертежи товаров и отраслей уже переписаны выше;
+    # здесь остаётся одно: у уже стоящих ферм рабочие места стали
+    # крестьянскими, поэтому их рабочих надо отпустить, иначе цех так и будет
+    # числить за собой людей не того сословия.
+    if models._LOADED_VERSION[0] < 6:
+        farms = [b for b in world.buildings.values()
+                 if world.industries.get(b.industry_key) is not None
+                 and world.industries[b.industry_key].labour == "peasants"]
+        for b in farms:
+            b.employed = 0.0
+        added.append("еда стала лестницей: зерно → продовольствие → мясо; "
+                     "на фермах теперь работают крестьяне"
+                     + (f" (перенабрано {len(farms)} хозяйств)" if farms else ""))
+
+    # --- версия 6 -> 7: фронты и офицеры -----------------------------------
+    # Само сословие офицеров заводить не надо: City.s() создаёт его по первому
+    # обращению. А вот укомплектовать корпус стоит сразу — иначе уже идущая
+    # партия обнаружит, что её армия внезапно осталась без командиров и воюет
+    # с качеством командования в один процент, хотя игрок ничего не менял.
+    # Военный бюджет при этом тоже поднимается: офицеры содержатся из него, и
+    # без прибавки армия начала бы разбегаться от недоплаты.
+    if models._LOADED_VERSION[0] < 7:
+        commissioned = 0.0
+        for country in world.countries.values():
+            regions = world.country_regions(country.id)
+            soldiers = sum(c.s("soldiers").people for c in regions)
+            have = sum(c.s("officers").people for c in regions)
+            need = soldiers * config.OFFICER_TARGET_SHARE - have
+            if need <= 0 or not regions:
+                continue
+            for city in regions:
+                share = (city.s("soldiers").people / soldiers) if soldiers else 0.0
+                part = need * share
+                # Офицеров берут из горожан, а не из воздуха: армия и так
+                # оторвана от хозяйства, и приписывать ей лишних людей нечестно.
+                for key in config.OFFICER_POOL:
+                    if part <= 0:
+                        break
+                    src = city.s(key)
+                    taken = min(part, src.people * 0.5)
+                    if taken <= 0:
+                        continue
+                    cash = src.cash * (taken / src.people) if src.people else 0.0
+                    src.people -= taken
+                    src.cash -= cash
+                    city.s("officers").people += taken
+                    city.s("officers").cash += cash
+                    part -= taken
+                    commissioned += taken
+            country.army_budget *= (1.0 + config.OFFICER_TARGET_SHARE
+                                    * config.OFFICER_PAY_MULT)
+        added.append(
+            "армия встала по фронтам, у неё появились офицеры и качество "
+            f"командования (произведено {commissioned:,.0f}, "
+            "военные бюджеты подняты под их содержание)")
 
     for gkey, good in world.goods.items():
         world.world_prices.setdefault(gkey, good.anchor)
