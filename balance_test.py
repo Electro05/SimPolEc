@@ -18,6 +18,19 @@
 входит в неё союзником и затем выходит сепаратным миром. Проверяется, что война
 идёт, армии несут потери, промышленность получает урон, области меняют хозяина,
 а сепаратный мир вынимает из войны только того, кто его заключил.
+
+С флагом --school две страны заводят просвещение, а третья остаётся при
+сословном образовании. Проверяется вся цепочка разом: школы и университеты
+учат, бумажная фабрика находит покупателя в казне, грамотность открывает
+деревне дорогу на завод, а неутолённое самосознание доводит одну из стран до
+революции. Лидер первой на требования соглашается, второй — молчит и получает
+гражданскую войну; сравнение этих двух исходов и есть смысл прогона.
+
+С флагом --laws четыре государства принимают по своей форме правления —
+республику с всеобщим избирательным правом, социализм, национализм, закрытую
+экономику, — собирают парламенты и голосуют по законам, а промышленник-лоббист
+скупает голоса. Проверяется, что палаты собираются, законы проходят, деньги
+лоббиста не исчезают из экономики и роспись казны по-прежнему сходится.
 """
 from __future__ import annotations
 
@@ -25,17 +38,19 @@ import sys
 
 from app import config
 from app.economy.engine import (
-    _add_alliance, declare_war, level_cost, make_peace, run_tick,
+    _add_alliance, accept_demands, declare_war, level_cost, make_peace, run_tick,
 )
 from app.economy.pricing import price_bounds
 from app.economy.seed import build_world
-from app.economy import society
+from app.economy import politics, society
 from app.models import Building, Player
 
 TICKS = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 150
 WITH_PLAYER = "--player" in sys.argv
 WITH_TRADE = "--trade" in sys.argv
 WITH_WAR = "--war" in sys.argv
+WITH_LAWS = "--laws" in sys.argv
+WITH_SCHOOL = "--school" in sys.argv
 QUIET = "--quiet" in sys.argv
 
 
@@ -200,11 +215,188 @@ def setup_war(world) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Законы, парламенты и лоббирование
+# ---------------------------------------------------------------------------
+# Каждая страна берёт СВОЮ форму правления, чтобы за один прогон прошли все
+# ветки сразу: и «крепостное право» монархии, и «дополнительное распределение»
+# социализма, и военный сбор национализма, и закрытая экономика.
+#
+# Земельное устройство разведено по странам по той же причине: у него четыре
+# уклада, и каждый трогает деревню по-своему — от барщины до общего хозяйства.
+# Социализм при этом объявляется ЗАКОННЫМ путём (республика + всеобщее право):
+# при монархии и при цензе он теперь попросту не принимается, а коллективное
+# хозяйство не мыслится без него самого.
+LAW_SETUPS = [
+    ("республика + всеобщее право",
+     {"suffrage": "universal", "state_form": "republic",
+      "land": "smallholding"}),
+    ("социализм и коллективное хозяйство",
+     {"suffrage": "universal", "state_form": "republic",
+      "ideology": "socialism", "land": "collective"}),
+    ("национализм при богатых",
+     {"suffrage": "rich", "ideology": "nationalism", "land": "commercial"}),
+    ("закрытая монархия",
+     {"suffrage": "census", "trade": "closed", "ideology": "conservatism"}),
+]
+
+
+def setup_laws(world) -> dict:
+    """Раздать четырём странам разные формы правления и завести лоббиста.
+
+    Лоббист намеренно очень богат: его дело — проверить, что вложенные деньги
+    двигают голоса и при этом не пропадают из экономики, а не изображать
+    правдоподобного промышленника.
+    """
+    ids = list(world.countries.keys())
+    setups = []
+    blocked: list[str] = []
+    for (label, laws), cid in zip(LAW_SETUPS, ids[4:8]):
+        co = world.countries[cid]
+        # Порядок не косметический, а обязательный, и он же проверка запретов:
+        # избирательная система идёт первой (без неё не объявить республику),
+        # форма правления второй (при монархии не принять социализма),
+        # идеология третьей и лишь затем земля (коллективное хозяйство требует
+        # уже принятого социализма). Каждый шаг проходит через law_blocked —
+        # если запрет сработал не там, где задумано, это видно сразу.
+        for cat in ("suffrage", "state_form", "ideology", "land", "trade"):
+            if cat not in laws:
+                continue
+            why = politics.law_blocked(co, cat, laws[cat])
+            if why:
+                blocked.append(f"{co.name}: {cat}={laws[cat]} — {why}")
+                continue
+            politics.apply_law(world, co, cat, laws[cat])
+        setups.append((label, co))
+    lobbyist = Player(id=world.next_player_id, username="Лоббист",
+                      cash=400_000_000.0, country_id=setups[0][1].id)
+    world.players[lobbyist.id] = lobbyist
+    world.next_player_id += 1
+    return {"setups": setups, "lobbyist": lobbyist, "blocked": blocked,
+            "votes": 0, "passed": 0, "spent": 0.0, "bought": 0.0, "bills": 0}
+
+
+def play_politics(world, state: dict, tick: int) -> None:
+    """Пейдей политической жизни: лоббист вкладывается и толкает законы."""
+    lob = state["lobbyist"]
+    for label, co in state["setups"]:
+        if not co.alive or not politics.has_elections(co):
+            continue
+        # Вложения в партию перед выборами — на всякий пейдей понемногу.
+        if tick % 17 == 0:
+            stake = politics.min_stake(co) * 2
+            if lob.cash > stake:
+                politics.place_party_bid(world, co, lob, "socialists", stake)
+                state["spent"] += stake
+        # Каждый десятый пейдей выносим на голосование протекционизм и
+        # подпираем его деньгами: перевес вложений и есть купленные голоса.
+        if (tick % 10 == 0 and co.law_vote is None and co.parties
+                and tick > co.last_law_tick + config.LAW_COOLDOWN_TICKS):
+            want = "protectionism" if politics.law(co, "trade") != "protectionism" \
+                else "free_trade"
+            if not politics.law_blocked(co, "trade", want):
+                politics.open_law_vote(world, co, "trade", want, lob, financed=True)
+                state["votes"] += 1
+        if co.law_vote is not None and tick % 10 == 2:
+            stake = politics.min_stake(co) * 4
+            if lob.cash > stake:
+                politics.place_law_bid(world, co, lob, "for", stake)
+                state["spent"] += stake
+                state["bought"] += stake / politics.seat_price(co) \
+                    * politics.lobby_power(co)
+
+
+# ---------------------------------------------------------------------------
+# Просвещение, бумага и революция
+# ---------------------------------------------------------------------------
+# Три страны, три разных ответа на один и тот же вопрос — что делать с
+# грамотностью. Смысл прогона в СРАВНЕНИИ: поодиночке ни одна из веток ничего
+# не доказывает.
+#
+#   УСТУПАЕТ  — открывает школы и, когда за ними приходят с требованиями,
+#       принимает их. Обязана выйти из истории с высокой грамотностью, низкой
+#       обидой и целой страной;
+#   УПИРАЕТСЯ — те же школы, но лидер молчит. Обязана дойти до гражданской
+#       войны, и войну эту обязаны решить перебежавшие солдаты, а не число
+#       ополченцев;
+#   ТЁМНАЯ    — школ не строит вовсе. Обязана остаться неграмотной, спокойной и
+#       без единого рабочего сверх того, что даёт врождённая грамотность. Это и
+#       есть цена, которую платит страна за отказ от просвещения.
+SCHOOL_SETUPS = [
+    ("уступает", "state", True),
+    ("упирается", "state", False),
+    ("тёмная", None, False),
+]
+
+
+def setup_schools(world) -> dict:
+    """Раздать трём странам просвещение (или отказ от него) и бумажную фабрику.
+
+    Школы, университет и бумажная фабрика ставятся казной сразу и уровнями:
+    прогон проверяет не то, накопит ли AI на постройку (он не накопит — строить
+    ему нечем), а то, что механика работает, когда здания уже стоят.
+    """
+    ids = list(world.countries.keys())
+    setups = []
+    for (label, law, concede), cid in zip(SCHOOL_SETUPS, ids[9:12]):
+        co = world.countries[cid]
+        state = world.state_player(co.id)
+        if law:
+            politics.apply_law(world, co, "education", law)
+            for city in world.country_regions(co.id):
+                for key, lv in (("school", 2), ("academy", 1), ("papermill", 1)):
+                    b = Building(id=world.next_building_id, industry_key=key,
+                                 owner_id=state.id, city_id=city.id, level=lv,
+                                 wage=45.0)
+                    world.buildings[b.id] = b
+                    world.next_building_id += 1
+        setups.append({"label": label, "country": co, "concede": concede,
+                       "schooled": bool(law), "accepted": 0, "wars": 0,
+                       "risen": 0, "defected": 0.0, "paper_bought": 0.0,
+                       # Население на старте — по нему и меряется, во что
+                       # обошлась гражданская война: людьми, а не процентами.
+                       "pop0": society.country_population(world, co),
+                       "losses": 0.0})
+    return {"setups": setups, "peak_edu": 0.0}
+
+
+def play_schools(world, state: dict) -> None:
+    """Пейдей просвещения: уступчивый лидер отвечает восставшим, упрямый молчит."""
+    for row in state["setups"]:
+        co = row["country"]
+        if not co.alive:
+            continue
+        rev = co.revolution
+        if rev is not None and rev.phase == "demands":
+            row["risen"] = max(row["risen"], 1)
+            row["defected"] = max(row["defected"], rev.defected)
+            if row["concede"]:
+                accept_demands(world, co)
+                row["accepted"] += 1
+        elif rev is not None and rev.phase == "war":
+            row["wars"] = max(row["wars"], rev.battles)
+            row["defected"] = max(row["defected"], rev.defected)
+            row["losses"] = max(row["losses"], rev.gov_losses + rev.rebel_losses)
+        # Бумага: сколько её казна и школы вправду выбирают с прилавка. Считаем
+        # по проданному, а не по спросу, — покупатель, которому не хватило
+        # товара, отрасли ничего не приносит.
+        for city in world.country_regions(co.id):
+            local = city.goods.get("paper")
+            if local is not None:
+                row["paper_bought"] += local.last_sold
+    state["peak_edu"] = max(
+        [state["peak_edu"]]
+        + [society.country_education(world, r["country"])
+           for r in state["setups"] if r["country"].alive])
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     world = build_world()
     bot = add_player(world) if WITH_PLAYER else None
     if WITH_TRADE:
         open_trade(world)
+    law_state = setup_laws(world) if WITH_LAWS else None
+    school_state = setup_schools(world) if WITH_SCHOOL else None
     war_setup = setup_war(world) if WITH_WAR else None
     regions_before = len(world.cities)
     print(f"Гоняем {TICKS} пейдеев по {len(world.countries)} государствам"
@@ -259,7 +451,16 @@ def main() -> int:
             att0 = war_setup["attacker"]
             war_log["command_before"] = society.command_quality(
                 society.officer_size(world, att0), society.army_size(world, att0))
+        if law_state:
+            play_politics(world, law_state, i)
         r = run_tick(world)
+        if school_state:
+            play_schools(world, school_state)
+        if law_state:
+            # Собственная инициатива палаты видна только в новостях: лидера у
+            # этих стран нет, лоббист вносит свои вопросы сам и отдельно.
+            law_state["bills"] += sum(1 for line in r.get("news", [])
+                                      if "сам выносит" in line)
         for co in world.countries.values():
             if co.alive:
                 budget_drift = max(budget_drift, abs(
@@ -506,6 +707,163 @@ def main() -> int:
             # обязана сойтись по числу областей.
             ("области не потерялись", len(world.cities) == regions_before,
              f"{len(world.cities)} из {regions_before}"),
+        ]
+
+    if law_state:
+        lob = law_state["lobbyist"]
+        print("\n--- Законы и парламенты ---")
+        seated = 0
+        for label, co in law_state["setups"]:
+            if not co.alive:
+                print(f"  {label:<28} государство исчезло")
+                continue
+            seated += 1 if co.parties else 0
+            forms = ", ".join(politics.option(co, cat)["name"]
+                              for cat in config.LAW_ORDER)
+            print(f"  {co.name:<12}{label:<28}{forms}")
+            print(f"  {'':<12}палата: "
+                  + (", ".join(f"{p.name} — {p.seats}" for p in co.parties)
+                     or "не созывалась"))
+        # ГЛАВНАЯ проверка этого прогона — деньги. Лоббирование не должно ни
+        # создавать червонцы из ничего, ни сжигать их: всё, что списано с
+        # игрока, обязано осесть в кошельках сословий или в казне.
+        state_lines = {key: sum(co.last_budget.get(key, 0.0)
+                                for co in world.countries.values())
+                       for key in ("serfdom", "redistribution", "parliament",
+                                   "army_levy", "law_fee")}
+        print(f"  вложено лоббистом: {law_state['spent']:,.0f} ₡, "
+              f"куплено голосов: {law_state['bought']:,.0f}, "
+              f"осталось кассы: {lob.cash:,.0f} ₡")
+        print("  статьи законов за последний пейдей: "
+              + ", ".join(f"{k} {v:,.0f}" for k, v in state_lines.items()))
+        # Запреты на принятие законов. Проверяются не тем, что «где-то что-то
+        # заблокировалось», а поимённо: социализм не берётся ни при монархии,
+        # ни при цензовом праве, а коллективное хозяйство — без социализма.
+        # Ошибись знак в law_blocked, и без этой проверки всё выглядело бы
+        # исправным — законы просто перестали бы запрещаться.
+        probe = next((co for _l, co in law_state["setups"] if co.alive), None)
+        crown = next((co for co in world.countries.values()
+                      if co.alive and politics.law(co, "state_form") == "monarchy"),
+                     None)
+        bans = []
+        if crown is not None:
+            bans.append(("социализм не принять при монархии",
+                         bool(politics.law_blocked(crown, "ideology", "socialism"))))
+            bans.append(("коллективное хозяйство не принять без социализма",
+                         bool(politics.law_blocked(crown, "land", "collective"))))
+        if probe is not None:
+            bans.append(("законы расставлены без нежданных запретов",
+                         not law_state["blocked"]))
+        checks += [
+            ("парламенты собрались", seated >= 3,
+             f"{seated} палат(ы) из {len(law_state['setups'])}"),
+            ("законы выносились на голосование", law_state["votes"] > 0,
+             f"{law_state['votes']} голосований"),
+            # Палата обязана двигать страну сама, без лидера и без лоббиста:
+            # раз в PARLIAMENT_BILL_TICKS пейдеев она выносит свой законопроект.
+            ("парламент вносит законы сам", law_state["bills"] > 0,
+             f"{law_state['bills']} собственных законопроектов палат"),
+            *[(name, ok, "запрет держится" if ok else "ЗАКОН ПРОШЁЛ, ХОТЯ НЕ ДОЛЖЕН")
+              for name, ok in bans],
+            ("лоббирование покупает голоса", law_state["bought"] > 1,
+             f"{law_state['bought']:,.1f} мест за {law_state['spent']:,.0f} ₡"),
+            # «Крепостное право» живёт при монархии, «дополнительное
+            # распределение» — при социализме, содержание палаты — везде, где
+            # есть выборы. Хотя бы одна из статей обязана быть ненулевой,
+            # иначе законы приняты, а денег по ним не движется вовсе.
+            ("статьи законов работают",
+             any(abs(v) > 1 for v in state_lines.values()),
+             ", ".join(f"{k} {v:,.0f} ₡" for k, v in state_lines.items()
+                       if abs(v) > 1) or "все статьи пусты"),
+        ]
+
+    if school_state:
+        print("\n--- Просвещение, бумага и революция ---")
+        print(f"  {'страна':<14}{'уклад':<12}{'грамот.':>9}{'обида':>8}"
+              f"{'годны':>7}{'бумаги куплено':>16}{'восст.':>8}"
+              f"{'бои':>5}{'перебеж.':>10}{'погибло':>10}{'население':>12}")
+        rows = []
+        for row in school_state["setups"]:
+            co = row["country"]
+            alive = co.alive and world.country_regions(co.id)
+            edu = society.country_education(world, co) if alive else 0.0
+            griev = society.country_grievance(world, co) if alive else 0.0
+            pool = society.worker_pool_share(edu)
+            pop = society.country_population(world, co) if alive else 0.0
+            rows.append((row, edu, griev, pool, pop))
+            print(f"  {co.name:<14}{row['label']:<12}{edu:>8.1%}{griev:>8.1%}"
+                  f"{pool:>7.0%}{row['paper_bought']:>16,.0f}"
+                  f"{row['risen']:>8}{row['wars']:>5}{row['defected']:>10,.0f}"
+                  f"{row['losses']:>10,.0f}{pop / max(row['pop0'], 1):>11.0%}")
+        schooled = [x for x in rows if x[0]["schooled"]]
+        dark = [x for x in rows if not x[0]["schooled"]]
+        grew = lambda x: x[4] / max(x[0]["pop0"], 1.0)
+        conceding = next((x for x in rows if x[0]["concede"]), None)
+        stubborn = next((x for x in rows
+                         if x[0]["schooled"] and not x[0]["concede"]), None)
+        checks += [
+            # Школы обязаны УЧИТЬ, и учить заметно: без этого вся ветка —
+            # дорогое здание, съедающее бумагу.
+            ("школы поднимают грамотность",
+             all(edu > 0.35 for _r, edu, _g, _p, _n in schooled),
+             ", ".join(f"{r['country'].name} {edu:.0%}"
+                       for r, edu, _g, _p, _n in schooled)),
+            # И обязаны открывать деревне дорогу на завод: в этом их
+            # хозяйственный смысл, а не только политический.
+            ("грамотность расширяет наём на завод",
+             all(pool > society.worker_pool_share(0.0) * 1.8
+                 for _r, _e, _g, pool, _n in schooled),
+             "годных к станку "
+             + ", ".join(f"{r['country'].name} {pool:.0%}"
+                         for r, _e, _g, pool, _n in schooled)
+             + f" при {society.worker_pool_share(0.0):.0%} у неграмотной страны"),
+            # Тёмная страна обязана остаться тёмной: если грамотность растёт и
+            # без школ, ни закон об образовании, ни школы никому не нужны.
+            ("без школ страна остаётся неграмотной",
+             all(edu < 0.20 for _r, edu, _g, _p, _n in dark),
+             ", ".join(f"{r['country'].name} {edu:.0%}"
+                       for r, edu, _g, _p, _n in dark) or "не с чем сравнить"),
+            # Бумага — единственная отрасль с чисто казённым покупателем.
+            # Не покупают её — значит, ни школы, ни палата за неё не платят.
+            ("бумага находит казённого покупателя",
+             all(r["paper_bought"] > 100 for r, *_ in schooled),
+             ", ".join(f"{r['country'].name} {r['paper_bought']:,.0f}"
+                       for r, *_ in schooled)),
+            # Грамотность без прав обязана обернуться требованиями. Не
+            # обернулась — значит самосознание ни на что не влияет.
+            ("выученная страна требует прав",
+             all(r["risen"] > 0 for r, *_ in schooled),
+             ", ".join(f"{r['country'].name}: "
+                       f"{'восставали' if r['risen'] else 'молчат'}"
+                       for r, *_ in schooled)),
+            # Молчание лидера обязано приводить к войне, а не рассасываться.
+            ("молчание лидера доводит до гражданской войны",
+             stubborn is not None and stubborn[0]["wars"] > 0,
+             f"{stubborn[0]['wars']} пейдеев боёв" if stubborn else "нет такой страны"),
+            # А уступки — обязаны от неё избавлять. Это и есть выбор, ради
+            # которого вся механика затевалась.
+            ("уступки лидера отменяют войну",
+             conceding is not None and conceding[0]["accepted"] > 0
+             and conceding[0]["wars"] == 0,
+             f"принято требований {conceding[0]['accepted']}, боёв "
+             f"{conceding[0]['wars']}" if conceding else "нет такой страны"),
+            # ГЛАВНАЯ проверка всей ветки. Победившая революция вводит ровно
+            # те же законы, которые лидер мог подписать без единого выстрела, —
+            # значит, разницу между уступкой и упрямством надо искать не в
+            # законах, а в ЦЕНЕ. Упрямый обязан заплатить людьми: погибшими в
+            # столице, разбежавшейся армией и месяцами работы вполсилы, из-за
+            # которых у него и школы стоят пустыми. Не окажись этой разницы —
+            # выбор лидера был бы мнимым, и отвечать восставшим не имело бы
+            # никакого смысла.
+            ("упрямство обходится дороже уступок",
+             conceding is not None and stubborn is not None
+             and stubborn[0]["losses"] > 0
+             and grew(conceding) > grew(stubborn),
+             (f"погибло {stubborn[0]['losses']:,.0f} против "
+              f"{conceding[0]['losses']:,.0f}; население "
+              f"{grew(conceding):.0%} у уступившего против "
+              f"{grew(stubborn):.0%} у упрямого")
+             if conceding and stubborn else "не с чем сравнить"),
         ]
 
     if bot is not None:

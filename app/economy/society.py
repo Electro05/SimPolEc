@@ -26,6 +26,7 @@ import random
 
 from .. import config
 from ..models import City, Country, Good, LocalGood, World
+from . import politics
 from .pricing import demand_response
 
 EPS = 1e-9
@@ -117,7 +118,21 @@ def glut_scale(local: LocalGood) -> float:
     return max(config.GLUT_MIN_OUTPUT, 1.0 - excess)
 
 
-def peasant_alternative(city: City) -> float:
+def peasant_yield(country: Country | None, good_key: str) -> float:
+    """Сколько крестьянин снимает со своего надела за пейдей — с поправкой на закон.
+
+    ЗЕМЕЛЬНОЕ УСТРОЙСТВО (config.LAWS["land"]) переделяет пашню, а вместе с ней
+    и урожай: барщина оставляет крестьянину четыре пятых силы, нарезанный
+    клочками надел — семь десятых, скупленная под фермы земля — чуть больше
+    трети. Промысла — леса и хлопка — закон не касается: их берут не с пашни.
+    """
+    base = config.PEASANT_YIELD[good_key]
+    if good_key != "grain":
+        return base
+    return base * politics.peasant_yield_mult(country)
+
+
+def peasant_alternative(city: City, country: Country | None = None) -> float:
     """Что даёт крестьянину СВОЙ надел за пейдей, в червонцах.
 
     Мерка для найма на чужое поле. Крестьянин не безработный, которому некуда
@@ -125,9 +140,14 @@ def peasant_alternative(city: City) -> float:
     только если там платят не меньше. Считается по текущим ценам области —
     подешевело зерно, и своё поле стало давать меньше, а работа по найму
     привлекательнее.
+
+    Земельный закон входит сюда напрямую, и это половина его действия на
+    хозяйство: обкорнав деревенский надел, коммерческое землевладение тем самым
+    и опускает планку найма — согнанному с земли человеку отказываться не от
+    чего, и на хозяйскую ферму он идёт за куда меньшие деньги.
     """
-    return sum(per_head * lg(city, key).price
-               for key, per_head in config.PEASANT_YIELD.items())
+    return sum(peasant_yield(country, key) * lg(city, key).price
+               for key in config.PEASANT_YIELD)
 
 
 def farm_hired(world: World, city: City) -> float:
@@ -151,6 +171,12 @@ def produce_peasants(world: World, country: Country, city: City, market) -> floa
     огород при избе (config.FARM_OWN_PLOT_LEFT), всё прочее он теперь покупает
     на рынке за деньги. В этом и весь смысл перемены: деревня перестаёт быть
     натуральной и становится покупателем.
+
+    **Сколько родит надел, решает ЗЕМЕЛЬНЫЙ ЗАКОН** (см. peasant_yield): при
+    крепостном праве крестьянин работает на своём поле в четыре пятых силы,
+    при коммерческом землевладении — чуть больше трети. Урожай (city.harvest)
+    тут ни при чём: он случаен и меняется каждый пейдей, а закон — это
+    устройство хозяйства, и в неурожай он бьёт по деревне вторым слоем.
     """
     st = city.s("peasants")
     if st.people <= EPS:
@@ -167,8 +193,8 @@ def produce_peasants(world: World, country: Country, city: City, market) -> floa
 
     owner = stratum_owner_id(city.id, "peasants")
     own_grain = 0.0
-    for good_key, per_head in config.PEASANT_YIELD.items():
-        qty = hands * per_head * harvest
+    for good_key in config.PEASANT_YIELD:
+        qty = hands * peasant_yield(country, good_key) * harvest
         if good_key == "grain":
             # сначала едят сами, на рынок идёт только излишек. Едят при этом
             # ВСЕ крестьяне, включая нанятых, — просто нанятым своего хлеба уже
@@ -643,13 +669,22 @@ def consume(world: World, country: Country, city: City, market,
 
 
 def satisfaction_score(fill: dict[str, float], unemployment: float,
-                       living_standard: float = 1.0) -> float:
+                       living_standard: float = 1.0,
+                       grievance: float = 0.0) -> float:
     """Довольство: закрыты ли базовые нужды и как хорошо живётся сверх того.
 
     Основа — по-прежнему ступени необходимого: голодного не утешит опера.
     Но жизнь заметно выше нормы и сама по себе радует, и смягчает удары —
     безработицу и мобилизацию переносить на сытый желудок куда легче. Отсюда и
     берётся возможность сытой страны держать армию больше: люди терпят.
+
+    `grievance` — НЕУДОВЛЕТВОРЁННОЕ САМОСОЗНАНИЕ: образование, умноженное на
+    бесправие (см. update_grievances). Это единственная часть довольства,
+    которую нельзя купить хлебом: сытый грамотный человек, лишённый голоса,
+    недоволен ровно так же, как голодный, — и достаток его от этой обиды не
+    спасает, в отличие от безработицы и мобилизации. Ровно поэтому революции
+    случаются не в самых нищих странах, а в тех, что успели разбогатеть и
+    выучиться.
     """
     basket = config.CONSUMPTION_BASKET
     score = 0.0
@@ -664,6 +699,9 @@ def satisfaction_score(fill: dict[str, float], unemployment: float,
     # привыкнуть к хорошему легко, терпеть нищету — тяжело. Именно отсюда
     # растут бунты.
     score -= config.SOL_MISERY_PENALTY * misery(living_standard)
+    # Обида на бесправие достатком не смягчается: в этом её отличие от
+    # безработицы и мобилизации, которые сытый переносит легче.
+    score -= config.AWARENESS_DISCONTENT * max(0.0, min(1.0, grievance))
     hardship = 0.35 * unemployment * (1.0 - config.SOL_HARDSHIP_CUSHION * surplus)
     return max(0.0, min(1.0, score * (1.0 - hardship)))
 
@@ -686,6 +724,176 @@ def prosperity(living_standard: float) -> float:
     """
     return max(0.0, min(1.0, (living_standard - config.SOL_PROSPER_AT)
                         / config.SOL_SATISFACTION_SPAN))
+
+
+# ---------------------------------------------------------------------------
+# Образование и самосознание
+# ---------------------------------------------------------------------------
+def education_floor(key: str) -> float:
+    """Врождённая грамотность сословия — та, что есть и без единой школы.
+
+    Дома, в приходе, в артели и в казарме грамоте учат и без казны. Ниже этой
+    черты сословие не опускается ни при каком законе: отнять у народа уже
+    выученное государство не в силах.
+    """
+    return config.EDU_FLOOR.get(key, 0.05)
+
+
+def teaching_capacity(world: World, city: City) -> dict[str, float]:
+    """Сколько человек учебные заведения области могут выучить за пейдей.
+
+    Возвращает ёмкость по РАЗРЯДАМ заведений ("school" / "university"), а не по
+    сословиям: кого именно учить, решает закон (politics.educated_strata), и
+    решается это уже при раздаче.
+
+    Ёмкость считается по ЗАНЯТЫМ местам, а не по уровням: школа без учителей
+    никого не учит, сколько бы этажей в ней ни было. Это и делает просвещение
+    настоящим хозяйственным делом — учителей надо нанять и содержать, а не
+    просто оплатить постройку.
+    """
+    out: dict[str, float] = {}
+    for b in world.city_buildings(city.id):
+        ind = world.industries.get(b.industry_key)
+        if ind is None or not ind.education_kind or not b.active:
+            continue
+        jobs = b.effective_level * max(ind.jobs_per_level, 1)
+        if jobs <= EPS:
+            continue
+        staffed = max(0.0, min(1.0, b.employed / jobs))
+        out[ind.education_kind] = out.get(ind.education_kind, 0.0) + (
+            b.effective_level * ind.education * staffed)
+    return out
+
+
+def educate(world: World, country: Country, city: City) -> float:
+    """Пейдей просвещения: школы и университеты учат, поколения забывают.
+
+    Порядок такой:
+
+        УЧАТ. Ёмкость каждого разряда заведений (teaching_capacity) делится
+            между теми сословиями, которым ЗАКОН позволяет учиться, — и делится
+            по числу ещё неграмотных, а не по числу людей вообще: место в школе
+            занимает тот, кому оно нужно. Школьная ёмкость вдобавок умножается
+            на эффективность закона: религиозная школа учит вполсилы;
+        ЗАБЫВАЮТ. Грамотность не наследуется: место выучившегося занимает
+            новорождённый, и доля образованных тает на config.EDU_DECAY за
+            пейдей. Отсюда и главное свойство просвещения — его нельзя
+            построить однажды, его приходится содержать.
+
+    Возвращает, скольких выучили за пейдей, — для новостей и витрины.
+    """
+    capacity = teaching_capacity(world, city)
+    school_share = politics.school_efficiency(country)
+
+    # Сперва старение: выученные вчера не должны тут же и осыпаться.
+    for key in config.STRATA_ORDER:
+        st = city.s(key)
+        floor = education_floor(key)
+        st.education = max(floor, min(config.EDU_MAX,
+                                      st.education * (1.0 - config.EDU_DECAY)))
+
+    taught = 0.0
+    for kind, room in capacity.items():
+        if room <= EPS:
+            continue
+        if kind == "school":
+            room *= school_share
+        allowed = politics.educated_strata(country, kind)
+        # Считаем «место в школе» по неграмотным: сословие, где учиться уже
+        # некому, ёмкости не занимает и отдаёт её соседям. Ровно поэтому
+        # университет при сословном образовании и простаивает — высшее
+        # общество упирается в потолок, а больше учить ему некого.
+        room_for = {}
+        for key in allowed:
+            st = city.s(key)
+            if st.people <= EPS:
+                continue
+            gap = max(0.0, config.EDU_MAX - st.education) * st.people
+            if gap > EPS:
+                room_for[key] = gap
+        need = sum(room_for.values())
+        if need <= EPS:
+            continue
+        used = min(room, need)
+        for key, gap in room_for.items():
+            got = used * gap / need
+            st = city.s(key)
+            st.education = min(config.EDU_MAX,
+                               st.education + got / max(st.people, 1.0))
+            taught += got
+    return taught
+
+
+def awareness(city: City, key: str) -> float:
+    """САМОСОЗНАНИЕ сословия — насколько оно осознаёт себя силой, 0..1.
+
+    Двух вещей мало по отдельности и достаточно вместе: грамотности и числа.
+    Выученный одиночка не сословие, а неграмотная толпа — не сила: она
+    голодает, а не требует. Поэтому образование умножается на то, какую долю
+    страны сословие занимает, и обе половины обязаны быть.
+
+    Это и есть та величина, на которую умножается всякая обида (см.
+    politics.grievance). Пока страна неграмотна, любое бесправие ей ничего не
+    стоит; стоит открыть школы — и та же самая строчка закона начинает
+    считаться в довольстве.
+    """
+    st = city.s(key)
+    if st.people <= EPS:
+        return 0.0
+    pop = city.population
+    if pop <= EPS:
+        return 0.0
+    mass = min(1.0, (st.people / pop) / max(config.AWARENESS_MASS_FULL, 1e-9))
+    return max(0.0, min(1.0, st.education * config.AWARENESS_FROM_EDUCATION * mass))
+
+
+def update_grievances(world: World, country: Country, city: City) -> float:
+    """Пересчитать неудовлетворённое самосознание сословий области.
+
+    Записывает его в Stratum.grievance (витрине надо знать, кто именно зол) и
+    возвращает средневзвешенную по людям величину — тот самый жар, из которого
+    и растёт революция.
+
+    Мера перемножена, а не сложена, и это главное: обиду надо СНАЧАЛА ОСОЗНАТЬ.
+    Бесправная неграмотная деревня даёт ноль, бесправная грамотная — единицу,
+    и переход между ними целиком в руках того, кто решает строить школы.
+    """
+    share = politics.represented(country)
+    num = den = 0.0
+    for key in config.STRATA_ORDER:
+        st = city.s(key)
+        if st.people <= EPS:
+            st.grievance = 0.0
+            continue
+        st.grievance = awareness(city, key) * politics.grievance(
+            country, key, share.get(key, 0.0))
+        num += st.grievance * st.people
+        den += st.people
+    return num / den if den > EPS else 0.0
+
+
+def country_grievance(world: World, country: Country) -> float:
+    """Неудовлетворённое самосознание всей страны, взвешенное по людям."""
+    num = den = 0.0
+    for city in country_cities(world, country):
+        for key in config.STRATA_ORDER:
+            st = city.s(key)
+            if st.people > EPS:
+                num += st.grievance * st.people
+                den += st.people
+    return num / den if den > EPS else 0.0
+
+
+def country_education(world: World, country: Country) -> float:
+    """Средняя грамотность страны, взвешенная по людям."""
+    num = den = 0.0
+    for city in country_cities(world, country):
+        for key in config.STRATA_ORDER:
+            st = city.s(key)
+            if st.people > EPS:
+                num += st.education * st.people
+                den += st.people
+    return num / den if den > EPS else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +920,13 @@ def recruit_workers(world: World, country: Country, city: City) -> float:
     не создаёт: на ней трудятся крестьяне, не меняя сословия (Industry.labour).
     Если её сюда пустить, ферма своими двадцатью тысячами мест выдёргивала бы
     деревню в рабочие, а сама оставалась бы без рук.
+
+    **Зарплаты мало — нужна ГРАМОТА.** У станка надо читать чертёж и считать,
+    поэтому переманить можно не всякого, а только того, кто на это годен. Доля
+    годных берётся от образования сословия (worker_pool_share): в неграмотной
+    деревне это малая часть, в выученной — почти все. Отсюда и вся цена закона
+    об образовании для промышленника: без школ рабочих в стране взять неоткуда,
+    сколько бы он ни платил.
     """
     buildings = [b for b in world.city_buildings(city.id)
                  if b.active and b.effective_level > 0 and b.throttle > EPS
@@ -738,11 +953,30 @@ def recruit_workers(world: World, country: Country, city: City) -> float:
             continue
         eagerness = min(1.0, best_wage / max(alternative, EPS)
                         / config.CONVERSION_WAGE_EDGE - 1.0 + 0.35)
-        limit = st.people * config.CONVERSION_MAX_SHARE * eagerness
+        limit = (st.people * worker_pool_share(st.education)
+                 * config.CONVERSION_MAX_SHARE * eagerness)
         came += move_people(st, workers, min(limit, deficit - came))
         if deficit - came <= EPS:
             break
     return came
+
+
+def worker_pool_share(education: float) -> float:
+    """Какая доля сословия ГОДИТСЯ на завод при такой грамотности, 0..1.
+
+    Мера — образование, но с нижней чертой, и черта эта не поблажка, а условие
+    существования игры. На старте мира школ нет ни одной, а первые цеха обязаны
+    иметь возможность набрать хоть кого-то: иначе промышленности не с чего
+    начаться, некому требовать перемены закона об образовании, и мир навсегда
+    остаётся крестьянским. Поэтому даже при полной неграмотности на завод
+    годится config.EDU_WORKER_FLOOR сословия — те, кто выучился у станка сам.
+
+    Полная грамотность поднимает долю до единицы, то есть до прежней, ещё
+    доеобразовательной скорости перехода. Быстрее прежнего дело не идёт никогда:
+    школы не ускоряют промышленность сверх возможного, они лишь снимают запрет.
+    """
+    floor = config.EDU_WORKER_FLOOR
+    return floor + (1.0 - floor) * max(0.0, min(1.0, education))
 
 
 def drift_and_switch(world: World, city: City, employed: float) -> None:
@@ -920,15 +1154,29 @@ def officer_size(world: World, country: Country) -> float:
     return sum(c.s("officers").people for c in country_cities(world, country))
 
 
+def officer_pool(country: Country) -> list[str]:
+    """Из каких сословий страна берёт офицеров — по форме государства.
+
+    При монархии патент дворянский, и корпус набирают в одном высшем обществе;
+    республика открывает его среднему классу. Список живёт в законе, а не в
+    config.OFFICER_POOL: то, из кого набирают командиров, — вопрос устройства
+    государства, а не общая настройка баланса.
+    """
+    return politics.officer_pool(country)
+
+
 def officer_pay(country: Country) -> float:
     """Жалованье офицера за пейдей — отдельный рычаг лидера.
 
     Ноль в Country.officer_pay значит «как заведено»: кратное солдатскому
-    (config.OFFICER_PAY_MULT). Ставка ниже солдатской не имеет смысла — на
-    таких условиях патента не возьмёт никто, — поэтому снизу она подпирается
-    жалованьем солдата.
+    (config.OFFICER_PAY_MULT), поправленное на форму государства. Республике
+    корпус обходится дешевле — мещанин берёт патент за меньшие деньги, чем
+    дворянин. Ставка ниже солдатской не имеет смысла — на таких условиях
+    патента не возьмёт никто, — поэтому снизу она подпирается жалованьем
+    солдата.
     """
-    default = country.soldier_pay * config.OFFICER_PAY_MULT
+    default = (country.soldier_pay * config.OFFICER_PAY_MULT
+               * politics.officer_pay_mult(country))
     if country.officer_pay <= EPS:
         return default
     return max(country.soldier_pay * config.OFFICER_PAY_MIN_MULT,
@@ -959,7 +1207,7 @@ def officer_candidates(world: World, country: Country) -> float:
     pay = officer_pay(country)
     total = 0.0
     for city in country_cities(world, country):
-        for key in config.OFFICER_POOL:
+        for key in officer_pool(country):
             st = city.s(key)
             if st.people <= EPS:
                 continue
@@ -971,12 +1219,13 @@ def officer_candidates(world: World, country: Country) -> float:
 def officer_pay_bar(world: World, country: Country) -> float:
     """Какое жалованье нужно, чтобы в офицеры пошло ВЫСШЕЕ ОБЩЕСТВО.
 
-    Первое сословие в config.OFFICER_POOL и есть то, ради которого механика
+    Первое сословие в officer_pool и есть то, ради которого механика
     затевалась: пока ставка ниже этой черты, патент берут только средние
     городские слои, а высший класс на службу не идёт. Витрине число нужно
     прямым ответом на вопрос «сколько платить».
     """
-    key = config.OFFICER_POOL[0] if config.OFFICER_POOL else "town_high"
+    pool = officer_pool(country)
+    key = pool[0] if pool else "town_high"
     people = 0.0
     weighted = 0.0
     for city in country_cities(world, country):
@@ -1154,7 +1403,8 @@ def commission_officers(world: World, country: Country) -> float:
     вся разница между рядовым и командиром:
 
       ОТКУДА. Не из деревни и не из бедноты, а из высшего общества и, если его
-          не хватило, из среднего класса (config.OFFICER_POOL). Командовать
+          не хватило, из среднего класса (officer_pool — список задаёт ЗАКОН
+          о государственном устройстве, а не общая настройка). Командовать
           учат, и патент достаётся тому, у кого есть образование и положение;
       ПОЧЁМ. Высший класс живёт лучше всех в стране, и перебить его привычный
           доход стоит дорого — отсюда и кратное жалованье офицера. Скупому
@@ -1184,7 +1434,7 @@ def commission_officers(world: World, country: Country) -> float:
         came = 0.0
         for city in cities:
             need = gap * (city.population / pop)
-            for key in config.OFFICER_POOL:
+            for key in officer_pool(country):
                 if need <= EPS:
                     break
                 st = city.s(key)
@@ -1358,8 +1608,9 @@ def set_front(world: World, country: Country, enemy_id: int,
     return result
 
 
-def command_quality(officers: float, soldiers: float) -> float:
-    """КАЧЕСТВО КОМАНДОВАНИЯ на фронте — от COMMAND_MIN до COMMAND_MAX.
+def command_quality(officers: float, soldiers: float,
+                    country: Country | None = None) -> float:
+    """КАЧЕСТВО КОМАНДОВАНИЯ на фронте — от COMMAND_MIN до потолка.
 
     Меряется одним: хватает ли на стоящих здесь солдат положенных им по штату
     офицеров (config.OFFICER_TARGET_SHARE). Хватает — потолок; нет ни одного —
@@ -1368,12 +1619,18 @@ def command_quality(officers: float, soldiers: float) -> float:
     Считается именно ПО ФРОНТУ, а не по стране, и это главное в механике:
     офицеры, оставленные в тылу или расставленные по спокойным границам, не
     командуют никем. Держать их надо там, где будет бой.
+
+    Сам потолок задаёт ЗАКОН о государственном устройстве: полтораста процентов
+    даёт только монархия с её дворянским корпусом, республике достаётся ровно
+    сто. Это и есть цена дешёвых офицеров из мещан — без страны потолок берётся
+    общий (нужно там, где считают отвлечённо, а не для конкретной армии).
     """
     if soldiers <= EPS:
         return 0.0
     target = max(config.OFFICER_TARGET_SHARE, 1e-9)
     filled = min(1.0, (officers / soldiers) / target)
-    return config.COMMAND_MIN + (config.COMMAND_MAX - config.COMMAND_MIN) * filled
+    top = politics.command_cap(country)
+    return config.COMMAND_MIN + (top - config.COMMAND_MIN) * filled
 
 
 def mobilize(world: World, country: Country) -> float:
@@ -1597,7 +1854,7 @@ def combat_strength(world: World, country: Country, soldiers: float,
     supply = 1.0 if need <= EPS else min(1.0, country.army_shells / need)
     supply = config.SUPPLY_STRENGTH_MIN + (1.0 - config.SUPPLY_STRENGTH_MIN) * supply
     morale = army_morale(world, country)
-    command = 1.0 + command_quality(officers, soldiers)
+    command = 1.0 + command_quality(officers, soldiers, country)
     return soldiers * equip * supply * (0.6 + 0.6 * morale) * command
 
 
@@ -1695,15 +1952,62 @@ def settle_newcomers(world: World, country: Country) -> float:
     return arrived
 
 
+def birth_drive(living_standard: float) -> float:
+    """Во сколько раз достаток разгоняет (или глушит) рождаемость.
+
+    Вторая мера рождаемости рядом с довольством — и мера с ДРУГИМ ПОТОЛКОМ, в
+    чём весь смысл её существования. Довольство отвечает на вопрос «закрыты ли
+    нужды» и упирается в потолок задолго до богатства: сытому человеку без
+    мебели больше 0.6 не набрать, сколько ему ни продавай. Пока рождаемость
+    висела на одном довольстве, население переставало прибавлять ровно там, где
+    рынок упёрся в потребление и заводу отчаянно нужен новый едок.
+
+    Уровень жизни потолка не имеет, и через него демография замыкается в
+    обратную связь для промышленника: догнали спрос — люди зажили лучше —
+    рождаемость взлетела вчетверо — спроса снова не хватает. Не поспели —
+    уровень жизни просел — рождаемость упала почти в ноль, и спрос перестал
+    убегать, пока цеха его нагоняют.
+
+    Единица — обычная рождаемость (config.POP_BIRTH_AT). Выше растёт линейно
+    до POP_BIRTH_MAX, ниже так же линейно валится до POP_BIRTH_MIN. Линия, а не
+    ступень: обратная связь должна отзываться на КАЖДУЮ десятую уровня жизни,
+    иначе она не регулирует, а дёргает.
+    """
+    if living_standard >= config.POP_BIRTH_AT:
+        up = min(1.0, (living_standard - config.POP_BIRTH_AT)
+                 / max(config.POP_BIRTH_SPAN, EPS))
+        return 1.0 + (config.POP_BIRTH_MAX - 1.0) * up
+    down = min(1.0, (config.POP_BIRTH_AT - living_standard)
+               / max(config.POP_BIRTH_AT - config.POP_BIRTH_FLOOR, EPS))
+    return 1.0 - (1.0 - config.POP_BIRTH_MIN) * down
+
+
 def demography(world: World, city: City) -> None:
-    """Рождаемость и смертность по сословиям — каждое по своему довольству."""
+    """Рождаемость и смертность по сословиям — по довольству и по достатку.
+
+    Довольство решает, РАСТЁТ сословие или убывает: голод выкашивает, закрытые
+    нужды позволяют прибавлять. А вот НАСКОЛЬКО быстро прибавлять — решает
+    уровень жизни (birth_drive), у которого, в отличие от довольства, потолка
+    нет.
+
+    Убыль достатком не правится намеренно. Вымирают не от того, что живут
+    небогато, а от того, что нечего есть, — это довольство и меряет. Приложи
+    сюда ту же поправку, и бедная, но сытая страна начала бы вымирать на ровном
+    месте, а спрос, ради которого механика и заводилась, обвалился бы вместо
+    того, чтобы просто перестать расти.
+
+    Считается по КАЖДОМУ сословию отдельно, а не по средней стране: рабочие
+    завода и деревня живут по-разному, и прибавлять им поровну значило бы
+    размазывать новый спрос ровно там, где его меньше всего ждут.
+    """
     n = config.SATISFACTION_NEUTRAL
     for key in config.STRATA_ORDER:
         st = city.s(key)
         if st.people <= EPS:
             continue
         if st.satisfaction >= n:
-            rate = config.POP_GROWTH_MAX * (st.satisfaction - n) / (1.0 - n)
+            rate = (config.POP_GROWTH_MAX * (st.satisfaction - n) / (1.0 - n)
+                    * birth_drive(st.living_standard))
         else:
             rate = config.POP_DECLINE_MAX * (n - st.satisfaction) / n
         st.people = max(0.0, st.people * (1.0 + rate))
@@ -1780,8 +2084,14 @@ def notional_unit_cost(world: World, city: City, key: str, wage: float) -> float
     минус, потому что настоящая себестоимость была вдвое выше показанной.
     """
     if key in config.PEASANT_YIELD:
+        # Расчётная себестоимость деревенского товара идёт от ЗАКОННОГО надела,
+        # а не от полной силы: обкорнав пашню, земельный закон делает каждый
+        # пуд хлеба дороже в труде — и коридор цены обязан это видеть, иначе
+        # деревня продавала бы по-старому то, что ей теперь вдвое труднее
+        # вырастить.
         share = config.PEASANT_EFFORT.get(key, 0.25)
-        return wage * share / config.PEASANT_YIELD[key]
+        country = world.countries.get(city.country_id)
+        return wage * share / max(peasant_yield(country, key), EPS)
 
     for ind in world.industries.values():
         if ind.output_good != key:

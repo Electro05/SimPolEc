@@ -15,10 +15,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from . import config, db
+from . import config, db, ratelimit
 from .auth import hash_password, new_token, verify_password
 from .economy.engine import (
     _add_alliance,
+    accept_demands as engine_accept_demands,
     bankruptcy_exit_level,
     chain_bonus_for,
     citizen_players as engine_citizens,
@@ -31,9 +32,10 @@ from .economy.engine import (
     release_bankrupt as engine_release_bankrupt,
     resolve_annexation as engine_resolve_annexation,
     run_tick,
+    upkeep_needs,
 )
 from .economy.pricing import U_MAX, U_MIN, price_bounds
-from .economy import society
+from .economy import politics, society
 from .models import Building, Player, World
 
 log = logging.getLogger("simpolec")
@@ -66,6 +68,9 @@ class Ctx:
     query: dict[str, str]
     token: str | None
     player: Player | None = None
+    # Адрес, с которого пришёл запрос. Нужен только входу и регистрации —
+    # по нему считаются промахи (см. ratelimit).
+    ip: str = "?"
 
     def require_player(self) -> Player:
         if self.player is None:
@@ -100,14 +105,57 @@ class Ctx:
 # ---------------------------------------------------------------------------
 # Авторизация
 # ---------------------------------------------------------------------------
+def login_gate(ip: str, username: str) -> None:
+    """Пускать ли к проверке пароля. Заперт — 429 и сколько ждать."""
+    pause = ratelimit.login_retry_after(ip, username)
+    if pause:
+        raise ApiError(429, f"Слишком много неудачных попыток входа. "
+                            f"Попробуйте через {ratelimit.human_pause(pause)}")
+
+
+def guard_request(path: str, body: dict[str, Any], ip: str) -> None:
+    """Проверки, которые дешевле сделать ДО загрузки мира.
+
+    Мир на каждый запрос читается из базы целиком, поэтому запертую попытку
+    входа стоит отбить раньше, чем она до этого чтения доберётся: иначе
+    подбирающий пароль хоть и не войдёт, но нагрузит сервер как обычный
+    игрок. Внутри login() та же проверка стоит ещё раз — на случай, если
+    обработчик позовут в обход HTTP-обвязки.
+    """
+    if path == "/api/login":
+        login_gate(ip, str(body.get("username") or "").strip())
+
+
+def check_password(username: str, password: str) -> None:
+    """Пароль, который не подберут с первой попытки.
+
+    Требование одно — длина: короткий пароль перебирается быстрее, чем
+    успевает сработать любая пауза между попытками. Совпадение с именем
+    отсекаем отдельно: его подбирающий пробует первым.
+    """
+    if len(password) < config.PASSWORD_MIN_LEN:
+        raise ApiError(400, f"Пароль должен быть не короче "
+                            f"{config.PASSWORD_MIN_LEN} символов")
+    if password.strip().lower() == username.strip().lower():
+        raise ApiError(400, "Пароль не должен повторять имя")
+
+
 def register(ctx: Ctx) -> dict:
     username = str(ctx.need("username")).strip()
     password = str(ctx.need("password"))
     country_id = int(ctx.body.get("country_id") or 0)
+    # Регистрация — тоже вход, только дорогой: она заводит игрока в мире и
+    # считает ему заселение. Пять аккаунтов в час с адреса хватит любому
+    # живому человеку и не хватит тому, кто набивает мир пустышками.
+    pause = ratelimit.register_retry_after(ctx.ip)
+    if pause:
+        raise ApiError(429, f"С этого адреса уже зарегистрировано "
+                            f"{config.REGISTER_LIMIT} игроков. "
+                            f"Следующего можно завести через "
+                            f"{ratelimit.human_pause(pause)}")
     if not 3 <= len(username) <= 24:
         raise ApiError(400, "Имя должно быть от 3 до 24 символов")
-    if len(password) < 4:
-        raise ApiError(400, "Пароль должен быть не короче 4 символов")
+    check_password(username, password)
     w = ctx.world
     if country_id not in w.countries or not w.countries[country_id].alive:
         raise ApiError(400, "Такого государства нет. Выберите область на карте.")
@@ -144,6 +192,7 @@ def register(ctx: Ctx) -> dict:
 
     token = new_token()
     w.sessions[token] = player.id
+    ratelimit.register_done(ctx.ip)
     db.add_event(w.tick, player.id, "join",
                  f"{username} открывает своё дело в государстве {country.name}"
                  + (f". За {config.JOIN_GROWTH_TICKS} пейдеев в страну прибудет "
@@ -162,10 +211,26 @@ def login(ctx: Ctx) -> dict:
     username = str(ctx.need("username")).strip()
     password = str(ctx.need("password"))
     w = ctx.world
+
+    # Подбор пароля упирается сюда. После пяти промахов по одному имени (или
+    # двадцати с одного адреса) вход запирается на минуту, и каждый следующий
+    # запор вдвое длиннее предыдущего: словарь на тысячу паролей перестаёт
+    # проходиться за вечер.
+    login_gate(ctx.ip, username)
+
     player = next((p for p in w.players.values()
                    if p.username.lower() == username.lower() and not p.is_state), None)
-    if not player or not verify_password(password, player.salt, player.password_hash):
+    if player is None:
+        # Пароль всё равно хешируем — по времени ответа не должно быть видно,
+        # есть такой игрок или нет: иначе имена перебираются в обход счётчика.
+        hash_password(password)
+        ratelimit.login_failed(ctx.ip, username)
         raise ApiError(401, "Неверное имя или пароль")
+    if not verify_password(password, player.salt, player.password_hash):
+        ratelimit.login_failed(ctx.ip, username)
+        raise ApiError(401, "Неверное имя или пароль")
+
+    ratelimit.login_ok(ctx.ip, username)
     token = new_token()
     w.sessions[token] = player.id
     c = w.countries.get(player.country_id)
@@ -322,7 +387,10 @@ def countries_list(ctx: Ctx) -> dict:
     return {"countries": rows,
             "join_window_open": w.tick < config.JOIN_WINDOW_TICKS,
             "join_window_left": max(0, config.JOIN_WINDOW_TICKS - w.tick),
-            "settlers_per_player": sum(config.POPULATION_PER_PLAYER.values())}
+            "settlers_per_player": sum(config.POPULATION_PER_PLAYER.values()),
+            # Требование к паролю форма показывает словами и проверяет сама,
+            # чтобы игрок узнал о нём до отправки, а не из ответа сервера.
+            "password_min": config.PASSWORD_MIN_LEN}
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +492,7 @@ def _country_brief(w: World, c) -> dict:
         "public_spending_rate": c.public_spending_rate,
         "min_wage": c.min_wage,
         "land_rent": c.land_rent,
+        "worker_insurance": c.worker_insurance,
         "tariff": c.tariff,
         "import_tariff": c.import_tariff,
         "bankruptcy_limit": c.bankruptcy_limit,
@@ -459,6 +528,31 @@ def _country_brief(w: World, c) -> dict:
         "alive": c.alive,
         "army": _army_brief(w, c),
         "budget": _budget_brief(w, c),
+        # Форма государства коротко — она нужна половине витрин: по ней
+        # рисуются пределы ползунков, скидки на стройку и подпись в шапке.
+        "laws": [{"key": cat,
+                  "name": config.LAWS[cat]["name"],
+                  "option": politics.law(c, cat),
+                  "option_name": politics.option(c, cat)["name"]}
+                 for cat in config.LAW_ORDER],
+        "has_parliament": politics.has_elections(c),
+        "parliament_seats": politics.seats(c) if politics.has_elections(c) else 0,
+        "tariff_cap": politics.tariff_cap(c),
+        "closed_economy": politics.is_closed(c),
+        "unfair_voting": politics.unfair_voting(c, w.tick),
+        "unfair_left": max(0, c.unfair_until - w.tick),
+        # ПРОСВЕЩЕНИЕ И ЕГО ЦЕНА. Грамотность — источник рабочих рук, обида —
+        # то, во что она обращается без прав; жар — насколько страна близка к
+        # тому, чтобы предъявить требования. Три числа рядом, потому что
+        # порознь они не значат ничего.
+        "education": round(society.country_education(w, c), 3),
+        "grievance": round(society.country_grievance(w, c), 3),
+        "revolution_heat": round(c.revolution_heat, 3),
+        "revolution": (c.revolution.phase
+                       if c.revolution is not None else "none"),
+        # Границы налоговых ползунков — уже с поправкой на идеологию: витрина
+        # обязана показывать тот же предел, о который ударится сохранение.
+        "policy_limits": {k: [lo, hi] for k, (lo, hi) in policy_limits(c).items()},
     }
 
 
@@ -523,7 +617,7 @@ def _fronts(w: World, c) -> list[dict]:
         rows.append({
             "country_id": nb, "name": other.name, "color": other.color,
             "soldiers": round(mine), "officers": round(officers),
-            "command": round(society.command_quality(officers, mine), 3),
+            "command": round(society.command_quality(officers, mine, c), 3),
             # сколько офицеров нужно для полного качества командования
             "officers_needed": round(mine * config.OFFICER_TARGET_SHARE),
             "strength": round(society.front_strength(w, c, nb)),
@@ -564,15 +658,20 @@ def _army_brief(w: World, c) -> dict:
         # пусто в казне или нанимать некого.
         "officer_candidates": round(society.officer_candidates(w, c)),
         "officer_pay_needed": round(society.officer_pay_bar(w, c), 2),
-        "officer_pool": [config.STRATA[k]["name"] for k in config.OFFICER_POOL],
+        # Из кого набирают офицеров — решает ЗАКОН о государственном устройстве:
+        # при монархии патент дворянский, республика открывает его мещанству.
+        "officer_pool": [config.STRATA[k]["name"]
+                         for k in politics.officer_pool(c)],
         "officers_hired": round(c.last_officers_hired),
         "officers_lost": round(c.last_officers_lost),
         "officer_recruit_share": config.OFFICER_RECRUIT_SHARE,
         "officer_casualty_mult": config.OFFICER_CASUALTY_MULT,
         # Качество командования «в среднем по стране» — справочно. В бою
         # считается своё на каждом фронте, см. _fronts.
-        "command": round(society.command_quality(officers, soldiers), 3),
-        "command_max": config.COMMAND_MAX,
+        "command": round(society.command_quality(officers, soldiers, c), 3),
+        # Потолок командования — тоже из закона: республике достаётся ровно
+        # сотня процентов, полтораста даёт только дворянский корпус.
+        "command_max": politics.command_cap(c),
         "slot_cost": round(society.soldier_slot_cost(c), 2),
         # ---- фронты ----
         "fronts": _fronts(w, c),
@@ -971,8 +1070,10 @@ def cities(ctx: Ctx) -> dict:
             "mine": c.country_id == scope.id,
             "population": round(c.population),
             "workers": round(c.s("workers").people),
-            "jobs": round(sum(b.level * w.industries[b.industry_key].jobs_per_level
-                              for b in w.city_buildings(c.id))),
+            "jobs": round(sum(
+                b.level * politics.industry_jobs(
+                    country, w.industries[b.industry_key])
+                for b in w.city_buildings(c.id))),
             "harvest": round(c.harvest, 3),
             "savings": round(c.savings, 2),
             "unemployment": round(c.unemployment, 4),
@@ -1043,7 +1144,7 @@ def population(ctx: Ctx) -> dict:
     scope_cities = w.country_regions(c.id) if whole else [region]
 
     agg = {k: {"people": 0.0, "cash": 0.0, "income": 0.0, "satisfaction": 0.0,
-               "sol": 0.0, "expect": 0.0, "eaten": {}}
+               "sol": 0.0, "expect": 0.0, "edu": 0.0, "griev": 0.0, "eaten": {}}
            for k in config.STRATA_ORDER}
     for city in scope_cities:
         for key in config.STRATA_ORDER:
@@ -1055,6 +1156,8 @@ def population(ctx: Ctx) -> dict:
             a["satisfaction"] += st.satisfaction * st.people
             a["sol"] += st.living_standard * st.people
             a["expect"] += st.expectation * st.people
+            a["edu"] += st.education * st.people
+            a["griev"] += st.grievance * st.people
             for g, qty in (st.consumed or {}).items():
                 a["eaten"][g] = a["eaten"].get(g, 0.0) + qty
     total_pop = sum(a["people"] for a in agg.values()) or 1.0
@@ -1075,6 +1178,18 @@ def population(ctx: Ctx) -> dict:
             "can_hire": key in config.LABOUR_POOL,
             "living_standard": round(a["sol"] / a["people"], 3) if a["people"] > 1 else 0.0,
             "expectation": round(a["expect"] / a["people"], 3) if a["people"] > 1 else 0.0,
+            # ОБРАЗОВАНИЕ и то, во что оно обходится государству. Смотреть на
+            # эти два числа надо вместе: первое — доля сословия, годная на
+            # завод, второе — та же грамотность, обернувшаяся требованием
+            # прав. Одно без другого не бывает.
+            "education": round(a["edu"] / a["people"], 3) if a["people"] > 1 else 0.0,
+            "grievance": round(a["griev"] / a["people"], 3) if a["people"] > 1 else 0.0,
+            # Какая доля сословия годится на завод при нынешней грамотности.
+            # Промышленнику это и есть ответ на вопрос «кого я вообще могу
+            # переманить», а он куда важнее общей численности.
+            "worker_pool": round(society.worker_pool_share(
+                a["edu"] / a["people"]), 3)
+                if a["people"] > 1 and key in config.LABOUR_POOL else None,
             # что из роскоши это сословие уже себе позволяет
             "luxuries": [
                 {"good": g, "name": w.goods[g].name,
@@ -1128,10 +1243,38 @@ def population(ctx: Ctx) -> dict:
                           and w.industries[b.industry_key].labour == "peasants"))
     sol = (society.country_living_standard(w, c) if whole
            else society.region_living_standard(region))
+    # ПРОСВЕЩЕНИЕ СТРАНЫ одной строкой: сколько людей учат прямо сейчас, кого
+    # именно позволяет учить закон и во что уже обошлась грамотность.
+    teaching = {}
+    for city in scope_cities:
+        for kind, room in society.teaching_capacity(w, city).items():
+            if kind == "school":
+                room *= politics.school_efficiency(c)
+            teaching[kind] = teaching.get(kind, 0.0) + room
+
     return {
         "strata": strata, "cities": by_city, "crafts": craft_rows,
         "army": _army_brief(w, c),
         "living_standard": round(sol, 3),
+        "education": {
+            "average": round(society.country_education(w, c), 3),
+            "grievance": round(society.country_grievance(w, c), 3),
+            "law": politics.option(c, "education")["name"],
+            "school_allowed": politics.school_allowed(c),
+            "school_efficiency": round(politics.school_efficiency(c), 3),
+            "schools": [config.STRATA[k]["name"]
+                        for k in politics.educated_strata(c, "school")
+                        if k in config.STRATA],
+            "universities": [config.STRATA[k]["name"]
+                             for k in politics.educated_strata(c, "university")
+                             if k in config.STRATA],
+            # Скольких страна выучивает за пейдей — уже с поправкой на закон.
+            "capacity_school": round(teaching.get("school", 0.0)),
+            "capacity_university": round(teaching.get("university", 0.0)),
+            "decay": config.EDU_DECAY,
+            "worker_floor": config.EDU_WORKER_FLOOR,
+            "rights_law": politics.option(c, "labour_rights")["name"],
+        },
         "scope": "country" if whole else "region",
         "region_id": None if whole else region.id,
         "region_name": None if whole else region.name,
@@ -1151,7 +1294,7 @@ def population(ctx: Ctx) -> dict:
         # Крестьяне, нанятые на фермы: деревня на жалованье, а не рабочие.
         "farm_hands": round(farm_hands),
         "farm_wage_floor": round(
-            society.peasant_alternative(region) if region is not None else 0.0, 2),
+            society.peasant_alternative(region, c) if region is not None else 0.0, 2),
     }
 
 
@@ -1194,18 +1337,24 @@ def industries(ctx: Ctx) -> dict:
                 return None
             return {"id": b.id, "level": b.level, "damage": b.damage,
                     "upgrade_cost": round(
-                        level_cost(i.build_cost_mult, b.level + 1), 2)}
+                        build_price(c, i, b.level + 1, owner.is_state), 2)}
 
+        # Места и выпуск показываются ПО ЗАКОНАМ ЭТОЙ СТРАНЫ, а не по чертежу
+        # отрасли: земельное устройство переписывает и то и другое у крестьянских
+        # предприятий (politics.industry_jobs / industry_output), и промышленник
+        # обязан видеть настоящую ферму до того, как решит её строить.
+        jobs_per_level = politics.industry_jobs(c, i)
+        output_per_worker = politics.industry_output(c, i)
         # Содержание на работника считается по местам ИМЕННО ЭТОЙ отрасли.
         # Общая константа врала бы всякий раз, когда мест не «как у всех»: у
         # «Фермы» их впятеро больше, и её расходы выходили бы впятеро завышенными,
         # а прибыль на работника — отрицательной на ровном месте.
-        upkeep_per_worker = config.UPKEEP_PER_LEVEL / max(i.jobs_per_level, 1)
+        upkeep_per_worker = config.UPKEEP_PER_LEVEL / max(jobs_per_level, 1)
         row = {
             "key": i.key, "name": i.name, "kind": i.kind,
             "sector": i.sector,
             "sector_name": config.SECTORS.get(i.sector, i.sector),
-            "jobs_per_level": i.jobs_per_level,
+            "jobs_per_level": round(jobs_per_level),
             # Кто на этом предприятии работает: рабочие или крестьяне. У «Фермы»
             # это крестьяне — сословия они не меняют, поэтому её можно ставить
             # с первого пейдея, когда рабочих в стране ещё нет.
@@ -1213,7 +1362,13 @@ def industries(ctx: Ctx) -> dict:
             "labour_name": config.STRATA.get(i.labour, {}).get("name", i.labour),
             "inputs": inputs,
             "inputs_ready": all(x["available"] for x in inputs),
-            "build_cost": round(level_cost(i.build_cost_mult, 1), 2),
+            # Цена постройки идёт двумя числами: своя и казённая. Идеология
+            # даёт скидку не всем сразу — при либерализме дешевле строит
+            # промышленник, при консерватизме казна, — и на витрине это должно
+            # быть видно до того, как игрок нажмёт кнопку.
+            "build_cost": round(build_price(c, i, 1, False), 2),
+            "build_cost_state": round(build_price(c, i, 1, True), 2),
+            "state_blocked": politics.state_build_blocked(c, i),
             "state_levels": state_lv, "private_levels": private_lv,
             # Предел развития и сколько уже занято В ЭТОЙ ОБЛАСТИ: у «Торговой
             # палаты» девять уровней на область, и считаются они по всем хозяевам.
@@ -1231,11 +1386,31 @@ def industries(ctx: Ctx) -> dict:
             "description": i.description,
             # Содержание штата есть и у производящих административных зданий
             # (оперный театр), поэтому считаем его всегда, а не в одной ветке.
-            "upkeep_goods": [{"good": k, "name": w.goods[k].name, "qty": q}
-                             for k, q in i.upkeep_goods.items()],
+            # Расход бумаги показывается уже с поправкой на закон об
+            # образовании: всеобщее право учиться удваивает его разом по всем
+            # зданиям, и промышленник обязан видеть настоящую цифру.
+            "upkeep_goods": [{"good": k, "name": w.goods[k].name, "qty": round(q, 1)}
+                             for k, q in upkeep_needs(c, i, 1).items()],
             "cost_per_level": round(
-                sum(q * society.lg(region, k).price for k, q in i.upkeep_goods.items())
-                + i.jobs_per_level * wage + config.UPKEEP_PER_LEVEL, 2),
+                sum(q * society.lg(region, k).price
+                    for k, q in upkeep_needs(c, i, 1).items())
+                + jobs_per_level * wage * (1.0 + max(0.0, c.worker_insurance))
+                + config.UPKEEP_PER_LEVEL, 2),
+            # ---- учебное заведение ----
+            # Ёмкость на уровень и кого ему позволено учить ПО ЗДЕШНЕМУ ЗАКОНУ.
+            # Одно и то же здание при разных законах учит разных людей, и
+            # видеть это надо до постройки, а не после.
+            "education": round(i.education, 1),
+            "education_kind": i.education_kind,
+            "education_strata": [
+                config.STRATA[k]["name"]
+                for k in politics.educated_strata(c, i.education_kind)
+                if k in config.STRATA] if i.education_kind else [],
+            "education_efficiency": (
+                round(politics.school_efficiency(c), 3)
+                if i.education_kind == "school" else 1.0),
+            "education_blocked": (
+                i.education_kind == "school" and not politics.school_allowed(c)),
         }
         # Ничего не выпускают не только ратуши, но и торговые площади:
         # ветвимся по наличию выходного товара, а не по виду постройки.
@@ -1255,15 +1430,15 @@ def industries(ctx: Ctx) -> dict:
             # заранее — и «прибыль на работника» на нём не настоящая.
             sell_through = (min(1.0, local.last_sold / local.last_supply)
                             if local.last_supply > 1.0 else None)
-            gross = ((local.price - input_cost) * i.output_per_worker
-                     - wage - upkeep_per_worker) if i.output_per_worker > 0 else 0.0
+            gross = ((local.price - input_cost) * output_per_worker
+                     - wage - upkeep_per_worker) if output_per_worker > 0 else 0.0
             net = ((local.price * (sell_through if sell_through is not None else 1.0)
-                    - input_cost) * i.output_per_worker
-                   - wage - upkeep_per_worker) if i.output_per_worker > 0 else 0.0
+                    - input_cost) * output_per_worker
+                   - wage - upkeep_per_worker) if output_per_worker > 0 else 0.0
             row.update({
                 "output_good": i.output_good,
                 "output_good_name": good.name,
-                "output_per_worker": i.output_per_worker,
+                "output_per_worker": round(output_per_worker, 2),
                 "unit_price": round(local.price, 2),
                 "unit_cost": round(input_cost, 2),
                 "shortage": round(local.last_shortage, 4),
@@ -1364,10 +1539,12 @@ def _building_dto(w: World, b: Building) -> dict:
     # это НЕ недобор людей, поэтому «Рабочие» и заполненность считаются от
     # рабочей мощности: иначе цех на половинном ходу вечно выглядел бы
     # недоукомплектованным и пугал бы хозяина мнимой нехваткой рук.
-    cap_full = b.effective_level * ind.jobs_per_level
-    cap = cap_full * max(0.0, min(1.0, b.throttle))
     city = w.cities[b.city_id]
     country = w.countries.get(city.country_id)
+    # Мест — по законам той страны, где цех стоит: земельное устройство меняет
+    # вместимость крестьянских предприятий (politics.industry_jobs).
+    cap_full = b.effective_level * politics.industry_jobs(country, ind)
+    cap = cap_full * max(0.0, min(1.0, b.throttle))
     owner = w.players.get(b.owner_id)
     local = city.goods.get(ind.output_good) if ind.output_good else None
     return {
@@ -1495,6 +1672,18 @@ def _charge(ctx: Ctx, owner: Player, cost: float, country, city) -> None:
     country.collect("income_tax", cost * country.income_tax)
 
 
+def build_price(country, ind, level: int, state_owned: bool) -> float:
+    """Цена уровня С УЧЁТОМ идеологии.
+
+    Скидки достаются разным: либерализм удешевляет стройку промышленнику,
+    консерватизм — казне, национализм — военным цехам, но зато всем сразу.
+    Одна и та же постройка в двух соседних странах стоит по-разному, и это
+    ровно то, ради чего идеологию и принимают.
+    """
+    base = level_cost(ind.build_cost_mult, level)
+    return base * (1.0 - politics.build_discount(country, ind, state_owned))
+
+
 def _existing_building(w: World, owner_id: int, city_id: int, key: str):
     """Уже построенное предприятие этой отрасли у этого хозяина в этой области."""
     return next((b for b in w.buildings.values()
@@ -1530,6 +1719,24 @@ def build(ctx: Ctx) -> dict:
         raise ApiError(404, "Город не принадлежит государству")
     if ind.kind == "admin" and not state_owned:
         raise ApiError(403, "Административные здания строит только государство")
+    # Либерализм выгоняет казну из хозяйства: государственных заводов при нём
+    # не строят вовсе. Управлять оно при этом не перестаёт — ратушу, торговую
+    # палату и академию строить по-прежнему некому, кроме него.
+    if state_owned and politics.state_build_blocked(country, ind):
+        raise ApiError(403, "Идеология государства («"
+                            + politics.option(country, "ideology")["name"]
+                            + "») запрещает казне строить предприятия. "
+                              "Казне остались только административные здания.")
+    # СОСЛОВНОЕ ОБРАЗОВАНИЕ школ не признаёт: грамота — дворянская привилегия,
+    # и учить деревню государству не позволено. Это первая стена, в которую
+    # упирается всякий, кто хочет промышленности, — и сломать её можно только
+    # законом, а не деньгами.
+    if (ind.education_kind == "school"
+            and not politics.school_allowed(country)):
+        raise ApiError(403, "Действующий закон об образовании («"
+                            + politics.option(country, "education")["name"]
+                            + "») не позволяет строить школы. "
+                              "Переменить его — дело парламента или указа.")
     if not state_owned and p.bankrupt:
         raise ApiError(403, "Вы признаны банкротом: строить нельзя, пока "
                             "государство не закроет дело о банкротстве")
@@ -1558,14 +1765,14 @@ def build(ctx: Ctx) -> dict:
         twin = _existing_building(w, owner.id, city_id, key)
         if twin is not None:
             who = "У государства" if state_owned else "У вас"
-            cost = level_cost(ind.build_cost_mult, twin.level + 1)
+            cost = build_price(country, ind, twin.level + 1, state_owned)
             raise ApiError(400,
                            f"{who} в области {city.name} уже есть «{ind.name}» "
                            f"(ур. {twin.level}). Второе такое же не строят — "
                            f"поднимите уровень за {cost:,.0f} ₡ или стройте "
                            f"в другой области.")
 
-    _charge(ctx, owner, level_cost(ind.build_cost_mult, 1), country, city)
+    _charge(ctx, owner, build_price(country, ind, 1, state_owned), country, city)
 
     b = Building(id=w.next_building_id, industry_key=key, owner_id=owner.id,
                  city_id=city_id, level=1,
@@ -1610,7 +1817,8 @@ def upgrade(ctx: Ctx) -> dict:
     if ind.max_level and _levels_in_city(w, b.city_id, b.industry_key) >= ind.max_level:
         raise ApiError(400, f"«{ind.name}» развита до предела: "
                             f"{ind.max_level} ур. — выше не поднять")
-    _charge(ctx, owner, level_cost(ind.build_cost_mult, b.level + 1), country, city)
+    _charge(ctx, owner, build_price(country, ind, b.level + 1, owner.is_state),
+            country, city)
     b.level += 1
     return {"ok": True, "building": _building_dto(w, b),
             "cash": round(ctx.require_player().cash, 2)}
@@ -1762,6 +1970,10 @@ POLICY_LIMITS = {
     "public_spending_rate": (0.0, 1.0),
     "land_rent": (0.0, 0.50),
     "min_wage": (0.0, 10_000.0),
+    # Страховка работника: доля фонда оплаты труда, которую предприятие платит
+    # сверх зарплаты прямо работающему сословию. Ставку крутит лидер, нижнюю
+    # границу задаёт закон о правах рабочих (politics.tax_bounds).
+    "worker_insurance": (0.0, 0.60),
     # Пошлины. Вывозная кормит казну с каждой сделки, но отбивает у своих охоту
     # вывозить; ввозная защищает своего производителя от дешёвого чужого товара.
     "tariff": (0.0, config.TARIFF_MAX),
@@ -1772,11 +1984,31 @@ POLICY_LIMITS = {
 }
 
 
+def policy_limits(country) -> dict[str, tuple[float, float]]:
+    """Пределы рычагов лидера С УЧЁТОМ действующих законов.
+
+    Общие границы (POLICY_LIMITS) — это предел здравого смысла: выше него
+    ставку не поднять никогда. Законы сужают его дальше, и в этом их главное
+    действие: либерализм не позволяет обложить прибыль, консерватизм не даёт
+    отменить подати, открытая экономика запирает пошлины на десяти процентах.
+    Ползунок, упёршийся в закон, — это и есть повод его менять.
+    """
+    limits = dict(POLICY_LIMITS)
+    cap = politics.tariff_cap(country)
+    for field_name in ("tariff", "import_tariff"):
+        lo, hi = limits[field_name]
+        limits[field_name] = (lo, min(hi, cap))
+    for field_name, (lo, hi) in politics.tax_bounds(country).items():
+        base_lo, base_hi = limits.get(field_name, (0.0, 1.0))
+        limits[field_name] = (max(base_lo, lo), min(base_hi, hi))
+    return limits
+
+
 def gov_policy(ctx: Ctx) -> dict:
     """Лидер меняет экономический курс СВОЕГО государства."""
     p, c = ctx.require_leader()
     changed = []
-    for field, (lo, hi) in POLICY_LIMITS.items():
+    for field, (lo, hi) in policy_limits(c).items():
         if ctx.body.get(field) is None:
             continue
         val = float(ctx.body[field])
@@ -1848,6 +2080,451 @@ def cast_vote(ctx: Ctx) -> dict:
         raise ApiError(400, "Такого кандидата нет в вашем государстве")
     c.election.votes[p.id] = candidate_id
     return {"ok": True, "votes_cast": len(c.election.votes)}
+
+
+# ---------------------------------------------------------------------------
+# Законы государства, парламент и лоббирование
+# ---------------------------------------------------------------------------
+def _party_dto(w: World, country, party, viewer: Player | None) -> dict:
+    """Фракция в палате: сколько мест, за что стоит и сколько в неё вложено."""
+    total = sum(p.seats for p in country.parties) or 1
+    bids = (country.lobby_bids or {}).get(party.key, {})
+    return {
+        "key": party.key, "name": party.name, "color": party.color,
+        "seats": party.seats,
+        "share": round(party.seats / total, 4),
+        "votes": round(party.votes),
+        # Мест, добавленных деньгами промышленников на прошлых выборах.
+        "bought": round(party.bought, 1),
+        "platform": [
+            {"law": cat, "law_name": config.LAWS[cat]["name"],
+             "option": opt,
+             "option_name": config.LAWS[cat]["options"][opt]["name"],
+             "current": politics.law(country, cat) == opt}
+            for cat, opt in party.platform.items() if cat in config.LAWS
+            and opt in config.LAWS[cat]["options"]],
+        # Заявки на БУДУЩИЕ выборы: свои и общие.
+        "pledged": round(sum(bids.values()), 2),
+        "my_pledge": round(bids.get(viewer.id, 0.0), 2) if viewer else 0.0,
+    }
+
+
+def _law_vote_dto(w: World, country, viewer: Player | None) -> dict | None:
+    """Идущее голосование по закону — вместе с раскладом и лоббированием."""
+    vote = country.law_vote
+    if vote is None:
+        return None
+    spec = politics.option_of(vote.law, vote.option) or {}
+    tally = politics.vote_tally(country)
+    proposer = w.players.get(vote.proposer_id) if vote.proposer_id else None
+    return {
+        "law": vote.law, "law_name": config.LAWS[vote.law]["name"],
+        "option": vote.option, "option_name": spec.get("name", vote.option),
+        "note": spec.get("note", ""),
+        "effects": list(spec.get("effects", [])),
+        "started_tick": vote.started_tick, "ends_tick": vote.ends_tick,
+        "ticks_left": max(0, vote.ends_tick - w.tick),
+        "proposer": proposer.username if proposer else "лидер государства",
+        "financed": vote.financed,
+        # Мнение палаты снято при постановке вопроса и больше не меняется:
+        # дальше идёт только торг за уже высказанные голоса.
+        "seats_for": round(vote.seats_for, 1),
+        "seats_against": round(vote.seats_against, 1),
+        "for": round(tally["for"], 1),
+        "against": round(tally["against"], 1),
+        "total": round(tally["total"], 1),
+        "swing": round(tally["swing"], 1),
+        "money_for": round(sum(vote.lobby_for.values()), 2),
+        "money_against": round(sum(vote.lobby_against.values()), 2),
+        "my_for": round(vote.lobby_for.get(viewer.id, 0.0), 2) if viewer else 0.0,
+        "my_against": round(vote.lobby_against.get(viewer.id, 0.0), 2)
+                      if viewer else 0.0,
+        "passing": tally["for"] > tally["against"],
+    }
+
+
+def _parliament_dto(w: World, country, viewer: Player | None) -> dict:
+    seats = politics.seats(country)
+    elected = country.parliament_tick
+    return {
+        "seats": seats,
+        "seats_next": politics.next_seats(country),
+        "seats_min": config.PARLIAMENT_SEATS_MIN,
+        "seats_max": config.PARLIAMENT_SEATS_MAX,
+        "seat_cost": config.PARLIAMENT_SEAT_COST,
+        "cost": round(politics.parliament_cost(country), 2),
+        "elections": politics.has_elections(country),
+        "elected_tick": elected,
+        "term": config.PARLIAMENT_TERM_TICKS,
+        "next_election": (max(0, elected + config.PARLIAMENT_TERM_TICKS - w.tick)
+                          if elected >= 0 else 0),
+        "parties": [_party_dto(w, country, p, viewer) for p in country.parties],
+        "taken": sum(p.seats for p in country.parties),
+    }
+
+
+def _can_lobby(w: World, player: Player | None, country) -> bool:
+    """Кому вообще позволено вкладывать деньги в здешнюю политику.
+
+    Гражданам — само собой. Но и чужому промышленнику, у которого в этой
+    стране стоят заводы: он платит здешние налоги и живёт по здешним законам,
+    так что интерес у него не меньший. Казна в политику не играет.
+    """
+    if player is None or player.is_state or player.bankrupt:
+        return False
+    if player.country_id == country.id:
+        return True
+    return any(b.owner_id == player.id
+               and w.cities.get(b.city_id) is not None
+               and w.cities[b.city_id].country_id == country.id
+               for b in w.buildings.values())
+
+
+def _revolution_dto(w: World, country) -> dict | None:
+    """Идущая революция: кто восстал, чего требует и сколько осталось на ответ.
+
+    Отдаётся всем, а не одному лидеру: революция — не служебная тайна, и
+    промышленнику знать о ней важнее всех. Кнопки же есть только у лидера.
+    """
+    rev = country.revolution
+    if rev is None:
+        return None
+    return {
+        "phase": rev.phase,
+        "outcome": rev.outcome,
+        "started_tick": rev.started_tick,
+        "deadline_tick": rev.deadline_tick,
+        "ticks_left": max(0, rev.deadline_tick - w.tick)
+                      if rev.phase == "demands" else 0,
+        "strata": [config.STRATA[k]["name"] for k in rev.strata
+                   if k in config.STRATA],
+        "demands": [
+            {"law": cat, "law_name": config.LAWS[cat]["name"], "option": opt,
+             "option_name": (politics.option_of(cat, opt) or {}).get("name", opt),
+             "note": (politics.option_of(cat, opt) or {}).get("note", ""),
+             "effects": list((politics.option_of(cat, opt) or {}).get("effects", []))}
+            for cat, opt in rev.demands.items() if cat in config.LAWS],
+        "rebels": round(rev.rebels),
+        "defected": round(rev.defected),
+        "support": round(rev.support, 4),
+        "battles": rev.battles,
+        "momentum": round(rev.momentum, 3),
+        "gov_losses": round(rev.gov_losses),
+        "rebel_losses": round(rev.rebel_losses),
+        "army": round(society.army_size(w, country)),
+    }
+
+
+def _require_revolution(ctx: Ctx):
+    """Лидер и идущая у него революция — или внятная ошибка."""
+    p, c = ctx.require_leader()
+    rev = c.revolution
+    if rev is None or rev.phase in ("none", "done"):
+        raise ApiError(400, "В стране сейчас нет восстания")
+    return p, c, rev
+
+
+def revolution_accept(ctx: Ctx) -> dict:
+    """Лидер принимает требования восставших.
+
+    Принять их можно и в разгар гражданской войны, а не только пока идёт срок
+    ответа: договориться никогда не поздно — просто до войны это обошлось бы
+    без сожжённой столицы и без разбежавшейся армии.
+    """
+    p, c, _rev = _require_revolution(ctx)
+    lines = engine_accept_demands(ctx.world, c)
+    for line in lines:
+        db.add_event(ctx.world.tick, p.id, "revolution", line)
+    return {"ok": True, "news": lines,
+            "revolution": _revolution_dto(ctx.world, c)}
+
+
+def revolution_reject(ctx: Ctx) -> dict:
+    """Лидер отказывает восставшим — и тем открывает гражданскую войну.
+
+    Отдельная кнопка нужна затем, чтобы отказ был РЕШЕНИЕМ, а не молчанием:
+    промолчав, лидер получит то же самое по истечении срока, но узнает об этом
+    из новостей. Здесь же он берёт войну на себя сознательно — и она начинается
+    в тот же пейдей, не дожидаясь конца срока.
+    """
+    p, c, rev = _require_revolution(ctx)
+    if rev.phase != "demands":
+        raise ApiError(400, "Гражданская война уже идёт")
+    rev.deadline_tick = ctx.world.tick
+    line = (f"{c.name}: лидер отказывает восставшим — "
+            f"требования отклонены, страна идёт к гражданской войне")
+    db.add_event(ctx.world.tick, p.id, "revolution", line)
+    return {"ok": True, "news": [line],
+            "revolution": _revolution_dto(ctx.world, c)}
+
+
+def laws(ctx: Ctx) -> dict:
+    """Всё о форме государства: законы, палата, голосование и цены лоббирования."""
+    w = ctx.world
+    c = _chosen_country(ctx)
+    me = ctx.player
+    is_leader = bool(me and c.leader_id == me.id)
+    decree = not politics.has_elections(c)
+    cooldown = max(0, c.last_law_tick + config.LAW_COOLDOWN_TICKS - w.tick)
+
+    # Капитал считаем один раз на все четырнадцать законов: взнос за
+    # рассмотрение зависит от него, а перебирать ради каждого закона все
+    # постройки мира незачем.
+    worth = w.net_worth(me) if (me and not me.is_state) else None
+
+    categories = []
+    for cat in config.LAW_ORDER:
+        spec = config.LAWS[cat]
+        current = politics.law(c, cat)
+        options = []
+        for key, opt in spec["options"].items():
+            blocked = politics.law_blocked(c, cat, key)
+            options.append({
+                "key": key, "name": opt["name"], "note": opt.get("note", ""),
+                "effects": list(opt.get("effects", [])),
+                "current": key == current,
+                "blocked": blocked if key != current else None,
+                # Насколько нынешняя палата к этому расположена и во что
+                # обойдётся промышленнику одна лишь постановка вопроса.
+                "support": round(politics.expected_support(c, cat, key), 4),
+                "finance_cost": round(
+                    politics.finance_cost(w, c, me, cat, key, worth), 2)
+                    if worth is not None else None,
+            })
+        categories.append({
+            "key": cat, "name": spec["name"], "note": spec.get("note", ""),
+            "current": current,
+            "current_name": spec["options"][current]["name"],
+            "options": options,
+        })
+
+    return {
+        "country_id": c.id, "country_name": c.name,
+        "is_leader": is_leader,
+        "leader": (w.players.get(c.leader_id).username
+                   if c.leader_id and w.players.get(c.leader_id) else None),
+        "decree": decree,
+        "laws": categories,
+        "parliament": _parliament_dto(w, c, me),
+        "vote": _law_vote_dto(w, c, me),
+        # РЕВОЛЮЦИЯ живёт на этой же витрине, и не случайно: требует она
+        # именно законов, и отвечать на неё лидеру приходится тем же, чем он
+        # правит. Жар показывается всегда — по нему видно, как близко страна к
+        # тому, чтобы предъявить требования.
+        "revolution": _revolution_dto(w, c),
+        "revolution_heat": round(c.revolution_heat, 3),
+        "grievance": round(society.country_grievance(w, c), 3),
+        "education": round(society.country_education(w, c), 3),
+        "cooldown_left": cooldown,
+        "vote_ticks": config.LAW_VOTE_TICKS,
+        "can_lobby": _can_lobby(w, me, c),
+        "lobby": {
+            "difficulty": round(politics.lobby_difficulty(c), 3),
+            "seat_price": round(politics.seat_price(c), 2),
+            "min_stake": round(politics.min_stake(c), 2),
+            "power": politics.lobby_power(c),
+        },
+        # Заготовки партий: из них и собирается палата на каждых выборах.
+        # Вкладываться можно в любую — даже в ту, что в прошлый раз не прошла.
+        "archetypes": [
+            {"key": a["key"], "name": a["names"][0], "color": a["color"],
+             "platform": [
+                 {"law_name": config.LAWS[cat]["name"],
+                  "option_name": config.LAWS[cat]["options"][opt]["name"]}
+                 for cat, opt in a["platform"].items()],
+             "pledged": round(sum((c.lobby_bids or {})
+                                  .get(a["key"], {}).values()), 2),
+             "my_pledge": round((c.lobby_bids or {})
+                                .get(a["key"], {}).get(me.id, 0.0), 2)
+                          if me else 0.0}
+            for a in config.PARTY_ARCHETYPES],
+        "unfair": {
+            "active": politics.unfair_voting(c, w.tick),
+            "left": max(0, c.unfair_until - w.tick),
+            "penalty": config.UNFAIR_DISCONTENT,
+        },
+        "cash": round(me.cash, 2) if me else 0.0,
+    }
+
+
+def law_propose(ctx: Ctx) -> dict:
+    """Лидер предлагает новый закон.
+
+    При авторитаризме предложение и есть решение: закон вступает в силу тем же
+    пейдеем. Там, где выборы уже есть, лидер только ставит вопрос — дальше
+    решает палата, а промышленники могут двигать её деньгами.
+    """
+    w = ctx.world
+    leader, c = ctx.require_leader()
+    category = str(ctx.need("law"))
+    opt = str(ctx.need("option"))
+    if category not in config.LAWS:
+        raise ApiError(400, "Такой категории законов нет")
+    blocked = politics.law_blocked(c, category, opt)
+    if blocked:
+        raise ApiError(400, blocked)
+    if c.law_vote is not None:
+        raise ApiError(400, "Палата уже рассматривает другой закон — "
+                            "дождитесь итога голосования")
+    left = c.last_law_tick + config.LAW_COOLDOWN_TICKS - w.tick
+    if left > 0:
+        raise ApiError(400, f"Страна только что переменила закон. "
+                            f"Следующий можно вынести через {left} пейдей(-ев)")
+
+    name = config.LAWS[category]["options"][opt]["name"]
+    if not politics.has_elections(c):
+        notes = politics.apply_law(w, c, category, opt)
+        db.add_event(w.tick, leader.id, "law",
+                     f"{c.name}: указом лидера вводится «{name}»"
+                     + (" (" + "; ".join(notes) + ")" if notes else ""))
+        return {"ok": True, "applied": True, "notes": notes}
+
+    if not c.parties:
+        raise ApiError(400, "Парламент ещё не собран — голосовать некому")
+    vote = politics.open_law_vote(w, c, category, opt, leader)
+    db.add_event(w.tick, leader.id, "law",
+                 f"{c.name}: лидер выносит на голосование «{name}» — "
+                 f"предварительно {vote.seats_for:.0f} за, "
+                 f"{vote.seats_against:.0f} против")
+    return {"ok": True, "applied": False, "vote": _law_vote_dto(w, c, leader)}
+
+
+def law_finance(ctx: Ctx) -> dict:
+    """Промышленник оплачивает САМУ постановку вопроса — мимо лидера.
+
+    Голосование запускается без него: деньги идут в казну, палата садится
+    рассматривать закон. Цена считается из того, насколько закон и без того
+    нравится депутатам, и из капитала заказчика — чтобы для крупного дельца
+    взнос оставался заметным.
+    """
+    w = ctx.world
+    p = ctx.require_player()
+    c = _chosen_country(ctx)
+    if not _can_lobby(w, p, c):
+        raise ApiError(403, "Вкладываться в политику этой страны вам не с чего")
+    if not politics.has_elections(c):
+        raise ApiError(400, "В стране авторитаризм: законы меняет лидер указом, "
+                            "и рассматривать их некому")
+    if not c.parties:
+        raise ApiError(400, "Парламент ещё не собран")
+    if c.law_vote is not None:
+        raise ApiError(400, "Палата уже занята другим законом")
+    left = c.last_law_tick + config.LAW_COOLDOWN_TICKS - w.tick
+    if left > 0:
+        raise ApiError(400, f"Страна только что переменила закон. "
+                            f"Следующий можно вынести через {left} пейдей(-ев)")
+    category = str(ctx.need("law"))
+    opt = str(ctx.need("option"))
+    if category not in config.LAWS:
+        raise ApiError(400, "Такой категории законов нет")
+    blocked = politics.law_blocked(c, category, opt)
+    if blocked:
+        raise ApiError(400, blocked)
+
+    cost = politics.finance_cost(w, c, p, category, opt)
+    if p.cash < cost:
+        raise ApiError(400, f"Взнос за рассмотрение — {cost:,.0f} ₡, "
+                            f"у вас {p.cash:,.0f} ₡")
+    p.cash -= cost
+    c.collect("law_fee", cost)
+    name = config.LAWS[category]["options"][opt]["name"]
+    vote = politics.open_law_vote(w, c, category, opt, p, financed=True)
+    db.add_event(w.tick, p.id, "law",
+                 f"{p.username} вносит {cost:,.0f} ₡ за рассмотрение закона "
+                 f"«{name}» в государстве {c.name}")
+    return {"ok": True, "cost": round(cost, 2), "cash": round(p.cash, 2),
+            "vote": _law_vote_dto(w, c, p)}
+
+
+def law_lobby(ctx: Ctx) -> dict:
+    """Подкупить палату за или против идущего законопроекта.
+
+    Считается не сумма, а РАЗНИЦА вложений сторон: депутаты берут у обоих, а
+    голосуют за того, кто дал больше. Деньги не исчезают — они оседают в
+    кошельках тех сословий, из которых палата и набрана.
+    """
+    w = ctx.world
+    p = ctx.require_player()
+    c = _chosen_country(ctx)
+    if not _can_lobby(w, p, c):
+        raise ApiError(403, "Вкладываться в политику этой страны вам не с чего")
+    if c.law_vote is None:
+        raise ApiError(400, "Палата сейчас ничего не рассматривает")
+    side = str(ctx.body.get("side") or "for")
+    if side not in ("for", "against"):
+        raise ApiError(400, "Сторона — «for» или «against»")
+    amount = float(ctx.need("amount"))
+    lowest = politics.min_stake(c)
+    if amount < lowest:
+        raise ApiError(400, f"Меньше {lowest:,.0f} ₡ в палате не берут "
+                            f"(сложность лоббирования "
+                            f"×{politics.lobby_difficulty(c):.2f})")
+    if p.cash < amount:
+        raise ApiError(400, f"У вас только {p.cash:,.0f} ₡")
+
+    politics.place_law_bid(w, c, p, side, amount)
+    seats = amount / politics.seat_price(c) * politics.lobby_power(c)
+    db.add_event(w.tick, p.id, "lobby",
+                 f"{p.username} вкладывает {amount:,.0f} ₡ "
+                 f"{'за' if side == 'for' else 'против'} законопроекта "
+                 f"в государстве {c.name} (≈{seats:.0f} голосов)")
+    return {"ok": True, "cash": round(p.cash, 2), "seats": round(seats, 1),
+            "vote": _law_vote_dto(w, c, p)}
+
+
+def party_lobby(ctx: Ctx) -> dict:
+    """Вложить деньги в партию до выборов: купленные голоса лягут в её итог."""
+    w = ctx.world
+    p = ctx.require_player()
+    c = _chosen_country(ctx)
+    if not _can_lobby(w, p, c):
+        raise ApiError(403, "Вкладываться в политику этой страны вам не с чего")
+    if not politics.has_elections(c):
+        raise ApiError(400, "В стране нет выборов — вкладываться не во что")
+    key = str(ctx.need("party"))
+    if not any(a["key"] == key for a in config.PARTY_ARCHETYPES):
+        raise ApiError(404, "Такой партии нет")
+    amount = float(ctx.need("amount"))
+    lowest = politics.min_stake(c)
+    if amount < lowest:
+        raise ApiError(400, f"Партия не станет связываться меньше чем "
+                            f"за {lowest:,.0f} ₡")
+    if p.cash < amount:
+        raise ApiError(400, f"У вас только {p.cash:,.0f} ₡")
+
+    politics.place_party_bid(w, c, p, key, amount)
+    name = next(a["names"][0] for a in config.PARTY_ARCHETYPES if a["key"] == key)
+    db.add_event(w.tick, p.id, "lobby",
+                 f"{p.username} вкладывает {amount:,.0f} ₡ в «{name}» "
+                 f"({c.name}) перед выборами")
+    return {"ok": True, "cash": round(p.cash, 2),
+            "parliament": _parliament_dto(w, c, p),
+            "pledged": round(sum(c.lobby_bids.get(key, {}).values()), 2)}
+
+
+def parliament_size(ctx: Ctx) -> dict:
+    """Лидер задаёт число кресел в палате.
+
+    Решение с двумя концами: большая палата дорого обходится казне (своя
+    статья расходов), зато её труднее перекупить — цена голоса растёт вместе
+    с числом кресел. Действует со следующего созыва: разгонять действующий
+    парламент ради арифметики нельзя.
+    """
+    w = ctx.world
+    leader, c = ctx.require_leader()
+    seats = int(ctx.need("seats"))
+    if not config.PARLIAMENT_SEATS_MIN <= seats <= config.PARLIAMENT_SEATS_MAX:
+        raise ApiError(400, f"Мест должно быть от {config.PARLIAMENT_SEATS_MIN} "
+                            f"до {config.PARLIAMENT_SEATS_MAX}")
+    # Число откладывается до ближайших выборов: действующая палата остаётся
+    # в том составе, в каком её избирали, вместе со своей ценой голоса и
+    # содержанием. Назначить прежний размер — значит отменить назначение.
+    c.parliament_seats_next = 0 if seats == politics.seats(c) else seats
+    db.add_event(w.tick, leader.id, "law",
+                 f"{c.name}: со следующего созыва в палате будет {seats} мест "
+                 f"(содержание {seats * config.PARLIAMENT_SEAT_COST:,.0f} ₡ "
+                 f"за пейдей)")
+    return {"ok": True, "parliament": _parliament_dto(w, c, leader)}
 
 
 # ---------------------------------------------------------------------------
@@ -2260,7 +2937,7 @@ def diplomacy(ctx: Ctx) -> dict:
                 "my_front_officers": round(society.front_officers(c, nb)) if c else 0,
                 "my_front_command": round(society.command_quality(
                     society.front_officers(c, nb),
-                    society.front_soldiers(c, nb)), 3) if c else 0.0,
+                    society.front_soldiers(c, nb), c), 3) if c else 0.0,
                 "at_war": w.at_war(cid, nb),
                 "allied": w.allied(cid, nb),
             })
@@ -2870,6 +3547,18 @@ ROUTES: dict[tuple[str, str], Route] = {
     ("GET", "/api/countries"): (countries_list, False),
     ("GET", "/api/elections"): (elections, False),
     ("POST", "/api/elections/vote"): (cast_vote, True),
+
+    # Законы, парламент и лоббирование
+    ("GET", "/api/laws"): (laws, False),
+    ("POST", "/api/laws/propose"): (law_propose, True),
+    ("POST", "/api/laws/finance"): (law_finance, True),
+    ("POST", "/api/laws/lobby"): (law_lobby, True),
+    ("POST", "/api/parliament/lobby"): (party_lobby, True),
+    ("POST", "/api/parliament/seats"): (parliament_size, True),
+    # Ответ лидера восставшим. Кнопок две, потому что решений тоже два, и
+    # молчание — это третье, отдельное: оно даёт войну по истечении срока.
+    ("POST", "/api/revolution/accept"): (revolution_accept, True),
+    ("POST", "/api/revolution/reject"): (revolution_reject, True),
 
     ("GET", "/api/buildings"): (my_buildings, False),
     ("POST", "/api/buildings/build"): (build, True),

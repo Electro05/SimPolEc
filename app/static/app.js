@@ -42,6 +42,7 @@ function freshState() {
         govBuildings: [],
         canManageState: false,
         elections: null,
+        laws: null,           // законы, парламент и идущее голосование
         map: null,
         mapPick: null,
         page: 'market',
@@ -63,6 +64,10 @@ const S = Object.assign({
     // Номер сессии. Растёт на каждый вход и выход; ответы запросов, ушедших
     // от прошлого аккаунта, по нему отбрасываются.
     session: 0,
+    // Минимальная длина пароля. Значение приходит с сервера вместе со
+    // списком государств; здесь — разумное умолчание на случай, если форма
+    // открылась раньше ответа.
+    pwMin: 8,
 }, freshState());
 
 /* ------------------------------ утилиты ------------------------------ */
@@ -121,14 +126,59 @@ function resetSession() {
     goPage('market');
 }
 
+/* --- вкладки формы --------------------------------------------------
+ *  Вход и регистрация — разные дела с разными полями, и держать их в одной
+ *  форме было нечестно: страна нужна только новичку, а «имя занято» в ответ
+ *  на попытку войти сбивало с толку. Выбранная вкладка помнится между
+ *  заходами: вернувшийся игрок сразу видит вход. */
+const AUTH_TAB_KEY = 'simpolec.authTab';
+const AUTH_PANES = { login: 'paneLogin', register: 'paneRegister' };
+
+function authTab(kind) {
+    if (!AUTH_PANES[kind]) kind = 'login';
+    for (const k of Object.keys(AUTH_PANES)) {
+        const on = k === kind;
+        const tab = $(k === 'login' ? 'tabLogin' : 'tabRegister');
+        const pane = $(AUTH_PANES[k]);
+        if (tab) { tab.classList.toggle('on', on); tab.setAttribute('aria-selected', on); }
+        if (pane) pane.hidden = !on;
+    }
+    authErr(kind, '');
+    try { localStorage.setItem(AUTH_TAB_KEY, kind); } catch (err) {}
+    const first = $(kind === 'login' ? 'logUser' : 'regUser');
+    // На телефоне всплывающая клавиатура при переключении вкладки только
+    // мешает, поэтому фокус ставим лишь на широком экране.
+    if (first && !NAV_MQ.matches) first.focus();
+}
+
+function authErr(kind, msg) {
+    const box = $(kind === 'register' ? 'regErr' : 'logErr');
+    if (box) box.textContent = msg || '';
+}
+
 async function doAuth(kind) {
-    const username = $('u').value.trim(), password = $('p').value;
-    const sel = $('regCountry');
-    const country_id = sel ? Number(sel.value) : 0;
-    $('authErr').textContent = '';
+    const reg = kind === 'register';
+    const username = $(reg ? 'regUser' : 'logUser').value.trim();
+    const password = $(reg ? 'regPass' : 'logPass').value;
+    authErr(kind, '');
+
+    // Что можно проверить на месте — проверяем на месте: сервер всё равно
+    // проверит ещё раз, но лишний круг по сети игроку ни к чему.
+    if (!username) return authErr(kind, 'Введите имя');
+    if (!password) return authErr(kind, 'Введите пароль');
+    if (reg) {
+        if (username.length < 3) return authErr(kind, 'Имя должно быть от 3 до 24 символов');
+        if (password.length < S.pwMin)
+            return authErr(kind, `Пароль должен быть не короче ${S.pwMin} символов`);
+        if (password !== $('regPass2').value)
+            return authErr(kind, 'Пароли не совпадают');
+        if (!Number($('regCountry').value))
+            return authErr(kind, 'Выберите государство');
+    }
+
     try {
         const body = { username, password };
-        if (kind === 'register' && country_id) body.country_id = country_id;
+        if (reg) body.country_id = Number($('regCountry').value);
         const r = await api('/api/' + kind, body);
         // Курсор оставался в поле пароля, а половина витрин не перерисовывается,
         // пока фокус в каком-нибудь input, — налоги и жалованье так и висели
@@ -137,10 +187,13 @@ async function doAuth(kind) {
         resetSession();
         S.token = r.token;
         localStorage.setItem('simpolec.token', r.token);
-        $('u').value = ''; $('p').value = '';
+        ['logUser', 'logPass', 'regUser', 'regPass', 'regPass2']
+            .forEach(id => { if ($(id)) $(id).value = ''; });
+        // Вошедший однажды в следующий раз придёт на вкладку входа.
+        try { localStorage.setItem(AUTH_TAB_KEY, 'login'); } catch (err) {}
         await start();
     } catch (e) {
-        $('authErr').textContent = e.message;
+        authErr(kind, e.message);
     }
 }
 
@@ -150,6 +203,15 @@ async function loadCountriesForRegister() {
     try {
         const r = await api('/api/countries');
         if (!r.countries || !r.countries.length) throw new Error('Список пуст');
+        // Требование к паролю задаётся на сервере (SIMPOLEC_PW_MIN) — форма
+        // берёт его оттуда, чтобы подсказка и проверка не разъезжались с ним.
+        if (r.password_min) {
+            S.pwMin = r.password_min;
+            const pw = $('regPass');
+            if (pw) pw.minLength = S.pwMin;
+            const hint = $('pwHint');
+            if (hint) hint.textContent = `Не короче ${S.pwMin} символов.`;
+        }
         sel.innerHTML = r.countries.map(c =>
             `<option value="${c.id}">${esc(c.name)} — ${esc(c.capital)}, ${esc(c.size)}, ${qty(c.population)} чел. (${c.players} игр.)</option>`
         ).join('');
@@ -168,8 +230,8 @@ async function loadCountriesForRegister() {
         // Молчать нельзя: пустой список выглядит как поломка формы,
         // а причина обычно в том, что сервер не поднялся или база старая.
         sel.innerHTML = '<option value="">— не удалось загрузить —</option>';
-        $('authErr').textContent = 'Не удалось получить список государств: '
-            + e.message + '. Проверьте, что сервер запущен.';
+        authErr('register', 'Не удалось получить список государств: '
+            + e.message + '. Проверьте, что сервер запущен.');
     }
 }
 
@@ -181,6 +243,9 @@ async function loadCountriesForRegister() {
 function showAuth() {
     $('game').style.display = 'none';
     $('auth').style.display = '';
+    let tab = 'login';
+    try { tab = localStorage.getItem(AUTH_TAB_KEY) || 'login'; } catch (err) {}
+    authTab(tab);
     loadCountriesForRegister();
 }
 
@@ -260,7 +325,7 @@ async function refresh(full) {
             // при этом остаются дома.
             const rqb = S.buildRegion ? '&region_id=' + S.buildRegion : rq2;
             const [series, macro, regions, industries, people, govBuildings,
-                   mapData, el, exch, diplo, cits, annex] = await Promise.all([
+                   mapData, el, exch, diplo, cits, annex, lawData] = await Promise.all([
                 api('/api/market/history?limit=120' + rq2),
                 api('/api/macro/history?limit=120'),
                 api('/api/regions'), api('/api/industries?x=1' + rqb),
@@ -268,6 +333,7 @@ async function refresh(full) {
                 api('/api/gov/buildings'), api('/api/map'), api('/api/elections'),
                 api('/api/exchange?limit=120'), api('/api/diplomacy'),
                 api('/api/gov/citizens'), api('/api/annexations'),
+                api('/api/laws'),
             ]);
             if (gen !== S.session) return;
             S.series = series.series; S.macro = macro.rows;
@@ -284,11 +350,12 @@ async function refresh(full) {
             S.canManageState = govBuildings.can_manage;
             S.map = mapData.nodes; S.elections = el;
             S.exchange = exch; S.diplo = diplo;
-            S.citizens = cits; S.annex = annex;
+            S.citizens = cits; S.annex = annex; S.laws = lawData;
             if (S.lastTick >= 0 && newTick) toast('Пейдей #' + world.tick + ' завершён');
             S.lastTick = world.tick;
             renderCountry(); renderBuild(); renderTop(); renderGov(); renderPeople();
             renderMap(); renderExchange(); renderWar(); renderAnnexations();
+            renderLaws();
         }
         renderHeader(); renderMarket(); renderBiz();
         if (S.page === 'admin') loadAdmin();
@@ -680,6 +747,55 @@ function consumptionCells(rows) {
     }).join(' ');
 }
 
+/** Цвет колонки грамотности: чем больше выучено, тем зеленее.
+ *  Шкала одна и та же для всех сословий — сравнивать их между собой и есть
+ *  главное, ради чего колонка нужна. */
+function eduCol(v) {
+    return v < .10 ? 'bad' : v < .30 ? 'warn' : v < .60 ? '' : 'good';
+}
+
+/** Карточка «Просвещение»: чему страна учит, кого и во что ей это обходится.
+ *
+ *  Три числа стоят рядом не для красоты. Грамотность — источник рабочих рук,
+ *  обида — то, во что она обращается без прав, ёмкость школ — то, чем лидер
+ *  двигает и первое, и второе. Порознь ни одно из них ничего не значит. */
+function renderEducation(e) {
+    if (!e || !$('eduAvg')) return;
+    $('eduLaw').textContent = e.law;
+    $('eduAvg').textContent = pct(e.average);
+    $('eduAvg').className = 'v num ' + eduCol(e.average);
+    $('eduGriev').textContent = pct(e.grievance);
+    $('eduGriev').className = 'v num '
+        + (e.grievance > .35 ? 'bad' : e.grievance > .15 ? 'warn' : 'good');
+    $('eduCapS').textContent = qty(e.capacity_school);
+    $('eduCapS').className = 'v num ' + (e.capacity_school ? 'good' : 'dim');
+    $('eduCapU').textContent = qty(e.capacity_university);
+    $('eduCapU').className = 'v num ' + (e.capacity_university ? 'good' : 'dim');
+    $('eduRights').textContent = e.rights_law;
+
+    const bits = [];
+    if (!e.school_allowed) {
+        bits.push('<span class="bad">Школы строить нельзя</span> — действующий закон '
+            + 'оставляет грамоту сословной привилегией. Пока он не переменён, '
+            + 'деревню на завод не переманить, сколько бы вы ни платили: годных '
+            + 'к станку в ней всего <b>' + pct(e.worker_floor) + '</b>.');
+    } else {
+        bits.push('Школы учат: <b>' + (e.schools.join(', ') || '—') + '</b>'
+            + (e.school_efficiency < 1
+                ? ' <span class="warn">вполсилы (' + pct(e.school_efficiency) + ')</span>' : '')
+            + '. Университеты: <b>' + (e.universities.join(', ') || '—') + '</b>.');
+    }
+    bits.push('Грамотность тает на <b>' + pct(e.decay) + '</b> за пейдей — место '
+        + 'выучившегося занимает новорождённый. Школы приходится содержать, а не '
+        + 'построить однажды.');
+    if (e.grievance > .2) {
+        bits.push('<span class="bad">Страна осознаёт своё бесправие.</span> Дайте ей '
+            + 'голос и права раньше, чем она потребует их сама, — на вкладке «Законы» '
+            + 'видно, насколько близко до революции.');
+    }
+    $('eduNote').innerHTML = bits.join(' ');
+}
+
 function renderPeople() {
     const p = S.people;
     if (!p) return;
@@ -700,6 +816,7 @@ function renderPeople() {
     const solCol = v => v < .75 ? 'bad' : v < 1.0 ? 'warn' : v < 1.25 ? 'good' : 'gold';
     $('pSol').textContent = (p.living_standard || 0).toFixed(2);
     $('pSol').className = 'v num ' + solCol(p.living_standard || 0);
+    renderEducation(p.education);
 
     $('strataRows').innerHTML = p.strata.map(s => `<tr>
         <td>${esc(s.name)}${s.can_hire
@@ -715,6 +832,12 @@ function renderPeople() {
             s.living_standard.toFixed(2)}</td>
         <td class="right dim" title="Уровень жизни, который сословие считает для себя нормой">${
             s.expectation.toFixed(2)}</td>
+        <td class="right ${eduCol(s.education)}" title="${s.worker_pool != null
+            ? 'Годны на завод: ' + pct(s.worker_pool) + ' сословия'
+            : 'Доля грамотных'}">${pct(s.education)}</td>
+        <td class="right ${s.grievance > .35 ? 'bad' : s.grievance > .15 ? 'warn' : 'dim'}"
+            title="Грамотность, помноженная на бесправие. Из этого и растёт революция">${
+            pct(s.grievance)}</td>
         <td class="right ${s.satisfaction < .4 ? 'bad' : s.satisfaction < .55 ? 'warn' : 'good'}">${pct(s.satisfaction)}</td>
         <td class="right dim">${money(s.savings)} ₡</td>
     </tr>`).join('');
@@ -1162,10 +1285,23 @@ function renderBuild() {
         const here = i.state_here || i.mine;
         const capped = i.max_level && i.levels_here >= i.max_level;
         const next = here ? here.upgrade_cost : i.build_cost;
+        // Учебное заведение показывается по ДЕЙСТВУЮЩЕМУ ЗАКОНУ, а не по
+        // чертежу: одно и то же здание при разных законах учит разных людей и с
+        // разной скоростью, и видеть это надо до постройки, а не после.
+        const edu = i.education_kind ? `<br><span class="tag ${
+            i.education_blocked ? 'luxury' : ''}" title="${
+            i.education_blocked
+                ? 'Действующий закон об образовании не позволяет строить школы'
+                : 'Учит: ' + (i.education_strata.join(', ') || 'никого')}">${
+            i.education_blocked ? 'запрещено законом'
+                : '+' + qty(i.education * i.education_efficiency) + ' учеников/ур.'
+            }</span>` : '';
         return `<tr>
         <td>${esc(i.name)}${i.max_level
-            ? ` <span class="tag ${capped ? 'luxury' : ''}">${i.levels_here} / ${i.max_level} ур.</span>` : ''}</td>
-        <td class="dim" style="font-size:13px;max-width:320px">${esc(i.description)}</td>
+            ? ` <span class="tag ${capped ? 'luxury' : ''}">${i.levels_here} / ${i.max_level} ур.</span>` : ''}${edu}</td>
+        <td class="dim" style="font-size:13px;max-width:320px">${esc(i.description)}${
+            i.education_kind && !i.education_blocked
+                ? `<br><b>Учит:</b> ${esc(i.education_strata.join(', ') || 'никого')}` : ''}</td>
         <td class="dim" style="font-size:13px">${i.upkeep_goods.map(x =>
             `${esc(x.name)} ×${x.qty}`).join(', ') || '—'}</td>
         <td class="right">${qty(i.jobs_per_level)}</td>
@@ -1173,7 +1309,9 @@ function renderBuild() {
         <td class="right ${next > 1e7 ? 'warn' : ''}">${money(next)} ₡</td>
         <td class="right">${capped
             ? '<span class="dim">развита до предела</span>'
-            : `<button class="sm ${S.me.is_governor ? 'primary' : ''}"
+            : i.education_blocked
+                ? '<span class="dim">запрещено законом об образовании</span>'
+                : `<button class="sm ${S.me.is_governor ? 'primary' : ''}"
             ${S.me.is_governor ? '' : 'disabled title="Нужны полномочия гос.деятеля"'}
             onclick="${here ? `upgrade(${here.id})` : `buildBiz('${i.key}', true)`}">${
                 here ? 'Поднять уровень' : 'Построить казной'}</button>`}</td>
@@ -1219,6 +1357,31 @@ function renderCountry() {
           + ' человек. Потом окно закроется, и страна будет расти только рождаемостью'
         : 'Страны растут только рождаемостью: новые игроки приходят на готовый рынок';
     $('cPlayersN').textContent = c.players != null ? c.players : '—';
+
+    // ---- форма государства и временные напасти ----
+    // Четыре действующих закона одной строкой: по ним читается вся рамка, в
+    // которой живёт страна, — и видно, что именно стоит менять.
+    $('cLaws').innerHTML = (c.laws || []).map(l =>
+        `<span class="step" title="${esc(l.name)}"><b>${esc(l.option_name)}</b></span>`
+    ).join('') + (c.has_parliament
+        ? `<span class="step">парламент — <b>${c.parliament_seats}</b> мест</span>`
+        : '<span class="step">парламента нет</span>');
+
+    // Модификаторы — то, что действует прямо сейчас и скоро пройдёт. Место им
+    // внизу карточки страны: иначе о «нечестном голосовании» узнаёшь только по
+    // упавшему довольству, не понимая причины.
+    const mods = [];
+    if (c.unfair_voting) mods.push(['Нечестное голосование',
+        'Выборы куплены слишком заметно: довольство всех сословий срезано ещё '
+        + c.unfair_left + ' пейдей(-ев)', 'bad']);
+    if (c.closed_economy) mods.push(['Закрытая экономика',
+        'Страна не торгует с заграницей: ни вывоза, ни ввоза', 'warn']);
+    const army = c.army || {};
+    if (army.mobilization_left) mods.push(['Мобилизация',
+        'Людей забирают приказом: довольство падает во всей стране ещё '
+        + army.mobilization_left + ' пейдей(-ев)', 'bad']);
+    $('cModifiers').innerHTML = mods.map(([name, note, tone]) =>
+        `<span class="step ${tone}" title="${esc(note)}">${esc(name)}</span>`).join('');
 
     // области своей страны: у каждой свой рынок, своё довольство и своё
     // озлобление — сравнивать их между собой и есть смысл этой таблицы
@@ -1304,9 +1467,11 @@ function renderGov() {
     $('gTariff').value = Math.round((c.tariff || 0) * 100);
     $('gImport').value = Math.round((c.import_tariff || 0) * 100);
     $('gMin').value = Math.round(c.min_wage);
+    $('gInsure').value = Math.round((c.worker_insurance || 0) * 100);
     $('gBank').value = Math.round(c.bankruptcy_limit);
     const cb = $('gForeign');
     if (cb) cb.checked = !!c.foreign_investment_open;
+    applyPolicyLimits(c);
     renderLevers();
     const can = S.me.is_governor && c.leader_is_ai === false && c.id === S.me.country_id;
     $('govSave').disabled = !can;
@@ -1324,6 +1489,12 @@ function renderGov() {
               + 'чтобы стать лидером.'
             : 'Лидер государства — «' + (c.leader || 'другой игрок') + '». Здесь видно, '
               + 'по каким правилам живёт страна.');
+    // Ползунок, упёршийся в предел, — это не поломка, а закон: границы задают
+    // идеология и торговая система. Говорим об этом прямо под полями.
+    $('govNote').innerHTML += ' <span class="dim">Пределы самих ставок задают '
+        + '<b>законы государства</b> ('
+        + (c.laws || []).map(l => esc(l.option_name)).join(', ')
+        + ') — их меняют во вкладке «Законы».</span>';
 }
 
 /** Рычаги экономического курса — ОДИН список на всё.
@@ -1381,6 +1552,11 @@ const POLICY_LEVERS = [
     ['gMin', 'МРОТ', 'предприятия',
      'Нижняя граница зарплаты: меньше неё цех не платит, что бы ни стояло в его '
      + 'карточке. Поднимает доход рабочих — и первыми закрывает убыточные цеха.'],
+    ['gInsure', 'Страховка работников', 'предприятия — работникам',
+     'Доля фонда оплаты труда, которую хозяин платит СВЕРХ зарплаты прямо в карман '
+     + 'работающему сословию. В казну не идёт ни червонца. Платится и за простой — '
+     + 'в том и смысл страховки, — поэтому тяжелее всего она цеху, стоящему без '
+     + 'сырья. Ниже положенного законом о правах рабочих ставку не опустить.'],
     ['gBank', 'Порог банкротства', 'предприятия',
      'До какого минуса делу позволено работать в долг. Пробило порог — все цеха '
      + 'встают под замок и сами уже не откроются: решать будет государство.'],
@@ -1388,6 +1564,43 @@ const POLICY_LEVERS = [
      'Пускать ли чужих промышленников строиться в вашей стране. Их заводы платят '
      + 'здешние налоги и нанимают здешних людей, но прибыль уходит хозяину.'],
 ];
+
+/** Какое поле курса каким рычагом является и в каких единицах живёт.
+ *  [id поля, имя поля на сервере, множитель к значению сервера] */
+const POLICY_FIELDS = [
+    ['gCorp', 'corporate_tax', 100], ['gSales', 'sales_tax', 100],
+    ['gInc', 'income_tax', 100], ['gPoll', 'poll_tax', 1],
+    ['gTithe', 'tithe', 100], ['gWealth', 'wealth_tax', 100],
+    ['gExcise', 'excise_tax', 100], ['gSpend', 'public_spending_rate', 100],
+    ['gRent', 'land_rent', 100], ['gTariff', 'tariff', 100],
+    ['gImport', 'import_tariff', 100], ['gMin', 'min_wage', 1],
+    ['gInsure', 'worker_insurance', 100],
+    ['gBank', 'bankruptcy_limit', 1],
+];
+
+/** Подтянуть границы ползунков под действующие ЗАКОНЫ.
+ *
+ *  Идеология и торговая система сужают то, что лидеру вообще позволено:
+ *  открытая экономика запирает пошлины на десяти процентах, либерализм не даёт
+ *  обложить прибыль, консерватизм — отменить подати. Витрина обязана
+ *  показывать тот же предел, о который ударится сохранение, иначе игрок вводит
+ *  число и получает непонятную ошибку. Поле, упёршееся в закон, подсвечивается:
+ *  это и есть повод закон переменить. */
+function applyPolicyLimits(c) {
+    const lim = c.policy_limits || {};
+    for (const [id, field, mult] of POLICY_FIELDS) {
+        const input = $(id);
+        const range = lim[field];
+        if (!input || !range) continue;
+        const lo = range[0] * mult, hi = range[1] * mult;
+        input.min = lo;
+        input.max = hi;
+        const at = Number(input.value) <= lo + 1e-9 && lo > 0
+                || Number(input.value) >= hi - 1e-9;
+        input.style.borderColor = at ? 'var(--gold)' : '';
+        input.title = `По действующим законам: от ${lo.toFixed(2)} до ${hi.toFixed(2)}`;
+    }
+}
 
 function renderLevers() {
     const rows = $('leverRows');
@@ -1650,12 +1863,461 @@ const savePolicy = () => act(async () => {
         tariff: Number($('gTariff').value) / 100,
         import_tariff: Number($('gImport').value) / 100,
         min_wage: Number($('gMin').value),
+        worker_insurance: Number($('gInsure').value) / 100,
         bankruptcy_limit: Math.min(0, Number($('gBank').value)),
     };
     const cb = $('gForeign');
     if (cb) body.foreign_investment_open = !!cb.checked;
     await api('/api/gov/policy', body);
     toast('Курс утверждён');
+});
+
+/* ====================================================================== */
+/* ЗАКОНЫ, ПАРЛАМЕНТ И ЛОББИРОВАНИЕ                                       */
+/* ====================================================================== */
+
+/** Полукруглая диаграмма мест — та самая, по которой парламент и узнают.
+ *
+ *  Одно кресло — один кружок. Кресла раскладываются рядами по дуге: во внешнем
+ *  ряду их больше, во внутреннем меньше, ровно пропорционально длине дуги, —
+ *  иначе внутренние ряды выглядели бы разреженными. Затем все места
+ *  сортируются по углу (слева направо) и раздаются фракциям подряд, поэтому
+ *  соседние сектора идут одним цветом, а не вперемешку.
+ */
+function hemicycle(parties, total) {
+    if (!total) return '';
+    const rows = Math.max(3, Math.min(10, Math.round(Math.sqrt(total / 2.6))));
+    const rr = [];
+    for (let i = 0; i < rows; i++) rr.push(0.45 + 0.55 * (rows === 1 ? 1 : i / (rows - 1)));
+    const sum = rr.reduce((a, b) => a + b, 0);
+    const counts = rr.map(r => Math.max(1, Math.round(total * r / sum)));
+    // Округление по рядам почти никогда не даёт ровно total — правим хвостом.
+    // Счётчик оборотов не украшение: при diff < 0 и рядах по одному креслу
+    // убавлять было бы нечего, и цикл крутился бы вечно.
+    let diff = total - counts.reduce((a, b) => a + b, 0);
+    for (let i = counts.length - 1, guard = 4 * total; diff !== 0 && guard > 0;
+         i = (i - 1 + counts.length) % counts.length, guard--) {
+        if (diff > 0) { counts[i]++; diff--; }
+        else if (counts[i] > 1) { counts[i]--; diff++; }
+    }
+    const seats = [];
+    counts.forEach((n, row) => {
+        for (let i = 0; i < n; i++) {
+            // Одиночное кресло в ряду ставим ровно посередине дуги.
+            const t = n === 1 ? 0.5 : i / (n - 1);
+            seats.push({ a: Math.PI * (1 - t), r: rr[row] });
+        }
+    });
+    seats.sort((x, y) => y.a - x.a || x.r - y.r);
+
+    const W = 620, R = 285, cx = W / 2, cy = R + 18;
+    const dot = Math.max(3, Math.min(9, 300 / total * 1.6 + 3));
+    let idx = 0, out = '';
+    for (const p of parties) {
+        for (let k = 0; k < p.seats && idx < seats.length; k++, idx++) {
+            const s = seats[idx];
+            const x = cx + Math.cos(s.a) * R * s.r;
+            const y = cy - Math.sin(s.a) * R * s.r;
+            out += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${dot.toFixed(1)}"
+                    fill="${p.color}"><title>${esc(p.name)}</title></circle>`;
+        }
+    }
+    // Места, не доставшиеся никому (округление), рисуем серым — их почти нет.
+    for (; idx < seats.length; idx++) {
+        const s = seats[idx];
+        out += `<circle cx="${(cx + Math.cos(s.a) * R * s.r).toFixed(1)}"
+                cy="${(cy - Math.sin(s.a) * R * s.r).toFixed(1)}"
+                r="${dot.toFixed(1)}" fill="#2b3340"/>`;
+    }
+    return `<svg viewBox="0 0 ${W} ${cy + 14}">${out}</svg>`;
+}
+
+/** Одна плашка категории законов: что действует и на что можно переменить. */
+function lawCard(cat, d) {
+    const vote = d.vote;
+    const busy = !!vote;
+    const opts = cat.options.map(o => {
+        const cls = o.current ? 'law-opt on' : (o.blocked ? 'law-opt off' : 'law-opt');
+        const eff = (o.effects || []).map(e => `<li>${esc(e)}</li>`).join('');
+        let acts = '';
+        if (o.current) {
+            acts = '<span class="dim" style="font-size:12px">Действует сейчас</span>';
+        } else if (o.blocked) {
+            acts = `<span class="dim" style="font-size:12px">${esc(o.blocked)}</span>`;
+        } else {
+            const btns = [];
+            if (d.is_leader && !d.cooldown_left && (d.decree || !busy)) {
+                btns.push(`<button class="sm primary"
+                    onclick="proposeLaw('${cat.key}','${o.key}')">${
+                    d.decree ? 'Ввести указом' : 'Вынести на голосование'}</button>`);
+            }
+            if (!d.decree && d.can_lobby && !busy && !d.cooldown_left
+                && o.finance_cost != null) {
+                btns.push(`<button class="sm"
+                    onclick="financeLaw('${cat.key}','${o.key}',${o.finance_cost})"
+                    title="Оплатить рассмотрение закона мимо лидера">
+                    Профинансировать — ${money(o.finance_cost)} ₡</button>`);
+            }
+            acts = btns.join(' ') || '<span class="dim" style="font-size:12px">'
+                + (busy ? 'Палата занята другим законом'
+                        : (d.cooldown_left ? 'Закон недавно менялся' : '—')) + '</span>';
+        }
+        // Поддержка палаты показывается только там, где палата есть.
+        const sup = (!d.decree && d.parliament.parties.length && !o.current)
+            ? `<span class="sup" title="Ожидаемая доля палаты «за»">палата ${pct(o.support)}</span>`
+            : '';
+        return `<div class="${cls}">
+            <div class="top"><b>${esc(o.name)}</b>${sup}</div>
+            <div class="note" style="margin:5px 0 0">${esc(o.note)}</div>
+            <ul class="eff">${eff}</ul>
+            <div class="acts">${acts}</div>
+        </div>`;
+    }).join('');
+    return `<div class="law">
+        <span class="cat">${esc(cat.name)}</span>
+        <h3>${esc(cat.current_name)}</h3>
+        <div class="note">${esc(cat.note)}</div>
+        ${opts}
+    </div>`;
+}
+
+function renderLaws() {
+    const d = S.laws;
+    if (!d || !$('lawCards')) return;
+    $('lawCountry').textContent = d.country_name;
+
+    const bits = [];
+    if (d.decree) {
+        bits.push('В стране <b>авторитаризм</b>: парламента нет, лидер меняет любой '
+            + 'закон указом — в тот же пейдей и ни у кого не спрашивая. '
+            + 'Чтобы появились выборы и палата, лидеру надо самому отдать власть, '
+            + 'переменив избирательную систему.');
+    } else {
+        bits.push('Законы принимает <b>парламент</b>. Лидер ставит вопрос, депутаты '
+            + 'голосуют по программам своих партий, а промышленники двигают их '
+            + 'деньгами — и могут вынести закон на голосование сами, оплатив '
+            + 'рассмотрение. Палата ходит и сама: раз в 12 часов она выносит '
+            + 'закон, за который в ней уже есть твёрдое большинство, — сорвать '
+            + 'такой можно только чужим кошельком.');
+    }
+    if (!d.is_leader) {
+        bits.push(d.leader
+            ? `Лидер государства — <b>${esc(d.leader)}</b>.`
+            : 'Государством управляет AI.');
+    }
+    if (d.cooldown_left) {
+        bits.push('Страна только что переменила закон: следующий можно вынести через '
+            + `<b>${d.cooldown_left}</b> пейдей(-ев).`);
+    }
+    if (d.unfair.active) {
+        bits.push('<span class="bad">Нечестное голосование</span> — по стране ходит '
+            + 'слух о купленных выборах. Довольство всех сословий срезано на '
+            + `<b>${pct(d.unfair.penalty)}</b> ещё <b>${d.unfair.left}</b> пейдей(-ев).`);
+    }
+    $('lawNote').innerHTML = bits.join(' ');
+    $('lawCards').innerHTML = d.laws.map(cat => lawCard(cat, d)).join('');
+
+    renderRevolution();
+    renderLawVote();
+    renderParliament();
+    renderLobbyParties();
+}
+
+/** Панель революции: требования, срок ответа и ход гражданской войны.
+ *
+ *  Карточка исчезает целиком, когда восстания нет, — но полоса ЖАРА остаётся
+ *  видна и в спокойное время: по ней лидер и понимает, что страна подходит к
+ *  черте. Это единственное предупреждение, которое он получит; самой революции
+ *  предшествовать не будет ничего.
+ */
+function renderRevolution() {
+    const box = $('revolutionBox');
+    if (!box) return;
+    const d = S.laws;
+    if (!d) { box.innerHTML = ''; return; }
+    const r = d.revolution;
+
+    // Спокойное время: одна полоса жара, и только если он уже копится.
+    if (!r || r.phase === 'none' || (r.phase === 'done' && !r.outcome)) {
+        const heat = d.revolution_heat || 0;
+        box.innerHTML = heat < 0.05 ? '' : `<div class="card">
+            <div class="row" style="justify-content:space-between;align-items:center">
+                <b>Недовольство копится</b>
+                <span class="${heat > .7 ? 'bad' : heat > .4 ? 'warn' : 'dim'}">${
+                    pct(Math.min(1, heat))} до революции</span>
+            </div>
+            <div class="bar" style="margin:8px 0"><i style="width:${
+                Math.min(100, heat * 100).toFixed(0)}%;background:${
+                heat > .7 ? 'var(--bad)' : 'var(--warn)'}"></i></div>
+            <p class="muted" style="font-size:13px;margin:0">
+                Грамотность страны — <b>${pct(d.education || 0)}</b>, обида на
+                бесправие — <b>${pct(d.grievance || 0)}</b>. Пока обида держится,
+                жар растёт; дойдёт до края — сословия выйдут с требованиями.
+                Утолить их законами сейчас дешевле, чем отвечать на них потом.
+            </p></div>`;
+        return;
+    }
+
+    // Отгремевшая революция: короткий итог, чтобы страна успела его увидеть.
+    if (r.phase === 'done') {
+        const tone = r.outcome === 'crushed' ? 'warn' : 'good';
+        const text = r.outcome === 'accepted'
+            ? 'Требования восставших приняты — законы переменены без крови.'
+            : r.outcome === 'won'
+                ? `Революция победила после ${r.battles} пейдеев боёв: законы
+                   переписаны силой. Потери — ${qty(r.rebel_losses)} восставших и
+                   ${qty(r.gov_losses)} солдат.`
+                : `Революция подавлена за ${r.battles} пейдеев. Потери —
+                   ${qty(r.rebel_losses)} восставших и ${qty(r.gov_losses)} солдат.
+                   Законы остались прежними, но это затишье, а не мир.`;
+        box.innerHTML = `<div class="card"><b class="${tone}">Итог восстания</b>
+            <p class="muted" style="font-size:13px;margin:6px 0 0">${text}</p></div>`;
+        return;
+    }
+
+    const war = r.phase === 'war';
+    const demands = r.demands.map(x => `<div class="law-opt">
+        <div class="top"><b>${esc(x.option_name)}</b>
+            <span class="sup">${esc(x.law_name)}</span></div>
+        <div class="note" style="margin:5px 0 0">${esc(x.note)}</div>
+        <ul class="eff">${(x.effects || []).map(e => `<li>${esc(e)}</li>`).join('')}</ul>
+    </div>`).join('');
+
+    // Перевес показывается всегда одинаково: слева государство, справа
+    // восставшие. Ноль посередине — ничья, край — конец войны.
+    const m = Math.max(-1, Math.min(1, r.momentum || 0));
+    const acts = d.is_leader && !war
+        ? `<button class="sm primary" onclick="answerRevolution('accept')">
+               Принять требования</button>
+           <button class="sm danger" onclick="answerRevolution('reject')">
+               Отказать — и в бой</button>`
+        : d.is_leader
+            ? `<button class="sm primary" onclick="answerRevolution('accept')">
+                   Пойти на условия восставших</button>`
+            : '<span class="dim" style="font-size:12px">Отвечать восставшим — дело лидера</span>';
+
+    box.innerHTML = `<div class="card">
+        <div class="row" style="justify-content:space-between;align-items:center">
+            <b class="bad">${war ? 'ГРАЖДАНСКАЯ ВОЙНА' : 'РЕВОЛЮЦИЯ'}</b>
+            ${war ? `<span class="dim">бой ${r.battles}-й пейдей</span>`
+                  : `<span class="warn">ответить: ${r.ticks_left} пейдей(-ев)</span>`}
+        </div>
+        <p class="muted" style="font-size:13px;margin:8px 0">
+            Восстали <b>${r.strata.map(esc).join(', ')}</b>. Под знамёнами
+            <b>${qty(r.rebels)}</b> человек${r.defected > 0
+                ? `, из них <b class="bad">${qty(r.defected)}</b> — перешедшие
+                   солдаты со своим оружием` : ''}.
+            У государства — <b>${qty(r.army)}</b> солдат.
+            ${war ? `Потери: ${qty(r.rebel_losses)} у восставших,
+                     ${qty(r.gov_losses)} у казны.`
+                  : 'Пока идёт срок ответа, к восставшим подходят новые люди.'}
+        </p>
+        ${war ? `<div class="bar" style="margin:8px 0" title="Перевес: слева государство, справа восставшие">
+            <i style="width:${((m + 1) / 2 * 100).toFixed(0)}%;background:${
+                m > 0 ? 'var(--bad)' : 'var(--good)'}"></i></div>` : ''}
+        <div class="grid cards">${demands}</div>
+        <div class="acts" style="margin-top:10px">${acts}</div>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">
+            ${war
+                ? 'Договориться никогда не поздно — просто теперь это обойдётся уже '
+                  + 'вместе с сожжённой столицей и разбежавшейся армией.'
+                : 'Молчание — тоже ответ: по истечении срока начнётся гражданская '
+                  + 'война сама собой. Пока она идёт, вся страна работает вполсилы, '
+                  + 'а границы стоят оголёнными.'}
+        </p></div>`;
+}
+
+const answerRevolution = (kind) => act(async () => {
+    const r = await api('/api/revolution/' + kind, {});
+    toast((r.news && r.news[0]) || 'Ответ дан');
+});
+
+function renderLawVote() {
+    const box = $('lawVote');
+    if (!box) return;
+    const d = S.laws;
+    const v = d && d.vote;
+    if (!v) {
+        box.innerHTML = '<div class="dim" style="font-size:13px">'
+            + (d && d.decree
+                ? 'При авторитаризме голосований не бывает: закон вступает в силу '
+                  + 'указом лидера сразу.'
+                : 'Палата сейчас ничего не рассматривает. Вопрос ставит лидер — '
+                  + 'или любой промышленник, оплативший рассмотрение.') + '</div>';
+        return;
+    }
+    const total = v.total || 1;
+    const yes = Math.max(0, Math.min(total, v.for));
+    const w1 = (yes / total * 100).toFixed(1), w2 = (100 - yes / total * 100).toFixed(1);
+    const me = d.lobby;
+    box.innerHTML = `
+        <div style="font-size:13px;margin-bottom:6px">
+            <span class="tag" style="border-color:var(--accent);color:var(--accent)">
+                ${esc(v.law_name)}</span>
+            <b>${esc(v.option_name)}</b> — вынес ${esc(v.proposer)}${
+                v.financed ? ' (оплаченное рассмотрение)' : ''}.
+            Осталось <b>${v.ticks_left}</b> пейдей(-ев).
+        </div>
+        <div class="note" style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
+            ${esc(v.note)}</div>
+        <div class="tally">
+            <i class="yes" style="width:${w1}%">${yes.toFixed(0)} за</i>
+            <i class="no" style="width:${w2}%">${(total - yes).toFixed(0)} против</i>
+        </div>
+        <!-- Числа дублируются под полосой: когда одна сторона набрала пять
+             процентов, подпись внутри неё не помещается ни при каком кегле,
+             а на телефоне так бывает чаще всего. -->
+        <div style="font-size:12.5px;margin-bottom:6px">
+            <b class="good">${yes.toFixed(0)}</b> за ·
+            <b class="bad">${(total - yes).toFixed(0)}</b> против ·
+            для принятия нужно <b>${Math.floor(total / 2) + 1}</b>
+        </div>
+        <div class="muted" style="font-size:12px">
+            Своих голосов у палаты: ${v.seats_for.toFixed(0)} за,
+            ${v.seats_against.toFixed(0)} против. Деньгами перекуплено
+            <b>${v.swing >= 0 ? '+' : ''}${v.swing.toFixed(0)}</b> мест
+            (за — ${money(v.money_for)} ₡, против — ${money(v.money_against)} ₡).
+            Один голос стоит ${money(me.seat_price)} ₡, до урны доходит
+            ${pct(me.power)} купленного.
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:4px">
+            Вами вложено: за — ${money(v.my_for)} ₡, против — ${money(v.my_against)} ₡.
+            ${v.passing ? '<b class="good">Сейчас проходит.</b>'
+                        : '<b class="bad">Сейчас не проходит.</b>'}
+        </div>
+        ${d.can_lobby ? `<div class="acts" style="margin-top:12px">
+            <label class="wagefield"><span>₡</span>
+                <input type="number" id="lawBid" min="0" step="100000"
+                       value="${Math.round(me.min_stake)}"></label>
+            <button class="primary" onclick="lobbyLaw('for')">Вложить ЗА</button>
+            <button class="danger" onclick="lobbyLaw('against')">Вложить ПРОТИВ</button>
+            <span class="muted" style="font-size:12px">Минимум
+                ${money(me.min_stake)} ₡. Считается разница вложений сторон.</span>
+        </div>` : ''}`;
+}
+
+function renderParliament() {
+    const d = S.laws;
+    if (!d || !$('pSeats')) return;
+    const p = d.parliament;
+    // Назначенный размер палаты показываем стрелкой: он вступит в силу только
+    // на следующих выборах, а живёт страна пока по прежнему числу кресел.
+    $('pSeats').textContent = !p.elections ? '—'
+        : (p.seats_next !== p.seats ? `${p.seats} → ${p.seats_next}` : p.seats);
+    $('pCost').textContent = money(p.cost) + ' ₡';
+    $('pElected').textContent = p.elected_tick >= 0 ? '#' + p.elected_tick : '—';
+    $('pNext').textContent = p.elections
+        ? (p.elected_tick >= 0 ? p.next_election + ' пейд.' : 'ближайший пейдей') : '—';
+    $('pDiff').textContent = '×' + d.lobby.difficulty.toFixed(2);
+    $('pSeatPrice').textContent = money(d.lobby.seat_price) + ' ₡';
+
+    const hemi = $('pHemi');
+    if (!p.elections) {
+        hemi.innerHTML = '<div class="empty">Парламента нет: в стране авторитаризм. '
+            + 'Палата соберётся, как только лидер введёт выборы.</div>';
+        $('partyRows').innerHTML = '';
+    } else if (!p.parties.length) {
+        hemi.innerHTML = '<div class="empty">Созыв ещё не собран — выборы пройдут '
+            + 'ближайшим пейдеем.</div>';
+        $('partyRows').innerHTML = '';
+    } else {
+        hemi.innerHTML = hemicycle(p.parties, p.seats)
+            + `<div class="cap">${p.seats} мест. Большинство — ${
+                Math.floor(p.seats / 2) + 1}.</div>`;
+        $('partyRows').innerHTML = p.parties.map(pt => `<tr>
+            <td><span class="dot-c" style="background:${pt.color}"></span>${esc(pt.name)}</td>
+            <td class="right num">${pt.seats}</td>
+            <td class="right dim">${pct(pt.share)}</td>
+            <td class="right ${pt.bought > 0 ? 'warn' : 'dim'}">${
+                pt.bought > 0 ? pt.bought.toFixed(0) : '—'}</td>
+            <td class="dim" style="font-size:12px">${
+                pt.platform.map(x => `${esc(x.option_name)}`).join(', ') || 'без программы'}</td>
+        </tr>`).join('');
+    }
+
+    const box = $('pSeatsBox');
+    box.style.display = d.is_leader ? '' : 'none';
+    if (d.is_leader && document.activeElement !== $('pSeatsInput')) {
+        $('pSeatsInput').value = p.seats_next;
+        $('pSeatsInput').min = p.seats_min;
+        $('pSeatsInput').max = p.seats_max;
+    }
+    $('pSeatsNote').textContent = p.seats_next !== p.seats
+        ? `Назначено ${p.seats_next} — палата соберётся такой на следующих выборах.`
+        : 'Со следующего созыва.';
+}
+
+function renderLobbyParties() {
+    const box = $('lobbyParties');
+    if (!box) return;
+    const d = S.laws;
+    if (!d.parliament.elections) {
+        box.innerHTML = '<div class="dim" style="font-size:13px">В стране нет выборов: '
+            + 'партий не существует и вкладываться не во что.</div>';
+        return;
+    }
+    if (!d.can_lobby) {
+        box.innerHTML = '<div class="dim" style="font-size:13px">Вкладываться в '
+            + 'здешнюю политику могут её граждане и те, у кого в стране стоят '
+            + 'предприятия.</div>';
+        return;
+    }
+    const seated = {};
+    for (const p of d.parliament.parties) seated[p.key] = p.seats;
+    box.innerHTML = `<div class="muted" style="font-size:12.5px;margin-bottom:10px">
+        Минимальная ставка — <b>${money(d.lobby.min_stake)} ₡</b>, один голос стоит
+        <b>${money(d.lobby.seat_price)} ₡</b>, до урны доходит
+        <b>${pct(d.lobby.power)}</b> купленного (сложность лоббирования
+        ×${d.lobby.difficulty.toFixed(2)}). У вас ${money(d.cash)} ₡.
+    </div>` + d.archetypes.map(a => `<div class="party">
+        <h4><span class="dot-c" style="background:${a.color}"></span>${esc(a.name)}
+            <span class="dim" style="font-weight:400;font-size:12px">${
+                seated[a.key] ? seated[a.key] + ' мест в палате' : 'в палате нет'}</span></h4>
+        <!-- Каждая позиция — своим элементом: на телефоне названия категорий
+             («идеология —», «торговая система —») прячутся, и программа
+             ужимается с четырёх строк до одной. Что это за законы, там и так
+             видно по самим названиям. -->
+        <div class="pf">Стоит за: ${a.platform.map(x =>
+            `<span class="pf-i"><i>${esc(x.law_name.toLowerCase())}</i><b>${
+                esc(x.option_name)}</b></span>`).join('')}</div>
+        <div class="acts">
+            <label class="wagefield"><span>₡</span>
+                <input type="number" id="bid_${a.key}" min="0" step="100000"
+                       value="${Math.round(d.lobby.min_stake)}"></label>
+            <button class="sm primary" onclick="lobbyParty('${a.key}')">Вложить</button>
+            ${a.pledged ? `<span class="muted" style="font-size:12px">Уже вложено всеми:
+                ${money(a.pledged)} ₡${a.my_pledge
+                    ? `, из них вами ${money(a.my_pledge)} ₡` : ''}</span>` : ''}
+        </div>
+    </div>`).join('');
+}
+
+const proposeLaw = (lawKey, optKey) => act(async () => {
+    const r = await api('/api/laws/propose', { law: lawKey, option: optKey });
+    toast(r.applied ? 'Закон введён указом' : 'Закон вынесен на голосование палаты');
+});
+
+const financeLaw = (lawKey, optKey, cost) => act(async () => {
+    if (!confirm('Оплатить рассмотрение закона за ' + money(cost) + ' ₡?')) return;
+    await api('/api/laws/finance', { law: lawKey, option: optKey });
+    toast('Палата примет вопрос к рассмотрению');
+});
+
+const lobbyLaw = side => act(async () => {
+    const amount = Number($('lawBid').value);
+    const r = await api('/api/laws/lobby', { side, amount });
+    toast('Вложено ' + money(amount) + ' ₡ — примерно ' + r.seats + ' голосов');
+});
+
+const lobbyParty = key => act(async () => {
+    const amount = Number($('bid_' + key).value);
+    await api('/api/parliament/lobby', { party: key, amount });
+    toast('Вложено ' + money(amount) + ' ₡ в партию');
+});
+
+const saveSeats = () => act(async () => {
+    await api('/api/parliament/seats', { seats: Number($('pSeatsInput').value) });
+    toast('Размер палаты назначен — со следующего созыва');
 });
 
 /* ------------------- судьба промышленников на занятой земле ------------------- */
@@ -1787,9 +2449,16 @@ function renderWar() {
     // другого не читается. Двадцать тысяч штыков без командиров стоят меньше,
     // чем десять с ними.
     $('aOff').textContent = qty(a.officers || 0) + ' / ' + qty(a.officers_target || 0);
+    // Из кого берут офицеров, решает закон о государственном устройстве:
+    // монархия — дворянский патент, республика открывает его мещанству.
+    // Поэтому сословие берётся с сервера, а не пишется в подписи руками.
+    const pool = a.officer_pool || ['высшее общество'];
+    const poolAll = pool.join('» и «').toLowerCase();
+    const poolTop = (pool[0] || 'высшее общество').toLowerCase();
     $('aOff').title = `Жалованье офицера ${money(a.officer_pay || 0)} ₡. Штат — `
         + `${pct(a.officer_target || .05)} от числа солдат, для полного командования `
-        + `нужно ${pct(a.officer_target_share || .05)}. Нанимают из высшего общества`;
+        + `нужно ${pct(a.officer_target_share || .05)}. Нанимают из сословий `
+        + `«${poolAll}»`;
     $('aOff').className = 'v num ' + ((a.officers || 0) + 1 < (a.officers_target || 0) * .9
         ? 'warn' : 'good');
     // Убыль офицеров и наём стоят рядом: по одному числу не понять, успевает
@@ -1809,7 +2478,7 @@ function renderWar() {
         ? `Столько людей в сословиях «${(a.officer_pool || []).join('», «')}» пойдут `
           + `в офицеры за ${money(a.officer_pay || 0)} ₡. За пейдей сословие отдаёт `
           + `не больше ${pct(a.officer_recruit_share || .03)} своих людей`
-        : 'За такое жалованье патент не берёт никто: высшее общество живёт лучше';
+        : `За такое жалованье патент не берёт никто: ${poolTop} живёт лучше`;
     $('aCmd').textContent = pct(a.command || 0);
     $('aCmd').title = 'Средняя по стране. В бою считается своя на каждом фронте — '
         + 'офицеры, оставленные в тылу, не командуют никем';
@@ -1837,7 +2506,8 @@ function renderWar() {
         + 'но дают <b>качество командования</b> — до +' + pct(a.command_max || 1.5)
         + ' к силе фронта, если их не меньше ' + pct(a.officer_target_share || .05)
         + ' от числа солдат и они назначены именно на этот фронт. Нанимают их '
-        + '<b>из высшего общества</b>, и служить оно идёт только за жалованье выше '
+        + `<b>из сословий «${poolAll}»</b> — так велит закон о государственном `
+        + 'устройстве, — и служить они идут только за жалованье выше '
         + 'своего привычного дохода; на войне офицеры гибнут чаще солдат, а корпус '
         + 'восполняется медленно. Оружие и снаряды казна закупает на ваш рынок '
         + 'на армейские склады. <b>Вооружённость</b> — это запас на складах: он '
@@ -1867,14 +2537,17 @@ function renderWar() {
           + `и <b class="good">${qty(Math.floor(budget / slot * offTarget))}</b> офицеров `
           + `<span class="dim">(место в строю — ${money(slot)} ₡)</span>`
         : '<span class="bad">При нулевом жалованье армии не будет</span>';
-    // Черта, ниже которой высшее общество патента не берёт. Главное число
-    // офицерского найма: по нему видно, кого лидер вообще может нанять.
+    // Черта, ниже которой ПЕРВОЕ сословие в наборе патента не берёт. Главное
+    // число офицерского найма: по нему видно, кого лидер вообще может нанять.
+    // Кто это сословие — зависит от формы государства, поэтому подпись берёт
+    // его имя с сервера, а не называет дворянство по привычке.
     const bar = a.officer_pay_needed || 0;
+    const fallback = pool.length > 1 ? pool[1].toLowerCase() : 'никто';
     $('aOffPayHint').innerHTML = bar > 0
         ? (offPay + 1e-9 >= bar
-            ? `<span class="good">высшее общество идёт служить</span> (нужно от ${money(bar)} ₡)`
-            : `<span class="warn">для высшего общества мало</span> — нужно от ${money(bar)} ₡, `
-              + 'иначе патент возьмёт только средний класс')
+            ? `<span class="good">${poolTop} идёт служить</span> (нужно от ${money(bar)} ₡)`
+            : `<span class="warn">для сословия «${poolTop}» мало</span> — нужно от `
+              + `${money(bar)} ₡, иначе патент возьмёт ${fallback}`)
         : '<span class="dim">нанимать некого</span>';
     $('aOffTargetHint').innerHTML = offTarget + 1e-9 >= (a.officer_target_share || .05)
         ? `<span class="dim">по уставу ${pct(a.officer_target_share || .05)} — командование будет полным</span>`
@@ -2680,9 +3353,8 @@ NAV_MQ.addEventListener('change', () => {
     redrawCharts();
 });
 
-['u', 'p'].forEach(id => $(id).addEventListener('keydown', e => {
-    if (e.key === 'Enter') doAuth('login');
-}));
+// Enter в полях формы отправляет её саму (обе вкладки — <form onsubmit>),
+// поэтому отдельный обработчик клавиши больше не нужен.
 
 let resizeTimer = null;
 window.addEventListener('resize', () => {
@@ -2693,7 +3365,7 @@ window.addEventListener('resize', () => {
 
 // Обработчики висят в разметке на onclick, поэтому кладём их в window явно.
 Object.assign(window, {
-    doAuth, logout, showAuth, pickGood, savePolicy, pickMapNode, pickRegion,
+    doAuth, authTab, logout, showAuth, pickGood, savePolicy, pickMapNode, pickRegion,
     pickBuildRegion,
     voteFor, setWage, setWageAll, setThrottle, upgrade, toggleBiz, demolish,
     buildBiz, repairBiz,

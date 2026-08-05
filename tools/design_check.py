@@ -59,8 +59,12 @@ def main() -> None:
     supply: dict[str, float] = {}
     maker: dict[str, str] = {}
 
-    for good, per_head in config.PEASANT_YIELD.items():
-        supply[good] = supply.get(good, 0.0) + peasants * per_head
+    # Надел считается ПО ДЕЙСТВУЮЩЕМУ ЗЕМЕЛЬНОМУ ЗАКОНУ, а не по чертежу:
+    # крепостное право, с которого мир начинается, оставляет крестьянину четыре
+    # пятых силы, и сводка обязана показывать ту деревню, что есть на самом деле.
+    for good in config.PEASANT_YIELD:
+        supply[good] = (supply.get(good, 0.0)
+                        + peasants * society.peasant_yield(country, good))
         maker[good] = "крестьяне"
     for craft, spec in artisan_crafts.items():
         supply[craft] = supply.get(craft, 0.0) + per_craft * spec["out"]
@@ -144,10 +148,10 @@ def main() -> None:
     # ---------------- крестьянский труд на фермах ----------------
     print("\n--- Ферма: наём крестьян ---")
     farm = world.industries["farm"]
-    alt = society.peasant_alternative(city)
+    alt = society.peasant_alternative(city, country)
     print(f"Своё поле даёт крестьянину {alt:.2f} ₡ за пейдей "
-          f"(зерна {config.PEASANT_YIELD['grain']:.2f} по {price['grain']:.2f} ₡ "
-          f"плюс лес и хлопок)")
+          f"(зерна {society.peasant_yield(country, 'grain'):.2f} "
+          f"по {price['grain']:.2f} ₡ плюс лес и хлопок)")
     print(f"На ферму он выйдет от {alt * config.FARM_WAGE_EDGE:.2f} ₡ "
           f"и выйдет весь от {alt * config.FARM_WAGE_FULL:.2f} ₡")
     upkeep_per_hand = config.UPKEEP_PER_LEVEL / farm.jobs_per_level
@@ -231,6 +235,43 @@ def main() -> None:
                 reached.append(config.STRATA[key]["name"])
         print(f"{world.goods[good].name:<20}{spec['unlock']:>15.2f}"
               f"{', '.join(reached) or 'никто':>28}")
+
+    # ---- просвещение и бумага ------------------------------------------
+    # Два числа, которых не видно ниоткуда больше, а балансировать надо именно
+    # их: сколько уровней школы нужно СТРАНЕ ЭТОГО РАЗМЕРА, чтобы выучить её
+    # заметную долю, и сколько уровней бумажной фабрики прокормят эти школы.
+    #
+    # Равновесие грамотности выводится из того, что она тает: доля образованных
+    # держится там, где выучиваемые за пейдей ровно возмещают убыль поколений,
+    # то есть ёмкость = население × доля × EDU_DECAY.
+    print("\n--- Просвещение: сколько школ нужно стране ---")
+    country_pop = society.country_population(world, country)
+    school = world.industries["school"]
+    uni = world.industries["academy"]
+    paper_mill = world.industries["papermill"]
+    print(f"Население государства: {country_pop:,.0f}; грамотность тает на "
+          f"{config.EDU_DECAY:.1%} за пейдей")
+    print(f"{'доля грамотных':>16}{'учить за пейдей':>18}{'уровней школы':>15}"
+          f"{'уровней университета':>22}")
+    for share in (0.25, 0.50, 0.75, 0.95):
+        need = country_pop * share * config.EDU_DECAY
+        print(f"{share:>15.0%}{need:>18,.0f}"
+              f"{need / school.education:>15.1f}{need / uni.education:>22.1f}")
+    # Бумага. Её покупает одно государство, поэтому «спрос» — это буквально
+    # содержание казённых зданий плюс делопроизводство палаты.
+    print("\n--- Бумага: единственный товар с казённым покупателем ---")
+    seats = config.PARLIAMENT_SEATS_DEFAULT
+    rows = [(world.industries[k].name, world.industries[k].upkeep_goods.get("paper", 0.0))
+            for k in ("school", "academy", "townhall", "trade_chamber", "opera")]
+    rows.append((f"парламент ({seats} мест)",
+                 seats * config.PARLIAMENT_PAPER_PER_SEAT))
+    mill = paper_mill.output_per_worker * paper_mill.jobs_per_level
+    print(f"{'потребитель':<26}{'бумаги за пейдей':>18}{'от уровня фабрики':>20}")
+    for name, qty in rows:
+        print(f"{name:<26}{qty:>18,.0f}{qty / mill:>19.1%}")
+    print(f"{'уровень бумажной фабрики':<26}{mill:>18,.0f}{1.0:>19.0%}")
+    print(f"При «праве образования для всех» расход бумаги удваивается "
+          f"(paper_mult = 2.0).")
 
     print("\n--- Ниши для игрока ---")
     print("В стране никто не производит:",

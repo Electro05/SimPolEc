@@ -19,7 +19,7 @@ from collections import defaultdict
 
 from .. import config
 from ..models import Country, Player, War, World
-from . import society
+from . import politics, society
 from .pricing import next_price, update_anchor
 from .society import EPS, decode_owner, stratum_owner_id
 
@@ -28,6 +28,61 @@ def level_cost(build_cost_mult: float, level: int) -> float:
     """Стоимость постройки/апгрейда до указанного уровня."""
     return (config.BUILD_COST_BASE * build_cost_mult
             * level ** config.BUILD_COST_EXPONENT)
+
+
+def upkeep_needs(country: Country, ind, levels: float) -> dict[str, float]:
+    """Что здание съедает за пейдей на все свои уровни — с поправкой на закон.
+
+    Поправка ровно одна, но важная: БУМАГА. Закон об образовании умножает её
+    расход по всем казённым зданиям разом (politics.paper_mult), потому что
+    учебники нужны не сотне дворянских сыновей, а целой стране. Считать её
+    отдельно от прочего содержания нельзя — иначе дотация казённому сектору
+    разошлась бы с тем, что цех на самом деле покупает, и школы встали бы без
+    бумаги при полной казне.
+    """
+    mult = politics.paper_mult(country)
+    return {g: levels * q * (mult if g == "paper" else 1.0)
+            for g, q in ind.upkeep_goods.items()}
+
+
+def parliament_paper(country: Country) -> float:
+    """Сколько бумаги съедает палата за пейдей.
+
+    Стенограммы, запросы, копии законопроектов — делопроизводство растёт вместе
+    с числом кресел. Там, где палаты нет (авторитаризм), нет и расхода: указ
+    пишется на одном листе.
+
+    Это второй казённый покупатель бумажной фабрики после школ, и покупатель
+    неожиданный: лидер, раздувший парламент ради неподкупности, обнаруживает,
+    что вместе с жалованьем депутатам ему приходится оплачивать ещё и бумагу.
+    """
+    if not politics.has_elections(country):
+        return 0.0
+    return (politics.seats(country) * config.PARLIAMENT_PAPER_PER_SEAT
+            * politics.paper_mult(country))
+
+
+def buy_parliament_paper(world: World, country: Country, city, market) -> float:
+    """Казна закупает бумагу для палаты на рынке одной области.
+
+    Устроено ровно как снабжение армии (society.restock_shells): парламент сам
+    на рынок не ходит, за него платит казна, и покупает она столько, сколько
+    лежит на прилавке и на сколько хватает остатка. Не купила — палата работает
+    на прошлогодних запасах, и никакого отдельного наказания за это нет:
+    бумажный голод бьёт не по закону, а по бумажной фабрике, которой не
+    заплатили.
+    """
+    want = parliament_paper(country)
+    if want <= EPS:
+        return 0.0
+    price = society.lg(city, "paper").price
+    if price > EPS:
+        want = min(want, max(0.0, country.treasury) / price)
+    if want <= EPS:
+        return 0.0
+    got = market.buy("paper", want, price)
+    country.spend("parliament", got * price)
+    return got
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +363,16 @@ def allocate_labor(world: World, country: Country, city_id: int) -> dict[str, fl
     * **крестьяне** — рабочие руки «Фермы». Сословия они не меняют и никуда не
       переселяются, поэтому и безработицы у них не бывает: не взяли на чужое
       поле — вернулся на своё. Зато и нанять их можно только за плату не хуже
-      собственного надела (см. farm_willingness).
+      собственного надела (см. farm_willingness);
+    * **прочие сословия** — служилые места. Школу и университет держит СРЕДНИЙ
+      КЛАСС: учитель и профессор берутся из мещан и разночинцев. Иначе выходил
+      бы замкнутый круг — рабочих не создать без школ, а школ не открыть без
+      рабочих, — и страна навсегда осталась бы неграмотной. Согласия у них не
+      спрашивают: казённая служба со стабильным жалованьем привлекательна сама
+      по себе, а мест этих на порядки меньше самого сословия.
 
-    Оттого и раздаются места двумя отдельными проходами: своя рабочая сила,
-    свой потолок и свои правила согласия у каждого.
+    Оттого и раздаются места отдельными проходами: своя рабочая сила, свой
+    потолок и свои правила согласия у каждого.
     """
     city = world.cities[city_id]
     buildings = world.city_buildings(city_id)
@@ -324,7 +385,11 @@ def allocate_labor(world: World, country: Country, city_id: int) -> dict[str, fl
 
     wages = {b.id: max(b.wage, country.min_wage) for b in active}
     # Разрушенные войной уровни рабочих мест не дают, пока их не починят.
-    caps = {b.id: b.effective_level * world.industries[b.industry_key].jobs_per_level
+    # Мест считается ПО ЗАКОНУ, а не по чертежу отрасли: коммерческое
+    # землевладение скупает землю под товарное хозяйство, и та же самая ферма
+    # вмещает втрое больше рук (politics.industry_jobs).
+    caps = {b.id: b.effective_level
+            * politics.industry_jobs(country, world.industries[b.industry_key])
             * max(0.0, min(1.0, b.throttle)) for b in active}
     by_labour: dict[str, list] = defaultdict(list)
     for b in active:
@@ -341,13 +406,25 @@ def allocate_labor(world: World, country: Country, city_id: int) -> dict[str, fl
     # каждому хозяйству отдельно: щедрый наберёт людей, скупой останется ни с чем.
     farms = by_labour.get("peasants", [])
     if farms:
-        alt = society.peasant_alternative(city)
+        alt = society.peasant_alternative(city, country)
         village = city.s("peasants").people
         willing = {b.id: farm_willingness(wages[b.id], alt) for b in farms}
         farm_caps = {b.id: caps[b.id] * willing[b.id] for b in farms}
         hands = min(village, sum(farm_caps.values()))
         alloc.update(_fill_jobs(farms, farm_caps, wages, hands))
         caps = {**caps, **farm_caps}
+
+    # --- служилые места: школы, университеты и прочее казённое --------------
+    # Всё, что нанимает не рабочих и не крестьян. Правило простое: занять
+    # можно не больше, чем есть людей в сословии, и кто больше платит — тот
+    # нанимает первым. Согласия не спрашиваем: мест этих на порядки меньше
+    # самого сословия, и торговаться ему не за что.
+    for labour, blds in by_labour.items():
+        if labour in ("workers", "peasants"):
+            continue
+        alloc.update(_fill_jobs(blds, caps, wages,
+                                min(city.s(labour).people,
+                                    sum(caps[b.id] for b in blds))))
 
     s = config.LABOR_STICKINESS
     for b in active:
@@ -408,7 +485,12 @@ def step_unrest(world: World) -> list[str]:
         if city.revolt_ticks >= config.CIVIL_WAR_AFTER:
             name = _secede(world, city, country)
             if name:
-                news.append(f"Гражданская война: {city.name} отделяется от "
+                # Именно ОТДЕЛЕНИЕ, а не «гражданская война»: последними двумя
+                # словами теперь называется совсем другое — бой в столице между
+                # государством и восставшими, у которых есть требования
+                # (step_revolutions). Голодный бунт требований не выдвигает и
+                # никаких законов не меняет: он просто уводит область.
+                news.append(f"Отделение: {city.name} выходит из состава "
                             f"{country.name} и провозглашает государство {name}")
     return news
 
@@ -451,6 +533,11 @@ def _secede(world: World, city, country: Country) -> str | None:
         leader_id=None, color="#c1121f",
         soldier_pay=country.soldier_pay,
         bankruptcy_limit=country.bankruptcy_limit,
+        # Отколовшаяся область уносит с собой законы, по которым жила, но не
+        # парламент: старый созыв ей не принадлежит, а новый она соберёт сама,
+        # если выборы у неё вообще есть.
+        laws=dict(country.laws or {}),
+        parliament_seats=country.parliament_seats,
     )
     country.spend("losses", share)
     rebel.collect("spoils", share)
@@ -492,6 +579,408 @@ def _secede(world: World, city, country: Country) -> str | None:
     # и сразу война за независимость — та самая, в которой мира не бывает
     declare_war(world, country.id, new_id, kind="revolt")
     return name
+
+
+# ---------------------------------------------------------------------------
+# Революция и гражданская война
+# ---------------------------------------------------------------------------
+# БУНТ И РЕВОЛЮЦИЯ — РАЗНЫЕ ВЕЩИ, и держатся они на разном топливе.
+#
+# Бунтует ОБЛАСТЬ, и бунтует она от голода: City.unrest копится от низкого
+# довольства, выливается в погромы и, если его не унять, уводит область из
+# страны (step_unrest выше). Требований у бунта нет никаких — есть только
+# отчаяние, и лечится оно хлебом.
+#
+# Восстаёт СТРАНА, и восстаёт она от грамотности. Школы выучили достаточно
+# народу, чтобы он осознал себя сословием и увидел, что законы писаны не про
+# него (society.awareness); неудовлетворённое самосознание копится в
+# Country.revolution_heat, и однажды сословия выходят со СПИСКОМ ТРЕБОВАНИЙ.
+# Хлебом это не лечится вовсе — только законом.
+#
+# Порядок такой:
+#   1. жар дошёл до единицы — вспыхивает революция, требования на столе;
+#   2. у лидера REVOLUTION_ANSWER_TICKS пейдеев на ответ. Принял — законы
+#      вводятся в тот же пейдей, и на этом всё кончается;
+#   3. отказал или промолчал — гражданская война: отдельное сражение в столице,
+#      пейдей за пейдеем;
+#   4. проиграло государство — требования вводятся силой. Победило — революция
+#      подавлена, но довольство восставших сословий падает ещё ниже, и
+#      передышка даётся лишь на REVOLUTION_COOLDOWN пейдеев.
+#
+# Главная опасность для государства — не численность восставших, а АРМИЯ.
+# Солдат идёт к мятежникам не за компанию, а по своему интересу: доля
+# перебежчиков считается из его собственного неудовлетворённого самосознания, и
+# уходит он СО СВОИМ ОРУЖИЕМ. Просвещённое самодержавие с большой, грамотной и
+# бесправной армией — самая уязвимая конструкция в этой игре.
+
+
+def _rebel_strata(world: World, country: Country) -> list[str]:
+    """Кто именно поднимает знамя: сословия, чья обида выше средней по стране.
+
+    Список нужен не для красоты: из него составляются ТРЕБОВАНИЯ (революция
+    крестьян и революция мещан требуют разного) и из него же набираются бойцы.
+    """
+    cities = society.country_cities(world, country)
+    weight: dict[str, float] = {}
+    people: dict[str, float] = {}
+    for city in cities:
+        for key in config.STRATA_ORDER:
+            st = city.s(key)
+            if st.people <= EPS:
+                continue
+            weight[key] = weight.get(key, 0.0) + st.grievance * st.people
+            people[key] = people.get(key, 0.0) + st.people
+    out = [key for key, w in weight.items()
+           if people.get(key, 0.0) > EPS
+           and w / people[key] >= config.REVOLUTION_TRIGGER]
+    # Хоть кто-то восстать обязан: если черту не перешагнул никто, знамя берёт
+    # самый обиженный — иначе революция вспыхнула бы без единого участника.
+    if not out and weight:
+        out = [max(weight, key=lambda k: weight[k] / max(people[k], 1.0))]
+    return sorted(out, key=lambda k: -weight[k] / max(people[k], 1.0))
+
+
+def _muster_rebels(world: World, country: Country, rev) -> None:
+    """Собрать войско восставших: своих людей и чужих перебежчиков.
+
+    Две части, и вторая куда важнее первой:
+
+        ОПОЛЧЕНИЕ — доля восставших сословий, вышедшая с чем попало. Вооружено
+            оно скверно (REVOLUTION_BASE_EQUIP): вилы против винтовки;
+        ПЕРЕБЕЖЧИКИ — солдаты, ушедшие к мятежникам ПО СВОЕМУ ИНТЕРЕСУ. Доля
+            считается из неудовлетворённого самосознания самих солдат, и уходят
+            они с оружием, которое им выдала казна. Именно они и решают исход:
+            обученный вооружённый полк стоит десятка ополченцев.
+
+    Отсюда и единственная настоящая защита от революции, кроме уступок:
+    довольная армия. Держать её сытой и представленной во власти дешевле, чем
+    потом отбивать у неё собственную столицу.
+    """
+    cities = society.country_cities(world, country)
+    levy = 0.0
+    for city in cities:
+        for key in rev.strata:
+            st = city.s(key)
+            if st.people <= EPS or key in ("soldiers", "officers"):
+                continue
+            levy += st.people * config.REVOLUTION_LEVY_SHARE * st.grievance
+    rev.rebels += levy
+    rev.rebel_weapons += levy * config.REVOLUTION_BASE_EQUIP
+
+    # --- перебежчики -------------------------------------------------------
+    soldiers = society.army_size(world, country)
+    if soldiers > EPS:
+        anger = 0.0
+        for city in cities:
+            st = city.s("soldiers")
+            if st.people > EPS:
+                anger += st.grievance * st.people
+        anger /= soldiers
+        share = min(config.REVOLUTION_DEFECT_MAX, anger)
+        if share > EPS:
+            gone = 0.0
+            for city in cities:
+                st = city.s("soldiers")
+                take = st.people * share
+                if take <= EPS:
+                    continue
+                # Перебежчик уходит из сословия совсем: он больше не солдат
+                # государства, он боец восставших.
+                cash = st.cash * (take / st.people) if st.people > EPS else 0.0
+                st.people -= take
+                st.cash -= cash
+                gone += take
+            if gone > EPS:
+                # Оружие уходит вместе с людьми — со своих же складов.
+                taken = min(country.army_weapons,
+                            country.army_weapons * (gone / soldiers))
+                country.army_weapons = max(0.0, country.army_weapons - taken)
+                society.update_army_equip(world, country)
+                society.normalize_fronts(world, country)
+                rev.rebels += gone
+                rev.rebel_weapons += taken
+                rev.defected += gone
+
+    pop = society.country_population(world, country)
+    rev.support = min(1.0, rev.rebels / pop) if pop > EPS else 0.0
+
+
+def _rebel_strength(world: World, country: Country, rev) -> float:
+    """Чего стоит войско восставших.
+
+    Считается по тому же правилу, что и армия государства (society.
+    combat_strength), но своими слагаемыми: вооружённость — доля оружия на
+    бойца, дух — единица (восставшему терять нечего), командования нет вовсе.
+    Перебежавшие офицеры сюда не набираются намеренно: революция берёт числом и
+    злостью, а не выучкой.
+    """
+    if rev.rebels <= EPS:
+        return 0.0
+    equip = min(1.0, rev.rebel_weapons / max(rev.rebels, EPS))
+    equip = config.EQUIP_STRENGTH_MIN + (1.0 - config.EQUIP_STRENGTH_MIN) * equip
+    # Дух восставших — их же обида: чем ярче она, тем злее дерутся.
+    spirit = 0.9 + 0.5 * min(1.0, rev.support * 4.0)
+    return rev.rebels * equip * spirit
+
+
+def _gov_forces(world: World, country: Country) -> tuple[float, float]:
+    """Силы государства в столице: солдаты и офицеры, оставшиеся ему верны.
+
+    Берётся ВСЯ армия, а не резерв: гражданская война идёт в столице, и полки
+    с границ снимают, не считаясь ни с каким соседом. Цена этому — оголённые
+    фронты: пока в столице стреляют, чужая армия входит в страну свободно.
+    """
+    return (society.army_size(world, country),
+            society.officer_size(world, country))
+
+
+def _civil_battle(world: World, country: Country, rev) -> None:
+    """Один пейдей боёв в столице.
+
+    Устроено как обычное сражение (_battle), но без фронтов и без карты: обе
+    стороны бьются в одном месте, и решает перевес, накопленный за пейдеи.
+    Разорение при этом достаётся столичной области — по ней и идёт война.
+    """
+    gov_men, gov_off = _gov_forces(world, country)
+    gov = society.combat_strength(world, country, gov_men, gov_off)
+    reb = _rebel_strength(world, country, rev)
+    if gov <= EPS and reb <= EPS:
+        return
+
+    r = society.rng_for(world, country.id, salt=193)
+    luck = config.REVOLUTION_BATTLE_LUCK
+    fg = gov * (1.0 + r.uniform(-luck, luck))
+    fr = reb * (1.0 + r.uniform(-luck, luck))
+    total = fg + fr
+    if total <= EPS:
+        return
+
+    # Потери: при равных силах каждый теряет REVOLUTION_BATTLE_LOSS своих.
+    loss_gov = min(config.BATTLE_LOSS_MAX,
+                   config.REVOLUTION_BATTLE_LOSS * 2.0 * fr / total)
+    loss_reb = min(config.BATTLE_LOSS_MAX,
+                   config.REVOLUTION_BATTLE_LOSS * 2.0 * fg / total)
+
+    dead_gov = gov_men * loss_gov
+    if dead_gov > EPS and gov_men > EPS:
+        rate = dead_gov / gov_men
+        for city in society.country_cities(world, country):
+            for key in ("soldiers", "officers"):
+                st = city.s(key)
+                if st.people <= EPS:
+                    continue
+                st.people = max(0.0, st.people * (1.0 - rate))
+        country.army_weapons = max(0.0, country.army_weapons * (1.0 - rate))
+        society.update_army_equip(world, country)
+        society.normalize_fronts(world, country)
+    rev.gov_losses += dead_gov
+
+    dead_reb = rev.rebels * loss_reb
+    rev.rebels = max(0.0, rev.rebels - dead_reb)
+    rev.rebel_weapons = max(0.0, rev.rebel_weapons * (1.0 - loss_reb))
+    rev.rebel_losses += dead_reb
+    rev.battles += 1
+
+    # Перевес копится, как оккупация на фронте: единица в чью-нибудь пользу и
+    # решает дело.
+    edge = (fr - fg) / total
+    rev.momentum = max(-1.5, min(1.5, rev.momentum
+                                 + edge * config.REVOLUTION_MOMENTUM))
+
+    # Разорение столицы: казна, люди и заводы.
+    capital = world.cities.get(country.capital_city_id)
+    if capital is not None:
+        country.spend("losses",
+                      max(0.0, country.treasury) * config.CIVIL_WAR_TREASURY_LOSS)
+        for key in config.STRATA_ORDER:
+            st = capital.s(key)
+            if st.people > EPS:
+                st.people = max(0.0, st.people * (1.0 - config.REVOLT_CASUALTIES))
+        for b in world.city_buildings(capital.id):
+            if b.effective_level > 0 and r.random() < config.CIVIL_WAR_BUILDING_DAMAGE:
+                b.damage = min(b.level, b.damage + 1)
+
+
+def accept_demands(world: World, country: Country) -> list[str]:
+    """Лидер принимает требования восставших. Возвращает строки новостей.
+
+    Принять их можно и в разгар гражданской войны, а не только пока идёт срок
+    ответа: договориться никогда не поздно, просто до войны это обошлось бы
+    дешевле — без сожжённой столицы и без разбежавшейся армии.
+    """
+    rev = country.revolution
+    if rev is None or rev.phase in ("none", "done"):
+        return []
+    done = politics.apply_demands(world, country, rev.demands)
+    rev.phase = "done"
+    rev.outcome = "accepted"
+    rev.resolved_tick = world.tick
+    country.revolution_heat = 0.0
+    country.revolution_calm_until = world.tick + config.REVOLUTION_COOLDOWN
+    _calm_country(world, country, rev, relief=0.35)
+    return [f"{country.name}: лидер принимает требования восставших — "
+            + (", ".join(done) if done else "требования оказались невыполнимы")]
+
+
+def _calm_country(world: World, country: Country, rev, relief: float) -> None:
+    """Успокоить страну после того, как революция чем-нибудь кончилась.
+
+    `relief` больше нуля — облегчение (требования выполнены), меньше — расплата
+    за подавление. Довольство трогается напрямую и разово: сама по себе обида
+    пересчитается на следующем же пейдее из новых законов, но людям надо дать
+    почувствовать, чем дело кончилось, сейчас.
+    """
+    for city in society.country_cities(world, country):
+        for key in config.STRATA_ORDER:
+            st = city.s(key)
+            if st.people <= EPS:
+                continue
+            weight = 1.0 if key in rev.strata else 0.4
+            st.satisfaction = max(0.0, min(1.0, st.satisfaction
+                                           + relief * weight))
+        city.unrest = max(0.0, city.unrest - max(0.0, relief))
+
+
+def _disband_rebels(world: World, country: Country, rev) -> None:
+    """Разошедшиеся по домам: уцелевшие восставшие возвращаются в сословия.
+
+    Возвращаются они в городскую бедноту, а не туда, откуда пришли: своё дело
+    и свой надел за время войны потеряны. Оружие остаётся у них на руках и
+    просто пропадает из учёта — государству его никто не вернёт.
+    """
+    if rev.rebels <= EPS:
+        return
+    capital = world.cities.get(country.capital_city_id)
+    cities = society.country_cities(world, country)
+    home = capital if capital is not None else (cities[0] if cities else None)
+    if home is not None:
+        home.s("town_low").people += rev.rebels
+    rev.rebels = 0.0
+    rev.rebel_weapons = 0.0
+
+
+def step_revolutions(world: World) -> list[str]:
+    """Пейдей революций во всех государствах.
+
+    Идёт ПОСЛЕ экономики и политики: революция смотрит на уже сложившееся
+    довольство, на уже собранную палату и на уже принятые за этот пейдей
+    законы. Иначе страна восставала бы против порядка, который парламент
+    только что и отменил.
+    """
+    news: list[str] = []
+    for country in world.countries.values():
+        if not country.alive:
+            continue
+        news += _step_one_revolution(world, country)
+    return news
+
+
+def _step_one_revolution(world: World, country: Country) -> list[str]:
+    news: list[str] = []
+    rev = country.revolution
+
+    # --- уже отгремевшая: держим её на витрине и убираем -------------------
+    if rev is not None and rev.phase == "done":
+        if world.tick - rev.resolved_tick > config.REVOLUTION_ANSWER_TICKS * 3:
+            country.revolution = None
+        return news
+
+    # --- жар: копится от неудовлетворённого самосознания -------------------
+    if rev is None:
+        heat = society.country_grievance(world, country)
+        if heat >= config.REVOLUTION_TRIGGER:
+            depth = min(1.0, (heat - config.REVOLUTION_TRIGGER)
+                        / max(1.0 - config.REVOLUTION_TRIGGER, EPS))
+            country.revolution_heat = min(
+                1.4, country.revolution_heat
+                + config.REVOLUTION_HEAT_GROWTH * (0.35 + 0.65 * depth))
+        else:
+            country.revolution_heat = max(
+                0.0, country.revolution_heat - config.REVOLUTION_HEAT_DECAY)
+        if (country.revolution_heat < 1.0
+                or world.tick < country.revolution_calm_until):
+            return news
+
+        strata = _rebel_strata(world, country)
+        demands = politics.revolution_demands(country, strata)
+        if not demands:
+            # Требовать нечего: все законы, которых могли бы хотеть эти
+            # сословия, уже приняты. Жар просто сбрасывается — восставать
+            # против собственных требований бессмысленно.
+            country.revolution_heat = 0.0
+            return news
+        from ..models import Revolution
+        rev = Revolution(phase="demands", started_tick=world.tick,
+                         deadline_tick=world.tick + config.REVOLUTION_ANSWER_TICKS,
+                         demands=demands, strata=strata)
+        country.revolution = rev
+        _muster_rebels(world, country, rev)
+        who = ", ".join(config.STRATA[k]["name"].lower() for k in strata[:3])
+        news.append(
+            f"{country.name}: РЕВОЛЮЦИЯ. Восстали {who}. "
+            f"Требования — {politics.demands_text(demands)}. "
+            f"У лидера {config.REVOLUTION_ANSWER_TICKS} пейдеев на ответ"
+            + (f"; на сторону восставших перешло {rev.defected:,.0f} солдат"
+               if rev.defected > 1 else ""))
+        return news
+
+    # --- срок на ответ вышел ------------------------------------------------
+    if rev.phase == "demands":
+        if world.tick < rev.deadline_tick:
+            return news
+        rev.phase = "war"
+        # Пока лидер молчал, к восставшим подходили новые люди.
+        _muster_rebels(world, country, rev)
+        news.append(
+            f"{country.name}: ответа на требования нет — начинается "
+            f"ГРАЖДАНСКАЯ ВОЙНА. У восставших {rev.rebels:,.0f} бойцов "
+            f"против {society.army_size(world, country):,.0f} солдат")
+        return news
+
+    # --- гражданская война --------------------------------------------------
+    if rev.phase != "war":
+        return news
+    _civil_battle(world, country, rev)
+
+    gov_men = society.army_size(world, country)
+    rebels_broken = rev.rebels <= EPS or rev.momentum <= -1.0
+    gov_broken = gov_men <= EPS or rev.momentum >= 1.0
+    # ВОЙНА НА ИЗМОР. Между двумя равными армиями перевес шумит около нуля и
+    # может не дойти до края никогда, а страна всё это время работает вполсилы.
+    # Настоящая гражданская война так и кончается — не победой, а тем, что
+    # драться больше некому: по исходу берётся накопленный перевес, каким бы
+    # малым он ни был, и при равенстве верх остаётся за государством.
+    if not rebels_broken and not gov_broken:
+        if rev.battles >= config.REVOLUTION_WAR_MAX_TICKS:
+            gov_broken = rev.momentum > 0
+            rebels_broken = not gov_broken
+
+    if gov_broken and not rebels_broken:
+        done = politics.apply_demands(world, country, rev.demands)
+        rev.phase, rev.outcome = "done", "won"
+        rev.resolved_tick = world.tick
+        country.revolution_heat = 0.0
+        country.revolution_calm_until = world.tick + config.REVOLUTION_COOLDOWN
+        _calm_country(world, country, rev, relief=0.40)
+        _disband_rebels(world, country, rev)
+        news.append(
+            f"{country.name}: РЕВОЛЮЦИЯ ПОБЕДИЛА после {rev.battles} пейдеев "
+            f"боёв. Законы переписаны силой: "
+            + (", ".join(done) if done else "требования оказались невыполнимы"))
+    elif rebels_broken:
+        rev.phase, rev.outcome = "done", "crushed"
+        rev.resolved_tick = world.tick
+        country.revolution_heat = 0.0
+        country.revolution_calm_until = world.tick + config.REVOLUTION_COOLDOWN
+        # Подавление — не мир, а затишье: у восставших сословий довольство
+        # падает ещё ниже, и через передышку они выйдут снова.
+        _calm_country(world, country, rev, relief=-config.REVOLUTION_CRUSHED_PENALTY)
+        _disband_rebels(world, country, rev)
+        news.append(
+            f"{country.name}: революция подавлена за {rev.battles} пейдеев. "
+            f"Потери — {rev.rebel_losses:,.0f} восставших и "
+            f"{rev.gov_losses:,.0f} солдат; законы остались прежними")
+    return news
 
 
 # ---------------------------------------------------------------------------
@@ -591,17 +1080,19 @@ def support_state_sector(world: World, country: Country) -> float:
             continue
         ind = world.industries[b.industry_key]
         lv = b.effective_level
-        jobs = lv * ind.jobs_per_level * max(0.0, min(1.0, b.throttle))
+        jobs = (lv * politics.industry_jobs(country, ind)
+                * max(0.0, min(1.0, b.throttle)))
         # Цепочка поднимает выпуск, а значит и аппетит цеха к сырью: дотацию
         # надо считать по тому же плану, по которому цех будет работать.
-        planned = jobs * ind.output_per_worker * (1.0 + b.chain_bonus)
+        planned = jobs * politics.industry_output(country, ind) * (1.0 + b.chain_bonus)
         # сырьё считаем по ценам ТОЙ области, где стоит цех
         need += (jobs * max(b.wage, country.min_wage)
+                 * (1.0 + max(0.0, country.worker_insurance))
                  + lv * config.UPKEEP_PER_LEVEL
                  + sum(planned * r * society.lg(city, g).price
                        for g, r in ind.inputs.items())
-                 + sum(lv * q * society.lg(city, g).price
-                       for g, q in ind.upkeep_goods.items()))
+                 + sum(q * society.lg(city, g).price
+                       for g, q in upkeep_needs(country, ind, lv).items()))
 
     gap = need - state.cash
     if gap <= 0:
@@ -711,7 +1202,7 @@ def _empty_country_result(country: Country) -> dict:
         "total_workers": 0.0, "farm_hands": 0.0, "pop": 0.0, "village": 0.0,
         "artisan_spend": 0.0, "public_spend": 0.0, "value_added": 0.0,
         "army_cost": 0.0, "mobilized": 0.0,
-        "living_standard": 1.0,
+        "living_standard": 1.0, "education": 0.0, "grievance": 0.0,
     }
 
 
@@ -753,7 +1244,12 @@ def run_country(world: World, country: Country) -> dict:
     # должны успеть и поесть, и выйти на работу, а не ждать следующего.
     society.settle_newcomers(world, country)
 
-    society.pay_army(world, country)
+    army_paid = society.pay_army(world, country)
+    # ВОЕННЫЙ СБОР. При национализме треть содержания армии перекладывается на
+    # промышленников — по капиталу, а не поровну. Берётся сразу после выплаты
+    # жалованья: сбор считается от того, что казна ДЕЙСТВИТЕЛЬНО отдала армии,
+    # а не от того, что собиралась отдать.
+    politics.collect_army_levy(world, country, army_paid)
     society.conscript(world, country)
     # Потери командиров считает война (step_wars идёт после экономики), а
     # обнуляется счётчик здесь — в начале следующего пейдея. Так витрина весь
@@ -786,10 +1282,16 @@ def run_country(world: World, country: Country) -> dict:
         employed_by_city[city.id] = allocate_labor(world, country, city.id)
 
     # Бунтующая область почти не работает: часть цехов стоит, часть разграблена.
+    # Гражданская война встаёт поверх этого и по всей стране сразу: когда в
+    # столице стреляют, работать не выходит и в дальней провинции.
+    civil = (config.CIVIL_WAR_OUTPUT_PENALTY
+             if country.revolution is not None
+             and country.revolution.phase == "war" else 1.0)
     morale = {
         city.id: max(0.6, min(1.3, 1.0 + config.MORALE_PRODUCTIVITY
                               * (city.satisfaction - 0.65) / 0.35))
         * (config.REVOLT_OUTPUT_PENALTY if city.revolt_ticks > 0 else 1.0)
+        * civil
         for city in cities
     }
 
@@ -843,17 +1345,23 @@ def run_country(world: World, country: Country) -> dict:
         employed = b.employed
         wage = max(b.wage, country.min_wage)
         wage_bill = employed * wage
+        # СТРАХОВКА РАБОТНИКА — доля фонда оплаты труда, которую хозяин платит
+        # сверх зарплаты прямо в карман работающему сословию. Ставку задаёт
+        # лидер, а нижнюю её границу — закон о правах рабочих: цех обязан
+        # заложить её в расходы наравне с зарплатой, иначе «право» осталось бы
+        # словом, ничего не стоящим тому, кто его нарушает.
+        insurance = wage_bill * max(0.0, country.worker_insurance)
         upkeep = b.effective_level * config.UPKEEP_PER_LEVEL
 
         # Ветвимся по наличию выпуска, а не по виду здания: административная
         # постройка тоже может что-то производить (оперный театр — роскошные
         # услуги), и содержание штата при этом никуда не девается.
-        needs = {g: b.effective_level * q for g, q in ind.upkeep_goods.items()}
+        needs = upkeep_needs(country, ind, b.effective_level)
         if ind.output_good:
             # Цепочка прибавляет к выпуску, а не к цене: связанное хозяйство
             # работает ровнее, чем такой же цех сам по себе.
-            planned = (employed * ind.output_per_worker * morale[b.city_id]
-                       * (1.0 + b.chain_bonus))
+            planned = (employed * politics.industry_output(country, ind)
+                       * morale[b.city_id] * (1.0 + b.chain_bonus))
             for g, r in ind.inputs.items():
                 needs[g] = needs.get(g, 0.0) + planned * r
         else:
@@ -861,7 +1369,7 @@ def run_country(world: World, country: Country) -> dict:
 
         p0 = price0[city.id]
         input_cost = sum(q * p0[g] for g, q in needs.items() if g in p0)
-        total_need = wage_bill + upkeep + input_cost
+        total_need = wage_bill + insurance + upkeep + input_cost
         # Предприятие работает в долг: зарплаты и сырьё оплачиваются и в минус,
         # пока касса не упёрлась в порог банкротства, установленный
         # государством. Казна себе в долг не влезает — её и так дотируют.
@@ -870,6 +1378,7 @@ def run_country(world: World, country: Country) -> dict:
             scale = max(0.0, purse / total_need)
             employed *= scale
             wage_bill *= scale
+            insurance *= scale
             upkeep *= scale
             planned *= scale
             needs = {g: q * scale for g, q in needs.items()}
@@ -879,7 +1388,8 @@ def run_country(world: World, country: Country) -> dict:
             input_demand[city.id][g] += q
         # Владельца несём с собой в плане, а не полагаемся на переменную цикла:
         # платит за цех именно его хозяин, кто бы ни шёл следующим по списку.
-        plans.append((b, owner, employed, wage_bill, upkeep, needs, planned))
+        plans.append((b, owner, employed, wage_bill, insurance, upkeep,
+                      needs, planned))
 
     # Рацион сырья считается в каждой области отдельно: склад соседней области
     # здешнему цеху недоступен, пока товар не привезли торговые площади.
@@ -904,7 +1414,7 @@ def run_country(world: World, country: Country) -> dict:
     # бы от найма ни червонца.
     wage_income: dict[tuple[int, str], float] = defaultdict(float)
 
-    for b, owner, employed, wage_bill, upkeep, needs, planned in plans:
+    for b, owner, employed, wage_bill, insurance, upkeep, needs, planned in plans:
         ind = inds[b.industry_key]
         market = markets[b.city_id]
         p0 = price0[b.city_id]
@@ -937,16 +1447,19 @@ def run_country(world: World, country: Country) -> dict:
             production[b.city_id][ind.output_good] += output
             prod_cost[b.city_id][ind.output_good] += spent_inputs + wages_paid + upkeep
 
-        owner.cash -= spent_inputs + wages_paid + upkeep
+        # Страховка платится с ПОЛНОГО фонда оплаты, а не с отработанного: в
+        # том и смысл страховки, что за простой она полагается тоже. Отсюда и
+        # её тяжесть для хозяина — простаивающий цех платит её целиком.
+        owner.cash -= spent_inputs + wages_paid + insurance + upkeep
         total_wages += wages_paid
         if ind.output_good:
             value_added += output * p0[ind.output_good] - spent_inputs
 
         b.last_output = output
         b.last_inputs = spent_inputs
-        b.last_wages = wages_paid
-        b.last_costs = spent_inputs + wages_paid + upkeep
-        wage_income[(b.city_id, ind.labour)] += wages_paid + upkeep
+        b.last_wages = wages_paid + insurance
+        b.last_costs = spent_inputs + wages_paid + insurance + upkeep
+        wage_income[(b.city_id, ind.labour)] += wages_paid + insurance + upkeep
 
     for (cid, stratum), gross in wage_income.items():
         st = world.cities[cid].s(stratum)
@@ -967,6 +1480,24 @@ def run_country(world: World, country: Country) -> dict:
             grant = public_spend * share
             st.cash += grant
             st.income += grant
+
+    # --- Фаза 5б: что казна раздаёт ПО ЗАКОНУ, а не по числу душ -----------
+    # Три статьи, и все три существуют только при определённых законах:
+    #
+    #   КРЕПОСТНОЕ ПРАВО — доля госрасходов и часть оброка, идущие дворянству
+    #       сверх положенного ему по числу душ. Живёт при монархии;
+    #   ДОПОЛНИТЕЛЬНОЕ РАСПРЕДЕЛЕНИЕ — доля казны низшим и средним слоям.
+    #       Живёт при социализме и есть смысл его высоких налогов на прибыль;
+    #   СОДЕРЖАНИЕ ПАРЛАМЕНТА — жалованье депутатам и аппарат. Живёт везде, где
+    #       есть выборы, и растёт вместе с числом кресел.
+    #
+    # Оброк берётся ПРОШЛОГО пейдея: в этом его ещё не собрали — деревня несёт
+    # выручку на рынок только в фазе 8, много позже. Помещик и получает ренту с
+    # прошлого урожая, а не с будущего, — так и должно быть.
+    politics.serfdom_payout(world, country, public_spend,
+                            country.last_budget.get("tithe", 0.0))
+    politics.redistribution_payout(world, country)
+    politics.charge_parliament(world, country)
 
     # --- Фаза 5а: налоги с населения --------------------------------------
     # Собираются ПОСЛЕ того, как люди получили доход, и ДО того, как они пошли
@@ -1004,6 +1535,15 @@ def run_country(world: World, country: Country) -> dict:
         consumer_demand[city.id]["shells"] += want_shells * share
         consumer_demand[city.id]["weapons"] += want_weapons * share
 
+    # БУМАГА ПАЛАТЫ. Второй казённый покупатель бумажной фабрики после школ.
+    # Спрос ставится на столичный рынок целиком, а не делится по областям:
+    # делопроизводство парламента ведётся там, где парламент и заседает.
+    paper_want = parliament_paper(country)
+    if paper_want > EPS:
+        seat = world.cities.get(country.capital_city_id) or cities[0]
+        consumer_demand[seat.id]["paper"] += paper_want
+        buy_parliament_paper(world, country, seat, markets[seat.id])
+
     # Спрос делится между областями по населению — армию снабжают отовсюду, и
     # цену это двигает везде. А вот САМА ЗАКУПКА идёт подряд, по всей стране,
     # пока недостача не закрыта или пока не кончились снаряды и деньги. Раньше
@@ -1037,12 +1577,27 @@ def run_country(world: World, country: Country) -> dict:
             if home is None:
                 continue
             st = home.s(key)
-            if key == "peasants" and country.land_rent > 0:
-                rent = rev * country.land_rent
-                high = home.s("town_high")
-                high.cash += rent
-                high.income += rent
-                rev -= rent
+            if key == "peasants":
+                # ЗЕМЛЯ КОРМИТ ПОМЕЩИКА ДВАЖДЫ, и это два разных сбора.
+                #
+                # Земельная РЕНТА (Country.land_rent) — рычаг лидера, доля со
+                # всего, что деревня выручила на рынке. Крестьянское владение и
+                # коллективное хозяйство запирают её в ноль (politics.tax_bounds),
+                # и тогда все деньги с земли остаются деревне.
+                #
+                # ХЛЕБНАЯ доля (politics.grain_rent) — не рычаг, а закон:
+                # крепостное право берёт своё именно с пашни, поэтому считается
+                # она от выручки за ЗЕРНО, а не от всей. Отсюда и порядок:
+                # сперва рента со всего, потом барская доля с хлеба.
+                grain_rev = markets[city.id].sales.get(owner_id, {}).get("grain", 0.0)
+                due = (rev * max(0.0, country.land_rent)
+                       + grain_rev * politics.grain_rent(country))
+                rent = min(due, rev)
+                if rent > EPS:
+                    high = home.s("town_high")
+                    high.cash += rent
+                    high.income += rent
+                    rev -= rent
             # ОБРОК. Деревня зарплаты не получает и подоходного не платит —
             # значит, взять с неё можно только долю того, что она выручила на
             # рынке. Берётся с крестьян и кустарей, после земельной ренты (та
@@ -1064,8 +1619,20 @@ def run_country(world: World, country: Country) -> dict:
     # у других встали заводы. Это и есть цена армии, набранной приказом — но
     # сытое сословие переносит её заметно легче голодного.
     mobilizing = country.mobilization_left > 0
+    # НЕЧЕСТНОЕ ГОЛОСОВАНИЕ. Скупка мест при всеобщем избирательном праве
+    # бесследно не проходит: несколько пейдеев по стране ходит слух, что выборы
+    # были куплены, и довольство падает у всех разом. В отличие от мобилизации,
+    # достаток от этой обиды не спасает — оскорбление одинаково для всех.
+    unfair = politics.unfair_voting(country, world.tick)
+    # ГРАЖДАНСКАЯ ВОЙНА бьёт по довольству всей страны разом, и достаток от
+    # неё не спасает: в стране стреляют.
+    civil_war = country.revolution is not None and country.revolution.phase == "war"
     for city in cities:
         hired = employed_by_city.get(city.id, {})
+        # Просвещение и его последствия — до подсчёта довольства: выученный за
+        # этот пейдей человек в этот же пейдей и осознаёт своё бесправие.
+        society.educate(world, country, city)
+        society.update_grievances(world, country, city)
         for key in config.STRATA_ORDER:
             st = city.s(key)
             if st.people <= EPS:
@@ -1073,12 +1640,16 @@ def run_country(world: World, country: Country) -> dict:
             unemp = city.unemployment if key == "workers" else 0.0
             score = society.satisfaction_score(
                 fulfilment[city.id].get(key, {}).get("fill", {}), unemp,
-                st.living_standard)
+                st.living_standard, st.grievance)
+            if civil_war:
+                score *= (1.0 - config.CIVIL_WAR_DISCONTENT)
             if mobilizing:
                 bite = config.MOBILIZATION_DISCONTENT * (
                     1.0 - config.SOL_HARDSHIP_CUSHION
                     * society.prosperity(st.living_standard))
                 score *= (1.0 - bite)
+            if unfair:
+                score *= (1.0 - config.UNFAIR_DISCONTENT)
             i = config.SATISFACTION_INERTIA
             st.satisfaction = max(0.0, min(1.0, st.satisfaction * i + score * (1 - i)))
         pop = city.population or 1.0
@@ -1126,6 +1697,11 @@ def run_country(world: World, country: Country) -> dict:
         "army_cost": country.last_army_cost,
         "mobilized": mobilized,
         "living_standard": society.country_living_standard(world, country),
+        # Грамотность страны и её неудовлетворённое самосознание. Первое —
+        # источник рабочих рук, второе — топливо революции; смотреть на них
+        # надо вместе, потому что растут они из одного корня.
+        "education": society.country_education(world, country),
+        "grievance": society.country_grievance(world, country),
     }
 
 
@@ -1456,6 +2032,34 @@ def settle_profits(world: World, country_results: dict,
             # выпустил, можно — это распродажа склада, а не долг.
             b.last_unsold = max(0.0, b.last_output - b.last_sold)
 
+    # --- доля деревни в выручке фермы --------------------------------------
+    # КОЛЛЕКТИВНОЕ ХОЗЯЙСТВО (config.LAWS["land"]) — единственный уклад, при
+    # котором хозяйская ферма перестаёт быть чужим полем: большая часть её
+    # выручки расходится по крестьянам области сверх зарплаты, которую они уже
+    # получили. Для промышленника это и есть цена социализма на земле — ферму
+    # построить можно, а снимать с неё всю прибыль больше нельзя.
+    #
+    # Считается ПОСЛЕ того, как выручка разложена по цехам, и записывается в
+    # расходы цеха: иначе прибыль показывала бы деньги, которых у хозяина уже
+    # нет, а налог на прибыль брался бы с чужого дохода.
+    for b in world.buildings.values():
+        ind = world.industries.get(b.industry_key)
+        if ind is None or ind.labour != "peasants" or b.last_revenue <= EPS:
+            continue
+        city = world.cities.get(b.city_id)
+        country = world.countries.get(city.country_id) if city else None
+        share = politics.farm_peasant_share(country)
+        if share <= EPS:
+            continue
+        due = b.last_revenue * share
+        owner = world.players.get(b.owner_id)
+        if owner is not None:
+            owner.cash -= due
+        st = city.s("peasants")
+        st.cash += due
+        st.income += due
+        b.last_costs += due
+
     # --- прибыль и налог ---------------------------------------------------
     profit_by_owner: dict[tuple[int, int], float] = defaultdict(float)
     for b in world.buildings.values():
@@ -1737,9 +2341,13 @@ def world_market_step(world: World, exports: dict | None = None) -> None:
     """
     caps = region_access(world)
     world.last_trades = {}
+    # ЗАКРЫТАЯ ЭКОНОМИКА. Страна, принявшая такой закон, на биржу не выходит
+    # вовсе — ни продавцом, ни покупателем: её области просто выпадают из
+    # клиринга. Внутренних обозов это не касается, они ходят по-прежнему.
     live = [c for c in world.cities.values()
             if (world.countries.get(c.country_id) is not None
-                and world.countries[c.country_id].alive)]
+                and world.countries[c.country_id].alive
+                and not politics.is_closed(world.countries[c.country_id]))]
     # Пошлины у каждой страны свои, поэтому и пороги разницы цен — по областям.
     duty = {c.id: max(0.0, world.countries[c.country_id].tariff) for c in live}
     duty_in = {c.id: max(0.0, world.countries[c.country_id].import_tariff)
@@ -2066,9 +2674,11 @@ def _battle(world: World, war: War, region_a: int, region_d: int) -> None:
         # нехватки штыков или из-за того, что офицеров оставили в тылу.
         "men_attacker": round(men_a), "men_defender": round(men_d),
         "command_attacker": round(society.command_quality(
-            society.front_officers(ca, cd.id), society.front_soldiers(ca, cd.id)), 3),
+            society.front_officers(ca, cd.id), society.front_soldiers(ca, cd.id),
+            ca), 3),
         "command_defender": round(society.command_quality(
-            society.front_officers(cd, ca.id), society.front_soldiers(cd, ca.id)), 3),
+            society.front_officers(cd, ca.id), society.front_soldiers(cd, ca.id),
+            cd), 3),
         "officers_attacker": round(off_a), "officers_defender": round(off_d),
         "edge": round(adv, 3),
         "losses_attacker": round(dead_a), "losses_defender": round(dead_d),
@@ -2608,6 +3218,14 @@ def run_tick(world: World) -> dict:
     # вотум недоверия может назначить внеочередные выборы — до обычных
     news += step_confidence(world)
     step_elections(world)
+    # Политика идёт последней: созывы парламента и итоги голосований по законам
+    # должны видеть уже сложившийся пейдей — и население, и казну, и войну.
+    news += politics.step_politics(world)
+    # А революция — после политики, и это не мелочь порядка. Восставать надо
+    # против того порядка, который сложился К КОНЦУ пейдея: палата, только что
+    # принявшая требуемый закон, обязана успеть снять вопрос, а не получить
+    # революцию за то, чего уже не существует.
+    news += step_revolutions(world)
 
     # Роспись казны замирает: всё, что случилось за пейдей и между пейдеями,
     # уходит в отчёт, и начинается новая копилка.

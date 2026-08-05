@@ -8,23 +8,57 @@
 </head>
 <body>
 
-<!-- ------------------------------ вход ------------------------------ -->
+<!-- ------------------------ вход и регистрация ------------------------ -->
+<!-- Два разных дела — две вкладки. Раньше обе кнопки стояли под одной формой,
+     и «Начать дело» с чужим именем в поле означало «имя занято», а «Войти» с
+     выбранной страной молча её игнорировало. -->
 <div id="auth">
     <h1>Sim<span style="color:var(--accent)">Pol</span>Ec</h1>
-    <div class="sub">Двадцать доиндустриальных государств. Вы — промышленник.
-        Выберите, в каком из них начать дело.</div>
-    <label for="u">Имя</label>
-    <input id="u" autocomplete="username" placeholder="как вас звать">
-    <label for="p">Пароль</label>
-    <input id="p" type="password" autocomplete="current-password" placeholder="••••••">
-    <label for="regCountry">Государство (для регистрации)</label>
-    <select id="regCountry"></select>
-    <div class="sub" id="joinNote" style="margin:10px 0 0;font-size:12.5px"></div>
-    <div class="row">
-        <button class="primary" onclick="doAuth('register')">Начать дело</button>
-        <button onclick="doAuth('login')">Войти</button>
+    <div class="sub">Двадцать доиндустриальных государств. Вы — промышленник.</div>
+
+    <div class="tabs" role="tablist">
+        <button class="tab on" id="tabLogin" role="tab" aria-selected="true"
+                aria-controls="paneLogin" onclick="authTab('login')">Вход</button>
+        <button class="tab" id="tabRegister" role="tab" aria-selected="false"
+                aria-controls="paneRegister" onclick="authTab('register')">Регистрация</button>
     </div>
-    <div class="err" id="authErr"></div>
+
+    <!-- вкладка «Вход» -->
+    <form class="pane" id="paneLogin" role="tabpanel" aria-labelledby="tabLogin"
+          onsubmit="doAuth('login'); return false">
+        <label for="logUser">Имя</label>
+        <input id="logUser" name="username" autocomplete="username"
+               placeholder="как вас звать" autocapitalize="off" spellcheck="false">
+        <label for="logPass">Пароль</label>
+        <input id="logPass" name="password" type="password"
+               autocomplete="current-password" placeholder="••••••••">
+        <button class="primary wide" type="submit">Войти</button>
+        <div class="err" id="logErr"></div>
+        <div class="swap">Ещё не открыли дело?
+            <a href="#" onclick="authTab('register'); return false">Зарегистрироваться</a></div>
+    </form>
+
+    <!-- вкладка «Регистрация» -->
+    <form class="pane" id="paneRegister" role="tabpanel" aria-labelledby="tabRegister"
+          hidden onsubmit="doAuth('register'); return false">
+        <label for="regUser">Имя</label>
+        <input id="regUser" name="username" autocomplete="username" maxlength="24"
+               placeholder="от 3 до 24 символов" autocapitalize="off" spellcheck="false">
+        <label for="regPass">Пароль</label>
+        <input id="regPass" name="new-password" type="password"
+               autocomplete="new-password" placeholder="••••••••">
+        <div class="hint" id="pwHint">Не короче 8 символов.</div>
+        <label for="regPass2">Пароль ещё раз</label>
+        <input id="regPass2" name="confirm-password" type="password"
+               autocomplete="new-password" placeholder="••••••••">
+        <label for="regCountry">Государство</label>
+        <select id="regCountry"></select>
+        <div class="sub" id="joinNote"></div>
+        <button class="primary wide" type="submit">Начать дело</button>
+        <div class="err" id="regErr"></div>
+        <div class="swap">Уже играете?
+            <a href="#" onclick="authTab('login'); return false">Войти</a></div>
+    </form>
 </div>
 
 <!-- ------------------------------ игра ------------------------------ -->
@@ -72,6 +106,7 @@
     <button data-page="build" data-pin="1">Строительство</button>
     <button data-page="country" data-pin="1">Страна</button>
     <button data-page="gov">Государство</button>
+    <button data-page="laws">Законы</button>
     <button data-page="war">Война</button>
     <button data-page="map">Карта</button>
     <button data-page="top">Рейтинг</button>
@@ -279,10 +314,44 @@
                     <th class="right">Доход на человека</th>
                     <th class="right">Уровень жизни</th>
                     <th class="right">Ожидания</th>
+                    <th class="right" title="Доля грамотных. От неё зависит, кого вообще можно переманить на завод">Грамотность</th>
+                    <th class="right" title="Неудовлетворённое самосознание: грамотность, помноженная на бесправие">Обида</th>
                     <th class="right">Довольство</th><th class="right">Сбережения</th>
                 </tr></thead>
                 <tbody id="strataRows"></tbody>
             </table></div>
+        </details>
+        <details class="card" data-sec="ppl-edu">
+            <summary>Просвещение — <span id="eduLaw">—</span></summary>
+            <details class="help">
+                <summary>зачем нужны школы и чем они опасны</summary>
+                <p class="muted">
+                    Грамотность работает сразу на два конца, и оба неизбежны.
+                    <b>В хозяйстве</b> это доля людей, которых завод вообще может
+                    переманить: у станка надо читать чертёж и считать. Без школ
+                    промышленности не из кого набирать — сколько бы вы ни платили.
+                    <b>В политике</b> это основа самосознания: выученный человек
+                    видит, что законы писаны не про него, и требует голоса.
+                    Неутолённое самосознание копится в жар революции.
+                </p>
+                <p class="muted">
+                    Отсюда и вилка, в которую попадает всякий лидер: без школ страна
+                    остаётся крестьянской и небогатой, со школами — богатеет и требует
+                    прав. Утолить требование можно заранее, законами о правах рабочих
+                    и избирательной системе, — или дождаться, когда его предъявят с
+                    оружием в руках. Грамотность при этом не наследуется: место
+                    выучившегося занимает новорождённый, и школы приходится
+                    <b>содержать</b>, а не построить однажды.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Грамотность страны</span><span class="v num" id="eduAvg">—</span></div>
+                <div class="stat"><span class="k">Обида на бесправие</span><span class="v num" id="eduGriev">—</span></div>
+                <div class="stat"><span class="k">Учат в школах за пейдей</span><span class="v num" id="eduCapS">—</span></div>
+                <div class="stat"><span class="k">Учат в университетах</span><span class="v num" id="eduCapU">—</span></div>
+                <div class="stat"><span class="k">Права рабочих</span><span class="v" id="eduRights">—</span></div>
+            </div>
+            <p class="muted" id="eduNote" style="font-size:13px"></p>
         </details>
         <details class="card" data-sec="ppl-sol">
             <summary>Уровень жизни и роскошь</summary>
@@ -467,7 +536,11 @@
                 <p class="muted">
                     Население — это рынок сбыта, и растёт оно из двух источников.
                     Первый работает всегда — <b>довольство</b>: сытая страна
-                    прибавляет людей сама, голодная убывает.
+                    прибавляет людей сама, голодная убывает. Прибавляет
+                    <b>медленно и нарочно</b>: люди появляются мгновенно, а выпуск
+                    растёт только вместе с новыми заводами, и страна, растущая
+                    быстрее своей промышленности, беднеет с каждым новым едоком.
+                    Голод же выкашивает вдвое быстрее, чем достаток плодит.
                 </p>
                 <p class="muted">
                     Второй работает только в самом начале партии. Пока идёт
@@ -489,6 +562,11 @@
                 <div class="stat"><span class="k">Заселение мира</span><span class="v" id="cJoinWindow">—</span></div>
                 <div class="stat"><span class="k">Промышленников</span><span class="v num" id="cPlayersN">—</span></div>
             </div>
+            <!-- Форма государства и действующие временные модификаторы: одна
+                 строка внизу карточки, чтобы «нечестное голосование» и прочие
+                 напасти были на виду, а не только на своей вкладке. -->
+            <div class="ladder" id="cLaws" style="margin-top:14px"></div>
+            <div class="ladder" id="cModifiers" style="margin-top:8px"></div>
         </details>
         <details class="card" data-sec="country-cities" data-main>
             <summary>Области государства</summary>
@@ -571,6 +649,9 @@
                 <div><label class="muted" style="font-size:12px">
                         МРОТ, ₡</label>
                      <input id="gMin" type="number" step="1" min="0"></div>
+                <div><label class="muted" style="font-size:12px">
+                        Страховка работников, % фонда</label>
+                     <input id="gInsure" type="number" step="1" min="0" max="60"></div>
                 <div><label class="muted" style="font-size:12px">
                         Порог банкротства, ₡</label>
                      <input id="gBank" type="number" step="100000" max="0"></div>
@@ -709,6 +790,117 @@
         </details>
     </section>
 
+    <!-- ---------- законы и форма государства ---------- -->
+    <section class="page" id="page-laws">
+        <!-- Революция стоит первой и раскрыта всегда, когда она есть: у лидера
+             считанные пейдеи на ответ, и прятать это под свёрнутой карточкой
+             нельзя. Когда восстания нет, карточка исчезает целиком. -->
+        <div id="revolutionBox"></div>
+        <details class="card" data-sec="laws-forms" data-main>
+            <summary>Форма и законы государства — <span id="lawCountry">—</span></summary>
+            <p class="muted" id="lawNote" style="font-size:13px;margin-bottom:14px"></p>
+            <details class="help">
+                <summary>как меняются законы</summary>
+                <p class="muted">
+                    Семь категорий, в каждой ровно один действующий закон. Мир
+                    начинается одинаково у всех: <b>монархия</b>, <b>авторитаризм</b>,
+                    <b>крепостное право</b>, <b>образование для высшего общества</b>,
+                    <b>нет прав у рабочих</b>, <b>свободная торговля</b>, идеологии нет.
+                </p>
+                <p class="muted">
+                    Пока в стране авторитаризм, лидер меняет любой закон <b>указом</b> —
+                    в тот же пейдей и ни у кого не спрашивая. Стоит появиться выборам,
+                    и решать начинает <b>парламент</b>: лидер только ставит вопрос, а
+                    депутаты голосуют по программам своих партий. Промышленник может
+                    двигать их деньгами — и даже вынести закон на голосование сам,
+                    оплатив рассмотрение мимо лидера.
+                </p>
+                <p class="muted">
+                    Закон — не прибавка к выпуску. Он переписывает правила: закрывает
+                    лидеру часть ползунков, меняет, из кого набирают офицеров, решает,
+                    кого учить грамоте и что позволено выучившемуся, — и чей голос
+                    вообще считается.
+                </p>
+                <p class="muted">
+                    Есть и третий путь, кроме указа и палаты, — <b>революция</b>.
+                    Грамотная страна, которой отказано в голосе, однажды выходит со
+                    списком требований. У лидера четыре пейдея, чтобы их принять;
+                    не принял — гражданская война в столице, и победившие восставшие
+                    вводят те же законы сами. Солдаты при этом уходят к ним со своим
+                    оружием, если у них есть на то свой интерес.
+                </p>
+            </details>
+            <div class="grid cards" id="lawCards"></div>
+        </details>
+
+        <details class="card" data-sec="laws-vote">
+            <summary>Голосование по закону</summary>
+            <div id="lawVote"></div>
+        </details>
+
+        <details class="card" data-sec="laws-parliament">
+            <summary>Парламент</summary>
+            <details class="help">
+                <summary>как собирается палата</summary>
+                <p class="muted">
+                    Партии не прописаны заранее — они <b>складываются на каждых
+                    выборах</b> из того, кто в стране голосует. Голосуют одни помещики —
+                    в палате сидят монархисты; допустили всех — приходят рабочие.
+                    Сверх этого каждые выборы бросается <b>тяга к переменам</b>:
+                    при высокой даже дворянское собрание может проголосовать за реформы,
+                    которые ему прямо невыгодны.
+                </p>
+                <p class="muted">
+                    Число кресел задаёт лидер, и решение это с двумя концами. Большая
+                    палата дорого обходится казне (статья «Содержание парламента»),
+                    зато её труднее перекупить: цена голоса растёт вместе с числом мест.
+                </p>
+            </details>
+            <div class="grid stats">
+                <div class="stat"><span class="k">Мест в палате</span><span class="v num" id="pSeats">—</span></div>
+                <div class="stat"><span class="k">Содержание</span><span class="v num" id="pCost">—</span></div>
+                <div class="stat"><span class="k">Созыв собран</span><span class="v num" id="pElected">—</span></div>
+                <div class="stat"><span class="k">До выборов</span><span class="v num" id="pNext">—</span></div>
+                <div class="stat" title="Во сколько раз лоббирование в этой стране дороже обычного. Складывается из избирательной системы, формы государства и размера палаты"><span class="k">Сложность лоббирования</span><span class="v num" id="pDiff">—</span></div>
+                <div class="stat" title="Во что обходится промышленнику один перекупленный голос"><span class="k">Цена голоса</span><span class="v num" id="pSeatPrice">—</span></div>
+            </div>
+            <div class="hemi" id="pHemi"></div>
+            <div class="tw"><table id="tParties">
+                <thead><tr><th>Фракция</th><th class="right">Мест</th>
+                    <th class="right">Доля</th><th class="right">Куплено</th>
+                    <th>За что стоит</th></tr></thead>
+                <tbody id="partyRows"></tbody>
+            </table></div>
+            <div class="acts" id="pSeatsBox" style="margin-top:14px">
+                <label class="wagefield"><span>Мест</span>
+                    <input type="number" id="pSeatsInput" min="40" max="400" step="10"></label>
+                <button class="primary" id="pSeatsBtn" onclick="saveSeats()">Назначить размер палаты</button>
+                <span class="muted" style="font-size:12px" id="pSeatsNote">Со следующего созыва.</span>
+            </div>
+        </details>
+
+        <details class="card" data-sec="laws-lobby">
+            <summary>Лоббирование партий</summary>
+            <details class="help">
+                <summary>как работают вложения в партию</summary>
+                <p class="muted">
+                    Деньги, вложенные до выборов, превращаются в добавочные голоса за
+                    выбранную партию. Сколько именно — зависит от <b>избирательной
+                    системы</b>: при цензовом праве до урны доходит три четверти
+                    купленного, при всеобщем — четверть. Меньше минимальной ставки с
+                    вами разговаривать не станут.
+                </p>
+                <p class="muted">
+                    Вкладывать можно и в ту партию, которой сейчас в палате нет: заявка
+                    ждёт следующих выборов. Слишком заметная скупка при всеобщем
+                    избирательном праве даёт стране модификатор
+                    <b>«нечестное голосование»</b> — довольство падает у всех.
+                </p>
+            </details>
+            <div id="lobbyParties"></div>
+        </details>
+    </section>
+
     <!-- ---------- война и дипломатия ---------- -->
     <section class="page" id="page-war">
         <details class="card" data-sec="war-army" data-main>
@@ -743,11 +935,17 @@
             <details class="help">
                 <summary>откуда берутся офицеры</summary>
                 <p class="muted">
-                    Офицеров <b>нанимают из высшего общества</b> — так же, как солдат
-                    призывают из деревни и городской бедноты, только сословия другие:
-                    патент достаётся тому, у кого есть образование и положение. Сперва
-                    зовут высший класс, и лишь если ему мало платят или его не хватило —
-                    средний.
+                    Офицеров нанимают так же, как солдат призывают из деревни и
+                    городской бедноты, только сословия другие: патент достаётся тому,
+                    у кого есть образование и положение.
+                </p>
+                <p class="muted">
+                    <b>Из кого именно — решает закон о государственном устройстве.</b>
+                    При <b>монархии</b> патент дворянский: командиров берут в одном
+                    высшем обществе, и командование доходит до 150%. <b>Республика</b>
+                    открывает патент среднему классу — корпус обходится на треть
+                    дешевле, но выслужившийся из мещан командир до дворянской школы не
+                    дотягивает, и качество упирается в 100%.
                 </p>
                 <p class="muted">
                     Высший класс живёт лучше всех в стране, и служить за гроши не пойдёт:

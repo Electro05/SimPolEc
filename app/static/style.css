@@ -76,7 +76,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     color: var(--muted); margin-bottom: 8px;
 }
 
-/* ---------------- вход ---------------- */
+/* ---------------- вход и регистрация ---------------- */
 #auth {
     max-width: 380px;
     margin: 12vh auto;
@@ -86,10 +86,35 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     padding: 28px;
 }
 #auth h1 { font-size: 26px; margin-bottom: 4px; letter-spacing: -.5px; }
-#auth .sub { color: var(--muted); margin-bottom: 22px; font-size: 13px; }
+#auth .sub { color: var(--muted); margin-bottom: 18px; font-size: 13px; }
 #auth label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 5px; }
-#auth .row { display: flex; gap: 8px; margin-top: 20px; }
-#auth .row button { flex: 1; }
+#auth .hint { color: var(--dim); font-size: 12px; margin-top: 5px; }
+#auth .pane > .sub { margin: 10px 0 0; font-size: 12.5px; }
+#auth button.wide { width: 100%; margin-top: 20px; padding: 9px 14px; }
+#auth .swap { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 14px; }
+#auth .swap a { color: var(--accent); text-decoration: none; }
+#auth .swap a:hover { text-decoration: underline; }
+
+/* Вкладки: вход и регистрация — разные дела, и путать их нечем. */
+#auth .tabs {
+    display: flex;
+    gap: 4px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 4px;
+    margin-bottom: 4px;
+}
+#auth .tab {
+    flex: 1;
+    background: transparent;
+    border-color: transparent;
+    color: var(--muted);
+    font-weight: 500;
+    padding: 8px 10px;
+}
+#auth .tab:hover:not(.on) { background: var(--panel-2); border-color: transparent; }
+#auth .tab.on { background: var(--panel-2); border-color: var(--line); color: var(--text); }
 .err { color: var(--bad); font-size: 13px; margin-top: 12px; min-height: 18px; }
 
 /* ---------------- шапка и меню ---------------- */
@@ -301,6 +326,59 @@ tr.clickable { cursor: pointer; }
 .ladder .step { font-size: 12px; color: var(--muted); background: var(--panel-2);
     border: 1px solid var(--line); border-radius: 20px; padding: 4px 11px; }
 .ladder .step b { color: var(--gold); font-variant-numeric: tabular-nums; }
+
+/* ------------- законы государства ------------- */
+/* Плашка одной категории законов: сверху действующий закон, ниже — на что его
+   можно переменить. Плашки живут в .grid.cards, поэтому тянутся сами. */
+.law { background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; display: flex; flex-direction: column; }
+.law .cat { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--dim); }
+.law h3 { font-size: 16px; margin: 3px 0 6px; color: var(--gold); }
+.law .note { font-size: 12.5px; color: var(--muted); line-height: 1.55;
+    margin-bottom: 12px; }
+/* Один вариант закона. Действующий подсвечен рамкой, недоступный приглушён. */
+.law-opt { border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px;
+    margin-top: 8px; background: var(--panel); }
+.law-opt.on { border-color: var(--gold); box-shadow: inset 0 0 0 1px #e3b34122; }
+.law-opt.off { opacity: .55; }
+.law-opt .top { display: flex; justify-content: space-between; gap: 8px;
+    align-items: baseline; }
+.law-opt b { font-size: 13.5px; }
+.law-opt .eff { list-style: none; margin: 6px 0 0; font-size: 12px;
+    color: var(--muted); line-height: 1.6; }
+.law-opt .eff li::before { content: '— '; color: var(--dim); }
+.law-opt .acts { margin-top: 9px; }
+/* Насколько палата расположена к варианту: узкая полоска под названием */
+.law-opt .sup { font-size: 11px; color: var(--dim); white-space: nowrap; }
+
+/* ------------- парламент ------------- */
+/* Полукруглая диаграмма мест: одно кресло — один кружок. Рисуется в app.js,
+   здесь только размеры, чтобы она сжималась вместе с экраном. */
+.hemi { margin: 14px 0 6px; }
+.hemi svg { width: 100%; max-width: 620px; height: auto; display: block;
+    margin: 0 auto; }
+.hemi .cap { text-align: center; font-size: 12px; color: var(--muted);
+    margin-top: 4px; }
+/* Полоса расклада голосования: слева «за», справа «против» */
+.tally { display: flex; height: 22px; border-radius: 6px; overflow: hidden;
+    border: 1px solid var(--line); margin: 10px 0 6px; }
+.tally > i { display: block; font-style: normal; font-size: 11px; color: #fff;
+    line-height: 22px; text-align: center; font-variant-numeric: tabular-nums; }
+.tally > i.yes { background: #2ea043; }
+.tally > i.no { background: #a4343a; }
+/* Плашка партии в списке лоббирования */
+.party { background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.party h4 { font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.party .pf { font-size: 12px; color: var(--muted); margin: 5px 0 9px;
+    line-height: 1.6; }
+/* Позиция партии по одному закону. Название категории живёт отдельным
+   элементом, чтобы на телефоне его можно было убрать, оставив сам закон. */
+.party .pf-i i { font-style: normal; color: var(--dim); }
+.party .pf-i i::after { content: ' — '; }
+.party .pf-i + .pf-i::before { content: '; '; }
+.party .acts input { width: 130px; }
 
 /* ------------- карточка предприятия ------------- */
 .biz { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
@@ -673,6 +751,98 @@ tr.clickable { cursor: pointer; }
     #tAdmCountries th:nth-child(2), #tAdmCountries td:nth-child(2),
     #tAdmCountries th:nth-child(3), #tAdmCountries td:nth-child(3),
     #tAdmCountries th:nth-child(5), #tAdmCountries td:nth-child(5) { display: none; }
+
+    /* ================================================================
+       ЗАКОНЫ, ПАРЛАМЕНТ И ВЫБОРЫ НА ТЕЛЕФОНЕ
+       ================================================================
+       Раздел устроен не как таблица, а как набор решений, и каждое решение —
+       это кнопка. Поэтому правило здесь одно и сквозное: ЛЮБОЙ ОРГАН
+       УПРАВЛЕНИЯ РАСТЯГИВАЕТСЯ НА ВСЮ ШИРИНУ. Кнопка «Вынести на голосование»
+       рядом с «Профинансировать — 2.3 млн ₡» в одну строку телефона не влезает
+       никогда: они либо наползают друг на друга, либо жмутся в нечитаемые
+       огрызки, и палец попадает не туда. Развёрнутые на всю полосу, они
+       читаются с одного взгляда и промахнуться по ним нельзя. */
+
+    /* --- плашки законов --- */
+    .law { padding: 12px; }
+    .law h3 { font-size: 17px; margin-bottom: 5px; }
+    .law-opt { padding: 10px 11px; }
+    /* Название закона и поддержка палаты переносятся, а не сжимаются:
+       «палата 62%» — короткая справка, ей место под заголовком. */
+    .law-opt .top { flex-wrap: wrap; gap: 2px 8px; }
+    .law-opt .sup { flex: 1 0 100%; }
+    .law-opt .eff { font-size: 11.5px; }
+    /* Четыре категории по два-пять законов, у каждого абзац объяснения и
+       список действий — на телефоне это пять экранов сплошной прокрутки, и
+       выбрать что-нибудь становится физически трудно. Поэтому у ЧУЖИХ законов
+       (тех, что сейчас не действуют) объяснение подрезается до трёх строк:
+       начало прозы остаётся, а механику всё равно точнее говорит список
+       действий под ним. У действующего закона проза не трогается — по нему
+       страна живёт, и знать о нём надо всё. */
+    .law-opt:not(.on) .note {
+        display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3;
+        -webkit-box-orient: vertical; overflow: hidden;
+    }
+
+    /* --- органы управления во всю ширину --- */
+    /* Разом на все три места, где что-то нажимают и вводят: постановка закона,
+       подкуп палаты и вложения в партию. */
+    #page-laws .acts { gap: 6px; }
+    #page-laws .acts > button { flex: 1 0 100%; min-height: 40px; }
+    /* Поле суммы тянется остатком строки, а не «шириной в сто процентов»:
+       рядом с ним в той же рамке стоит значок ₡, и сто процентов от родителя
+       вытолкнули бы его за край. */
+    #page-laws .acts > label.wagefield { flex: 1 0 100%; }
+    #page-laws .acts > label.wagefield input {
+        flex: 1 1 auto; min-width: 0; width: auto;
+    }
+    #page-laws .acts > span.muted { flex: 1 0 100%; }
+
+    /* --- полукруг парламента --- */
+    /* Диаграмма и так тянется по ширине, но на телефоне ей незачем занимать
+       пол-экрана высотой: подпись под ней важнее лишних ста пикселей купола. */
+    .hemi { margin: 10px 0 4px; }
+    .hemi svg { max-width: 100%; }
+    .hemi .cap { font-size: 11px; }
+
+    /* --- расклад голосования --- */
+    /* Полоса становится выше (пальцем по ней не жмут, но читают на ходу), а
+       подписи внутри обрезаются вместо того, чтобы вылезать за края: когда
+       одна сторона набрала пять процентов, слово «против» в неё не помещается
+       ни при каком кегле. Числа всё равно продублированы строкой ниже. */
+    .tally { height: 26px; }
+    .tally > i { line-height: 26px; font-size: 10px; overflow: hidden;
+        white-space: nowrap; min-width: 0; }
+
+    /* --- фракции: остаются название, места и программа --- */
+    /* Доля в процентах и купленные места уезжают: первое видно по диаграмме,
+       второе — редкость, о которой и без того сообщают новости. Программа
+       остаётся: без неё по списку фракций нельзя понять, за что голосовать. */
+    #tParties th:nth-child(3), #tParties td:nth-child(3),
+    #tParties th:nth-child(4), #tParties td:nth-child(4) { display: none; }
+    #tParties td:nth-child(5) { white-space: normal; font-size: 11.5px; }
+
+    /* --- партии для лоббирования --- */
+    /* Заготовок восемь, и на телефоне список выходил длиной в три экрана.
+       Программа ужимается до самих законов — без названий категорий, которые
+       и так угадываются, — и разделяется точкой вместо точки с запятой. */
+    .party { padding: 11px 12px; }
+    .party h4 { flex-wrap: wrap; gap: 4px 8px; }
+    .party .pf { margin: 4px 0 8px; }
+    .party .pf-i i { display: none; }
+    .party .pf-i + .pf-i::before { content: ' · '; }
+
+    /* --- выборы лидера и вотум доверия --- */
+    /* Те же две кнопки решения, что и в законах, и та же беда: «Доверяю
+       лидеру» и «Не доверяю лидеру» в строку не встают. Правило нарочно
+       привязано к самой карточке вотума, а не ко всей вкладке: на ней же
+       живут карточки казённых предприятий, и растягивать их «Стоп» и «Снести»
+       во всю ширину незачем — там кнопки короткие и их много. */
+    details[data-sec="gov-confidence"] .acts > button {
+        flex: 1 0 100%; min-height: 40px;
+    }
+    #govElections table { font-size: 12.5px; }
+    #govElections td:last-child button { min-height: 34px; }
 
     /* Чат занимает всю полосу и садится над нижним меню */
     #chat { right: 10px; left: 10px; bottom: calc(var(--nav-h) + 10px); }
